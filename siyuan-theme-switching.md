@@ -1,7 +1,6 @@
 # SiYuan 主题与外观切换机制代码分析
 
-> **路径约定**：本文档中所有代码引用的显示文本采用**仓库相对路径**（便于跨机器验证），点击可跳转至本地绝对路径。
-> 仓库根目录：`288-siyuan/`
+> **路径约定**：本文档中所有代码引用均采用**仓库相对路径**，便于跨机器验证。
 
 ---
 
@@ -32,7 +31,7 @@ SiYuan 采用前后端分离架构，主题与外观系统由**后端内核（Go
 | 用户配置 | `~/.siyuan/appearance/` | 运行时拷贝 + 用户扩展，实际加载路径 |
 
 开发模式下直接使用工作目录资源，生产模式从用户配置目录加载。
-参考：[kernel/util/working.go](file:///d:/fz/0601/solo-dogfeeding/code/288-siyuan/kernel/util/working.go#L158-L165)
+参考：[kernel/util/working.go](kernel/util/working.go#L158-L165)
 
 ### 2.2 主题包结构
 
@@ -56,7 +55,7 @@ SiYuan 采用前后端分离架构，主题与外观系统由**后端内核（Go
 }
 ```
 
-参考：[app/appearance/themes/daylight/theme.json](file:///d:/fz/0601/solo-dogfeeding/code/288-siyuan/app/appearance/themes/daylight/theme.json)
+参考：[app/appearance/themes/daylight/theme.json](app/appearance/themes/daylight/theme.json)
 
 ### 2.3 主题扫描与加载
 
@@ -69,9 +68,9 @@ SiYuan 采用前后端分离架构，主题与外观系统由**后端内核（Go
 5. 有效性检查 + 默认值回退
 6. 保存配置
 
-参考：[kernel/model/appearance.go - InitAppearance()](file:///d:/fz/0601/solo-dogfeeding/code/288-siyuan/kernel/model/appearance.go#L34-L69)
+参考：[kernel/model/appearance.go - InitAppearance()](kernel/model/appearance.go#L34-L69)
 
-**主题扫描逻辑**（[kernel/model/appearance.go - LoadThemes()](file:///d:/fz/0601/solo-dogfeeding/code/288-siyuan/kernel/model/appearance.go#L129-L212)）：
+**主题扫描逻辑**（[kernel/model/appearance.go - LoadThemes()](kernel/model/appearance.go#L129-L212)）：
 
 - 遍历 `themes/` 目录，跳过非目录项
 - 解析 `theme.json`，解析失败则静默跳过
@@ -87,7 +86,7 @@ SiYuan 采用前后端分离架构，主题与外观系统由**后端内核（Go
 
 #### 后端 Go 结构体
 
-[kernel/conf/appearance.go - Appearance](file:///d:/fz/0601/solo-dogfeeding/code/288-siyuan/kernel/conf/appearance.go#L21-L39)：
+[kernel/conf/appearance.go - Appearance](kernel/conf/appearance.go#L21-L39)：
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
@@ -105,13 +104,13 @@ SiYuan 采用前后端分离架构，主题与外观系统由**后端内核（Go
 
 #### 前端 TypeScript 接口
 
-[app/src/types/config.d.ts - IAppearance](file:///d:/fz/0601/solo-dogfeeding/code/288-siyuan/app/src/types/config.d.ts#L194-L265)
+[app/src/types/config.d.ts - IAppearance](app/src/types/config.d.ts#L194-L265)
 
 ### 3.2 持久化机制
 
 配置保存在 `~/.siyuan/conf.json`，通过 `AppConf.Save()` 方法持久化。
 
-**写入流程**（[kernel/model/conf.go - Save()](file:///d:/fz/0601/solo-dogfeeding/code/288-siyuan/kernel/model/conf.go#L870-L900)）：
+**写入流程**（[kernel/model/conf.go - Save()](kernel/model/conf.go#L870-L900)）：
 
 ```
 1. 加读写锁（m.Lock），防止并发写入
@@ -124,7 +123,7 @@ SiYuan 采用前后端分离架构，主题与外观系统由**后端内核（Go
 
 ### 3.3 初始化与默认值
 
-`InitConf()` 负责配置初始化（[kernel/model/conf.go - InitConf()](file:///d:/fz/0601/solo-dogfeeding/code/288-siyuan/kernel/model/conf.go#L123-L625)）：
+`InitConf()` 负责配置初始化（[kernel/model/conf.go - InitConf()](kernel/model/conf.go#L123-L625)）：
 
 1. 从 `conf.json` 加载已有配置
 2. 加载失败或解析失败时**仅记录日志**，使用零值结构
@@ -132,7 +131,7 @@ SiYuan 采用前后端分离架构，主题与外观系统由**后端内核（Go
 4. 对无效值进行修正（如语言不存在则回退）
 5. 首次运行时保存完整默认配置
 
-**默认外观**（[kernel/conf/appearance.go - NewAppearance()](file:///d:/fz/0601/solo-dogfeeding/code/288-siyuan/kernel/conf/appearance.go#L41-L55)）：
+**默认外观**（[kernel/conf/appearance.go - NewAppearance()](kernel/conf/appearance.go#L41-L55)）：
 
 - 模式：明亮（Mode=0）
 - 跟随系统：开启（ModeOS=true）
@@ -184,11 +183,11 @@ SiYuan 采用前后端分离架构，主题与外观系统由**后端内核（Go
 
 用户在设置面板修改后，`appearance._send()` 收集所有外观配置，通过 `fetchPost("/api/setting/setAppearance", ...)` 发送。
 
-参考：[app/src/config/appearance.ts - _send()](file:///d:/fz/0601/solo-dogfeeding/code/288-siyuan/app/src/config/appearance.ts#L184-L212)
+参考：[app/src/config/appearance.ts - _send()](app/src/config/appearance.ts#L184-L212)
 
 #### 第 2 步：后端处理
 
-`setAppearance()` 接口处理流程（[kernel/api/setting.go - setAppearance()](file:///d:/fz/0601/solo-dogfeeding/code/288-siyuan/kernel/api/setting.go#L530-L562)）：
+`setAppearance()` 接口处理流程（[kernel/api/setting.go - setAppearance()](kernel/api/setting.go#L530-L562)）：
 
 1. 反序列化参数到 `Appearance` 结构体
 2. 更新内存中的配置（`model.Conf.Appearance`）
@@ -198,7 +197,7 @@ SiYuan 采用前后端分离架构，主题与外观系统由**后端内核（Go
 
 #### 第 3 步：前端接收并刷新
 
-**桌面端**：`updateAppearance()` 处理广播（[app/src/config/util/updateAppearance.ts](file:///d:/fz/0601/solo-dogfeeding/code/288-siyuan/app/src/config/util/updateAppearance.ts)）：
+**桌面端**：`updateAppearance()` 处理广播（[app/src/config/util/updateAppearance.ts](app/src/config/util/updateAppearance.ts)）：
 
 1. 若旧主题有 JS 且主题发生了变化，尝试调用 `destroyTheme()` 清理
 2. 若无 `destroyTheme` 函数，则导出布局后刷新页面
@@ -207,11 +206,11 @@ SiYuan 采用前后端分离架构，主题与外观系统由**后端内核（Go
 
 **移动端**：直接 `window.location.reload()` 刷新页面（因涉及原生状态栏交互，全量刷新更可靠）
 
-参考：[app/src/mobile/util/onMessage.ts - setAppearance](file:///d:/fz/0601/solo-dogfeeding/code/288-siyuan/app/src/mobile/util/onMessage.ts#L39-L41)
+参考：[app/src/mobile/util/onMessage.ts - setAppearance](app/src/mobile/util/onMessage.ts#L39-L41)
 
 ### 4.3 系统主题跟随
 
-`initAssets()` 中注册了 `prefers-color-scheme` 监听器（[app/src/util/assets.ts - initAssets()](file:///d:/fz/0601/solo-dogfeeding/code/288-siyuan/app/src/util/assets.ts#L162-L210)）：
+`initAssets()` 中注册了 `prefers-color-scheme` 监听器（[app/src/util/assets.ts - initAssets()](app/src/util/assets.ts#L162-L210)）：
 
 ```javascript
 window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", event => {
@@ -231,7 +230,7 @@ window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", eve
 
 **关键设计**：`setAppearanceMode` 接口**不广播** `setAppearance` 事件，因为是前端主动调用的，前端自己处理刷新即可，避免重复通知。
 
-参考：[kernel/api/system.go - setAppearanceMode()](file:///d:/fz/0601/solo-dogfeeding/code/288-siyuan/kernel/api/system.go#L704-L725)
+参考：[kernel/api/system.go - setAppearanceMode()](kernel/api/system.go#L704-L725)
 
 ### 4.4 主题热刷新
 
@@ -242,8 +241,8 @@ window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", eve
 - 前端直接更新 `<link>` 的 `href` 属性，浏览器自动重新加载
 
 参考：
-- [kernel/model/appearance.go - broadcastRefreshThemeIfCurrent()](file:///d:/fz/0601/solo-dogfeeding/code/288-siyuan/kernel/model/appearance.go#L259-L276)
-- [kernel/model/themes_watcher.go - handleThemesEvent()](file:///d:/fz/0601/solo-dogfeeding/code/288-siyuan/kernel/model/themes_watcher.go#L149-L154)
+- [kernel/model/appearance.go - broadcastRefreshThemeIfCurrent()](kernel/model/appearance.go#L259-L276)
+- [kernel/model/themes_watcher.go - handleThemesEvent()](kernel/model/themes_watcher.go#L149-L154)
 
 > **注意**：darwin 版本的 watcher 在 `handleThemesEvent` 中先过滤 `.css` 后缀，通用版本的过滤在 `broadcastRefreshThemeIfCurrent` 内部完成，两版本实现有细微差异。
 
@@ -253,7 +252,7 @@ window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", eve
 
 ### 5.1 脚本加载方式
 
-前端 `loadAssets()` 中直接构造脚本 URL 并加载（[app/src/util/assets.ts - loadAssets()](file:///d:/fz/0601/solo-dogfeeding/code/288-siyuan/app/src/util/assets.ts#L99-L108)）：
+前端 `loadAssets()` 中直接构造脚本 URL 并加载（[app/src/util/assets.ts - loadAssets()](app/src/util/assets.ts#L99-L108)）：
 
 ```javascript
 const themeScriptAddress = `/appearance/themes/${data.mode === 1 ? data.themeDark : data.themeLight}/theme.js?v=${data.themeVer}`;
@@ -276,7 +275,7 @@ if (themeScriptElement) {
 
 ### 5.2 addScript 的实现细节
 
-[app/src/protyle/util/addScript.ts](file:///d:/fz/0601/solo-dogfeeding/code/288-siyuan/app/src/protyle/util/addScript.ts)
+[app/src/protyle/util/addScript.ts](app/src/protyle/util/addScript.ts)
 
 ```javascript
 export const addScript = (path: string, id: string) => {
@@ -318,7 +317,7 @@ export const addScript = (path: string, id: string) => {
 
 ### 5.4 destroyTheme 约定
 
-[app/src/types/index.d.ts - destroyTheme()](file:///d:/fz/0601/solo-dogfeeding/code/288-siyuan/app/src/types/index.d.ts#L310)
+[app/src/types/index.d.ts - destroyTheme()](app/src/types/index.d.ts#L310)
 
 ```typescript
 destroyTheme(): Promise<void>;
@@ -352,9 +351,9 @@ destroyTheme(): Promise<void>;
 | 主题回退时 | `InitAppearance()` | 回退到内置主题时设为 false |
 
 参考：
-- [kernel/model/appearance.go - LoadThemes()](file:///d:/fz/0601/solo-dogfeeding/code/288-siyuan/kernel/model/appearance.go#L210)
-- [kernel/api/system.go - setAppearanceMode()](file:///d:/fz/0601/solo-dogfeeding/code/288-siyuan/kernel/api/system.go#L716-L718)
-- [kernel/model/bazaar.go](file:///d:/fz/0601/solo-dogfeeding/code/288-siyuan/kernel/model/bazaar.go#L356)
+- [kernel/model/appearance.go - LoadThemes()](kernel/model/appearance.go#L210)
+- [kernel/api/system.go - setAppearanceMode()](kernel/api/system.go#L716-L718)
+- [kernel/model/bazaar.go](kernel/model/bazaar.go#L356)
 
 **后端作用**：
 1. 持久化到 `conf.json`，下次启动时无需再次检测
@@ -369,7 +368,7 @@ destroyTheme(): Promise<void>;
 
 #### 场景一：收到 setAppearance 广播
 
-[app/src/config/util/updateAppearance.ts](file:///d:/fz/0601/solo-dogfeeding/code/288-siyuan/app/src/config/util/updateAppearance.ts)
+[app/src/config/util/updateAppearance.ts](app/src/config/util/updateAppearance.ts)
 
 ```javascript
 if (window.siyuan.config.appearance.themeJS) {  // 旧主题是否有 JS
@@ -388,7 +387,7 @@ if (window.siyuan.config.appearance.themeJS) {  // 旧主题是否有 JS
 
 #### 场景二：系统主题跟随切换
 
-[app/src/util/assets.ts - initAssets()](file:///d:/fz/0601/solo-dogfeeding/code/288-siyuan/app/src/util/assets.ts#L183-L205)
+[app/src/util/assets.ts - initAssets()](app/src/util/assets.ts#L183-L205)
 
 ```javascript
 fetchPost("/api/system/setAppearanceMode", {...}, async response => {
@@ -427,7 +426,7 @@ fetchPost("/api/system/setAppearanceMode", {...}, async response => {
 
 ### 7.1 主题回退
 
-`InitAppearance()` 中进行有效性检查（[kernel/model/appearance.go](file:///d:/fz/0601/solo-dogfeeding/code/288-siyuan/kernel/model/appearance.go#L53-L65)）：
+`InitAppearance()` 中进行有效性检查（[kernel/model/appearance.go](kernel/model/appearance.go#L53-L65)）：
 
 ```go
 if !containTheme(Conf.Appearance.ThemeDark, Conf.Appearance.DarkThemes) {
@@ -451,7 +450,7 @@ if !gulu.Str.Contains(Conf.Appearance.Icon, Conf.Appearance.Icons) {
 
 ### 7.2 代码高亮主题回退
 
-[app/src/protyle/render/util.ts - setCodeTheme()](file:///d:/fz/0601/solo-dogfeeding/code/288-siyuan/app/src/protyle/render/util.ts#L52-L75)
+[app/src/protyle/render/util.ts - setCodeTheme()](app/src/protyle/render/util.ts#L52-L75)
 
 ```javascript
 if (!Constants.SIYUAN_CONFIG_APPEARANCE_LIGHT_CODE.includes(css)) {
@@ -466,7 +465,7 @@ if (!Constants.SIYUAN_CONFIG_APPEARANCE_DARK_CODE.includes(css)) {
 
 ### 7.3 语言回退
 
-三级回退策略（[kernel/model/conf.go](file:///d:/fz/0601/solo-dogfeeding/code/288-siyuan/kernel/model/conf.go#L156-L182)）：
+三级回退策略（[kernel/model/conf.go](kernel/model/conf.go#L156-L182)）：
 
 ```
 用户指定语言 → 系统检测语言（近似匹配） → 默认 en_US
@@ -478,13 +477,13 @@ if (!Constants.SIYUAN_CONFIG_APPEARANCE_DARK_CODE.includes(css)) {
 
 ### 8.1 独立的设置界面
 
-移动端有独立的设置页面：[app/src/mobile/settings/appearance.ts](file:///d:/fz/0601/solo-dogfeeding/code/288-siyuan/app/src/mobile/settings/appearance.ts)
+移动端有独立的设置页面：[app/src/mobile/settings/appearance.ts](app/src/mobile/settings/appearance.ts)
 
 功能与桌面端一致，但 UI 适配移动端交互。
 
 ### 8.2 原生状态栏适配
 
-`updateMobileTheme()` 根据主题背景色更新移动端状态栏颜色（[app/src/util/assets.ts - updateMobileTheme()](file:///d:/fz/0601/solo-dogfeeding/code/288-siyuan/app/src/util/assets.ts#L372-L393)）：
+`updateMobileTheme()` 根据主题背景色更新移动端状态栏颜色（[app/src/util/assets.ts - updateMobileTheme()](app/src/util/assets.ts#L372-L393)）：
 
 | 平台 | 调用方式 |
 |------|----------|
@@ -507,7 +506,7 @@ if (!Constants.SIYUAN_CONFIG_APPEARANCE_DARK_CODE.includes(css)) {
 
 移动端在 `setAppearance` 消息处理中直接 `window.location.reload()`。
 
-参考：[app/src/mobile/util/onMessage.ts](file:///d:/fz/0601/solo-dogfeeding/code/288-siyuan/app/src/mobile/util/onMessage.ts#L39-L41)
+参考：[app/src/mobile/util/onMessage.ts](app/src/mobile/util/onMessage.ts#L39-L41)
 
 ---
 
@@ -535,7 +534,7 @@ SiYuan 对异常资源采用**分级处理**策略，不同层级的异常有不
 - 无法拷贝内置资源到用户目录
 - 无法读取主题/图标根目录
 
-参考：[kernel/model/appearance.go - InitAppearance()](file:///d:/fz/0601/solo-dogfeeding/code/288-siyuan/kernel/model/appearance.go#L36-L46)
+参考：[kernel/model/appearance.go - InitAppearance()](kernel/model/appearance.go#L36-L46)
 
 致命错误会阻止应用正常启动，需用户介入解决文件系统问题。
 
@@ -620,8 +619,8 @@ if err = themesWatcher.Add(themesDir); err != nil {
 
 ### 10.1 存储与加载
 
-- 后端持久化：[kernel/api/snippet.go](file:///d:/fz/0601/solo-dogfeeding/code/288-siyuan/kernel/api/snippet.go)
-- 前端渲染：[app/src/config/util/snippets.ts - renderSnippet()](file:///d:/fz/0601/solo-dogfeeding/code/288-siyuan/app/src/config/util/snippets.ts#L7-L42)
+- 后端持久化：[kernel/api/snippet.go](kernel/api/snippet.go)
+- 前端渲染：[app/src/config/util/snippets.ts - renderSnippet()](app/src/config/util/snippets.ts#L7-L42)
 
 ### 10.2 应用时机
 
