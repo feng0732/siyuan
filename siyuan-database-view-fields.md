@@ -816,48 +816,98 @@ if val := destVal.GetValByType(destKey.Type); nil == val || reflect.ValueOf(val)
 #### 7.4.5 看板/画廊封面字段失效
 
 - **现象**：画廊或看板的 `CoverFrom = CoverFromAssetField`，且 `CoverFromAssetKeyID` 指向的字段类型从 `mAsset` 切换为其他类型
-- **判断：封面降级为空，不会崩溃，且不会显示旧资源数据。**
+- **唯一明确结论：封面是否显示旧图片，取决于该单元格在资源字段类型下是否曾经填过值。填过就显示旧图片，没填过就不显示。** 类型切换本身不会清理旧资源数据。
 
-  完整链路（以画廊为例，`kernel/sql/av_gallery.go` L196-L212，看板在 `kernel/sql/av_kanban.go` L191-L207）：
+##### 完整证据链
 
-  ```go
-  case av.CoverFromAssetField:
-      if "" == view.Gallery.CoverFromAssetKeyID {
-          break                                 // L197-L198：无资源字段 ID → 无封面
-      }
+**证据 1：类型切换不清空子结构**
 
-      assetValue := attrView.GetValue(view.Gallery.CoverFromAssetKeyID, cardID)
-      if nil == assetValue || 1 > len(assetValue.MAsset) {
-          break                                 // L201-L203：值为 nil 或 MAsset 为空 → 无封面
-      }
+`kernel/model/attribute_view.go` L4672-L4677：
 
-      for _, asset := range assetValue.MAsset {
-          if asset.Type == av.AssetTypeImage && util.IsPossiblyImage(asset.Content) {
-              galleryCard.CoverURL = asset.Content  // L207-L208：找到图片 → 设置封面
-              break
-          }
-      }
-      return
-  ```
+```go
+changeType = keyValues.Key.Type != colType
+keyValues.Key.Type = colType
 
-  **降级为空的精确触发条件**（满足任一即不显示封面）：
+for _, value := range keyValues.Values {
+    value.Type = colType   // 只改 Type 标记，不动 Text/Number/MAsset 等子结构
+}
+```
 
-  | 条件 | 代码行 | 说明 |
-  |------|--------|------|
-  | `CoverFromAssetKeyID` 为空字符串 | L197-L198 | 未配置资源字段 |
-  | `attrView.GetValue()` 返回 nil | L201 | 该单元格从未被写入过任何值 |
-  | `len(assetValue.MAsset) < 1` | L202 | `MAsset` 切片为空或 nil |
-  | `MAsset` 中所有资源 `Type != AssetTypeImage` | L207 遍历无匹配 | 没有图片资源 |
-  | `MAsset` 中图片资源 `util.IsPossiblyImage(content) == false` | L207 | URL 不是合法图片路径 |
+类型切换只修改 `Key.Type` 和 `Value.Type` 两个标记字段，**不清理任何旧类型的子结构指针**。
 
-  **为什么不会显示旧资源数据**：类型切换时（`kernel/model/attribute_view.go` L4672-L4677），`changeType` 触发后虽然只改 `Key.Type` 和 `Value.Type`、不清空子结构，但封面代码**不检查值的 Type 字段**，直接读 `assetValue.MAsset`。旧 `MAsset` 子结构理论上仍在内存中，但：
+**证据 2：JSON 序列化保留旧子结构**
 
-  1. 若该单元格在资源字段类型下从未填过值 → `MAsset` 本就为 nil → L202 break
-  2. 若该单元格曾填过资源值 → `MAsset` 非 nil，理论上仍会被读到并显示旧封面 → 这是**唯一可能显示旧资源的场景**
+`kernel/av/value.go` L46-L61 中，`Value` 的所有类型子结构（Text、Number、MAsset 等）都使用 `json:",omitempty"` 标签。对于切片和指针类型：
+- 指针为 nil 或切片长度为 0 → 不序列化
+- 指针非 nil 且内容非空 → **正常序列化**
 
-  **用户可见结果**：
-  - 绝大多数情况下卡片不显示封面（静默降级）
-  - 仅当该单元格在原资源字段类型下曾填过图片资源时，切换类型后可能短暂显示旧图片，直到用户编辑该单元格触发值清理
+因此，旧类型的子结构只要有数据，就会被持久化到 JSON 文件中。
+
+**证据 3：封面渲染不检查 Type，直接读 MAsset**
+
+以画廊为例，`kernel/sql/av_gallery.go` L196-L212（看板在 `kernel/sql/av_kanban.go` L191-L207）：
+
+```go
+case av.CoverFromAssetField:
+    if "" == view.Gallery.CoverFromAssetKeyID {
+        break
+    }
+    assetValue := attrView.GetValue(view.Gallery.CoverFromAssetKeyID, cardID)
+    if nil == assetValue || 1 > len(assetValue.MAsset) {
+        break   // 只判断 MAsset 是否为空，不判断 Type
+    }
+    for _, asset := range assetValue.MAsset {
+        if asset.Type == av.AssetTypeImage && util.IsPossiblyImage(asset.Content) {
+            galleryCard.CoverURL = asset.Content
+            break
+        }
+    }
+```
+
+封面代码通过 `attrView.GetValue()` 直接从原始数据取值，**完全不检查 `value.Type`**，直接访问 `assetValue.MAsset` 字段。只要 `MAsset` 切片非空且包含图片，就显示封面。
+
+**证据 4：编辑新类型值不会清理旧值**
+
+`kernel/av/value.go` L384-L419 的 `SetValByType` 方法：
+
+```go
+func (value *Value) SetValByType(typ KeyType, val any) {
+    switch typ {
+    case KeyTypeText:
+        value.Text = val.(*ValueText)    // 只设 Text
+    case KeyTypeMAsset:
+        value.MAsset = val.([]*ValueAsset)  // 只设 MAsset
+    // ... 每种类型只设置对应字段
+    }
+    // 从不清理其他类型的旧字段
+}
+```
+
+编辑新类型的值时，只会覆盖新类型对应的子结构指针，**不会清空旧类型的子结构**。所以从 mAsset 切到 text 后再编辑文本，旧的 MAsset 数据仍然保留。
+
+##### 降级为空的精确触发条件
+
+当且仅当以下任一条件满足时，封面不显示：
+
+| 条件 | 代码行 | 说明 |
+|------|--------|------|
+| `CoverFromAssetKeyID` 为空字符串 | `av_gallery.go` L197-L198 | 用户未配置封面资源字段 |
+| `attrView.GetValue()` 返回 nil | `av_gallery.go` L201 | 该单元格从未被写入过任何值 |
+| `len(assetValue.MAsset) < 1` | `av_gallery.go` L202 | `MAsset` 切片为空或 nil（即该字段在资源类型下从未填过值） |
+| `MAsset` 中所有资源 `Type != AssetTypeImage` | `av_gallery.go` L207 遍历无匹配 | 只有非图片资源 |
+| `MAsset` 中图片资源 `util.IsPossiblyImage(content) == false` | `av_gallery.go` L207 | URL 不是合法图片路径 |
+
+##### 用户可见结果
+
+- **曾填过图片的单元格**：类型切换后封面继续显示旧图片，和切换前视觉上无差异。用户可能意识不到字段类型已经变了。
+- **从未填过图片的单元格**：类型切换前后都不显示封面（静默降级），用户感知不到变化。
+- **旧数据长期留存**：旧 MAsset 数据会一直保留在 JSON 文件中，不会因为编辑新类型的值而消失。只有切回资源类型并手动清空、或删除该字段，旧数据才会被清理。
+
+##### 潜在问题
+
+由于封面代码不检查字段类型，字段从 mAsset 切走后，封面显示的其实是「残留的旧数据」，而非当前字段类型的有效值。这在以下场景可能造成困惑：
+- 用户切换字段类型后，封面看起来还在正常显示，但单元格内容已经不是资源类型了
+- 删除资源字段时，如果 `CoverFromAssetKeyID` 没被清理，可能引发 nil 解引用（但 `GetValue` 返回 nil 时有 `nil == assetValue` 保护，不会崩溃）
 
 ### 7.5 主键（block）类型的特殊性
 
@@ -1028,7 +1078,6 @@ if nil == val1 || val1.IsEmpty() {
 - [ ] 类型切换后旧值结构是否真的残留？构造测试用例验证 JSON 输出
 - [ ] 类型切换时是否应该清理过滤规则？当前跳过过滤的用户体验是否合理
 - [ ] 切回原类型时，旧数据"复活"是预期行为还是 bug？
-- [ ] 封面字段类型切换后，旧 `MAsset` 指针非 nil 时显示过期封面的具体复现条件
 
 ### 9.2 渲染正确性
 
