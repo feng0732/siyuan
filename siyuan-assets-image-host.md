@@ -6,7 +6,7 @@
 2. [附件引用机制](#附件引用机制)
 3. [上传配置项详解](#上传配置项详解)
 4. [上传设置与流程](#上传设置与流程)
-5. [云端批量上传链路](#云端批量上传链路)
+5. [三种云端资源处理场景的严格区分](#三种云端资源处理场景的严格区分)
 6. [路径映射策略](#路径映射策略)
 7. [权限校验机制](#权限校验机制)
 8. [清理策略与一致性保证](#清理策略与一致性保证)
@@ -205,103 +205,164 @@ MultipartForm 解析（c.Request.MultipartForm）
 
 ---
 
-## 云端批量上传链路
+## 三种云端资源处理场景的严格区分
 
-### 界面触发点
+SiYuan 涉及"云端"的资源处理存在三种**完全不同**的语义，代码证据表明它们的行为、触发方式和对正文的影响均严格区分，不可混淆：
 
-SiYuan 中有 **5 处 UI/API** 会触发云端图床批量上传：
+| 维度 | 场景一：云端批量上传 | 场景二：标准 Markdown 导出渲染 | 场景三：发布到链滴社区 |
+|------|---------------------|------------------------------|----------------------|
+| **核心语义** | 把本地资源推到 SiYuan 云端做备份/CDN | 输出 .md 时给链接加云端前缀 | 先上传社区图床再发帖 |
+| **触发函数** | `UploadAssets2Cloud` / `UploadAssets2CloudByAssetsPaths` | `ExportStdMarkdown` | `Export2Liandi` |
+| **内部调用** | `uploadAssets2Cloud(assets, bizTypeUploadAssets, ignorePushMsg)` | `exportMarkdownContent0(tree, cloudAssetsBase, …)` | 先 `uploadAssets2Cloud(assets, bizTypeExport2Liandi, false)`，再 `exportMarkdownContent0(tree, forumAssetsBase, assetsDestSpace2Underscore=true, …)` |
+| **bizType 参数** | `"upload-assets"` | 不参与上传 | `"export-liandi"` |
+| **meta-type** | `5`（SiYuan 内部） | N/A | `4`（社区 Client） |
+| **上传目标** | `{cloudServer}/apis/siyuan/upload` | 不上传 | `{cloudServer}/apis/siyuan/upload`，最终链接前缀 `{forumAssetsServer}/{yyyymm}/siyuan/{userId}/` |
+| **是否回写正文（.sy 文件）** | **完全不回写**，保留本地 `assets/` 链接 | **完全不回写**，仅内存渲染 | **仅回写 `custom-liandi-articleid` 属性**，不修改资源链接 |
+| **返回值** | `count`（成功上传个数） | `string`（渲染后的 Markdown 文本） | `error`（社区发帖是否成功） |
 
-| 触发场景 | 文件位置 | 调用方式 |
-|---------|---------|---------|
-| **文档面包屑菜单 → 上传到云端图床** | `app/src/protyle/breadcrumb/index.ts#L363-L374` | 菜单项 `uploadAssets2CDN`，`needSubscribe()` 前置拦截后 `fetchPost("/api/asset/uploadCloud", {id})` |
-| **发布到链滴社区** | `app/src/protyle/breadcrumb/index.ts#L375-L387` + `kernel/model/export.go` | `fetchPost("/api/export/export2Liandi", {id})`，导出流程内部调用 `uploadAssets2Cloud(bizTypeExport2Liandi)` |
-| **标准 Markdown 导出（订阅者）** | `kernel/model/export.go#L1686-L1688` | `IsSubscriber()` 判定后自动替换链接前缀为云端图床 URL |
-| **API /api/asset/uploadCloud** | `kernel/api/router.go#L309` | 参数 `{id, ignorePushMsg?}`，按文档 ID 批量提取并上传 |
-| **API /api/asset/uploadCloudByAssetsPaths** | `kernel/api/router.go#L310` | 参数 `{paths:[...], ignorePushMsg?}`，由调用方直接指定资源路径列表 |
+### 场景一：云端批量上传（上传到云端图床菜单）
 
-### 完整链路（面包屑 → 云端）
+**触发入口（2 个）：**
+
+| 入口 | 前端位置 | API | 参数 |
+|------|---------|-----|------|
+| 文档面包屑菜单「上传到云端图床」 | `app/src/protyle/breadcrumb/index.ts#L363-L374` | `POST /api/asset/uploadCloud` | `{id: protyle.block.id}` |
+| 按路径直接指定 | 供插件/脚本使用 | `POST /api/asset/uploadCloudByAssetsPaths` | `{paths: [string,...], ignorePushMsg?: bool}` |
+
+**完整调用链：**
 
 ```
-点击菜单 [上传到云端图床]
-  (app/src/protyle/breadcrumb/index.ts#L363)
-    │
-    ▼ needSubscribe() 校验（前端本地判断）
-    │  依据 window.siyuan.user.userSiYuanProExpireTime
-    │  非订阅：showMessage("此功能需订阅 SiYuan 会员") → 中止
-    │  (app/src/util/needSubscribe.ts#L4-L19)
-    │
-    ▼ confirmDialog() 二次确认
-    │  提示文本来自 window.siyuan.languages.uploadAssets2CDNConfirmTip
-    │
-    ▼ fetchPost("/api/asset/uploadCloud", {id: protyle.block.id})
-    │  (app/src/util/fetch.ts#L8-L117)
-    │  - POST JSON Body
-    │  - 401 时 3 秒后 window.location.reload()
-    │  - 响应通过 processMessage() 路由到 showMessage()
-    │
-    ▼ Gin 中间件（kernel/api/router.go#L309）
-    │  model.CheckAuth → model.CheckAdminRole → model.CheckReadonly
-    │  → api.uploadCloud(c)
-    │
-    ▼ 参数解析：util.JsonArg(c, ret)
-    │  - id (必填)：文档块 ID
-    │  - ignorePushMsg (可选)：是否静默不发 WS 消息
-    │
-    ▼ model.UploadAssets2Cloud(id, ignorePushMsg)
-    │  (kernel/model/assets.go#L613-L660)
-    │  ├─ !IsSubscriber() → 返回 ErrNotLoggedIn(1) 直接拒绝
-    │  ├─ DocAssets(id) 递归提取该文档及子文档的全部 assets/ 路径
-    │  └─ 调用 uploadAssets2Cloud(paths, false, "", ignorePushMsg)
-    │
-    ▼ uploadAssets2Cloud 核心逻辑
-    │  (kernel/model/assets.go#L662-L776)
-    │  ├─ LoadUploadToken() 获取 1h 有效期 Cookie
-    │  ├─ GetAssetAbsPath() 批量解析 → 去重
-    │  ├─ 单文件大小限制：免费用户 3MB，订阅者 10MB
-    │  ├─ HTTP POST multipart/form-data →
-    │  │   {siyuanCloudServer}/apis/siyuan/upload
-    │  │   Cookie: symphony={token}
-    │  │   Header: meta-type=5 (图床), biz-type
-    │  └─ 逐条替换文档中的 assets/xxx → {cloudAssetsServer}/{user}/{yyyymm}/xxx
-    │
-    ▼ util.PushMsg() 广播 WebSocket 消息（app/src/util/processMessage.ts）
-    │
-    ▼ 前端收到响应 → processMessage() 判断 code===0
-       → showMessage(Conf.Language(41), 3000)
-         "已上传 N 个资源文件到云端图床"
+点击菜单
+  └─ needSubscribe() 本地判断订阅状态
+       ├─ 非订阅 → showMessage 拦截中止
+       └─ 订阅者 → confirmDialog 二次确认
+            └─ fetchPost("/api/asset/uploadCloud", {id})
+                 └─ Gin 中间件链：CheckAuth → CheckAdminRole → CheckReadonly
+                      └─ kernel/api/asset.go: uploadCloud(c)
+                           ├─ 参数：id 必填，ignorePushMsg 可选
+                           └─ UploadAssets2Cloud(id, ignorePushMsg)
+                                ├─ IsSubscriber() 再次校验（后端防御）
+                                ├─ LoadTreeByBlockID(id) 加载文档
+                                ├─ 标题块额外包含 HeadingChildren
+                                ├─ getAssetsLinkDests + getQueryEmbedNodesAssetsLinkDests
+                                │    提取文档内 assets/ 路径
+                                ├─ gulu.Str.RemoveDuplicatedElem 去重
+                                └─ uploadAssets2Cloud(assets, bizTypeUploadAssets, ignorePushMsg)
 ```
 
-### 参数来源详解
+**`uploadAssets2Cloud` 真实行为（`kernel/model/assets.go#L662-L776`）：**
 
-**`/api/asset/uploadCloud` 参数：**
+函数签名只有 3 个参数，**不存在 `needReplaceDocAssets` 参数**：
 
-```json
-{
-  "id": "20240101000000-abcd123",      // 文档块ID，来源 protyle.block.id
-  "ignorePushMsg": false               // 可选，true 时不发送 WS 提示
+```go
+func uploadAssets2Cloud(assetPaths []string, bizType string, ignorePushMsg bool) (count int, err error)
+```
+
+执行步骤：
+1. `GetAssetAbsPath` 批量解析绝对路径 + 去重
+2. 推送进度消息（Language 27 "正在上传 N 个资源文件…"）
+3. `LoadUploadToken()` 获取 1 小时有效期的 symphony Cookie
+4. 大小限制：3MB（免费）/ 10MB（订阅者），超限 PushErrMsg 跳过（最多 3 条）
+5. 循环 `httpclient.NewCloudFileRequest2m()` 逐文件上传
+   - 端点：`{cloudServer}/apis/siyuan/upload?ver=`
+   - Cookie：`symphony={uploadToken}`
+   - Header：`meta-type`=5、`biz-type`="upload-assets"
+6. 失败：401→语言31（未登录）、网络错误→ErrFailedToConnectCloudServer、业务错误→包装消息
+7. 完成：仅记录 `completedUploadAssets` 和 `count`
+8. **⚠️ 没有任何遍历 .sy 文件 / bytes.Replace / writeTree 的代码**——本地文档正文的 `assets/` 链接完全不变
+
+**结论：** 该场景的作用是把资源做云端备份/发布前的预热，本地仍保留相对链接。后续需要渲染云端 URL 时由导出场景（场景二/三）在内存中加前缀。
+
+---
+
+### 场景二：标准 Markdown 导出的资源前缀渲染
+
+**触发入口：**
+
+| 入口 | API | 说明 |
+|------|-----|------|
+| 导出菜单 | 前端通过 `POST /api/export/*` 系列路由 | 后端 API 通过 `kernel/api/router.go` 的标准导出端点调用 |
+| 直接调用 | `ExportStdMarkdown(id, ...)` | 供其他内核逻辑复用 |
+
+**关键代码 `kernel/model/export.go#L1678-L1722`：**
+
+```go
+func ExportStdMarkdown(id string, ...) string {
+    tree := prepareExportTree(bt)
+    cloudAssetsBase := ""
+    if IsSubscriber() {
+        cloudAssetsBase = util.GetCloudAssetsServer() + Conf.GetUser().UserId + "/"
+        // 中国大陆示例："https://assets.b3logfile.com/siyuan/{userId}/"
+    }
+    return exportMarkdownContent0(id, tree, cloudAssetsBase, ...)
 }
 ```
 
-**`/api/asset/uploadCloudByAssetsPaths` 参数：**
+**前缀注入方式（`kernel/model/export.go#L2300-L2301`）：**
 
-```json
-{
-  "paths": [                           // 直接指定资源相对路径数组
-    "assets/20240101000000-image.jpg",
-    "assets/20240101000001-doc.pdf"
-  ],
-  "ignorePushMsg": false
+```go
+luteEngine := NewLute()
+if "" != cloudAssetsBase {
+    luteEngine.RenderOptions.LinkBase = cloudAssetsBase
 }
 ```
 
-**内部 `uploadAssets2Cloud` 私有参数（不对外暴露）：**
+这是 Lute 渲染引擎的配置项，**仅在内存中渲染 AST→Markdown 时对所有以 `assets/` 开头的链接附加前缀**。输出的 `.md` 文件中链接会变成绝对云端 URL，但工作空间里的 `.sy` 文件不受任何修改。
 
-| 参数 | 类型 | 含义 |
-|------|------|------|
-| `assets` | `[]string` | 资源相对路径集合 |
-| `needReplaceDocAssets` | `bool` | 是否将文档内本地链接替换为云端 URL（`export2Liandi` 为 false，面板上传为 true） |
-| `bizType` | `string` | 业务标识：`""`=普通图床、`bizTypeExport2Liandi`=链滴社区发布 |
-| `ignorePushMsg` | `bool` | 静默模式 |
+---
+
+### 场景三：发布到链滴社区
+
+**触发入口：**
+
+| 入口 | 前端位置 | API | 参数 |
+|------|---------|-----|------|
+| 面包屑菜单「分享到链滴」 | `app/src/protyle/breadcrumb/index.ts#L375-L387` | `POST /api/export/export2Liandi` | `{id: protyle.block.parentID}`（整个文档，注意这里是 **parentID**，不是 uploadCloud 用的 id） |
+
+**完整调用链（`kernel/model/export.go#L322-L439`）：**
+
+```
+export2Liandi(c)
+  └─ Export2Liandi(id)
+       ├─ IsUserGuide(tree.Box) → 拒绝用户指南文档发布
+       │
+       ├─ Step 1: 上传到社区图床
+       │    ├─ getAssetsLinkDests + getQueryEmbedNodesAssetsLinkDests 去重
+       │    └─ uploadAssets2Cloud(assets, bizTypeExport2Liandi="export-liandi", ignorePushMsg=false)
+       │         └─ 上传时 meta-type=4（Client 标识），但**仍不回写正文**
+       │
+       ├─ Step 2: 内存构造社区格式 Markdown
+       │    └─ exportMarkdownContent0(
+       │         id, tree,
+       │         // cloudAssetsBase 前缀：
+       │         util.GetCloudForumAssetsServer()
+       │           + time.Now().Format("2006/01") + "/siyuan/"
+       │           + Conf.GetUser().UserId + "/",
+       │         // 中国大陆示例：
+       │         //   "https://b3logfile.com/file/2025/06/siyuan/{userId}/"
+       │         assetsDestSpace2Underscore=true,   // ★ 空格 → 下划线
+       │         ...)
+       │         └─ 内部 AST 遍历（L2303-L2326）：NodeLinkDest、TextMark a、IFrame/Audio/Video
+       │              的 assets 链接中空格替换为 _（因为论坛图床服务端会自动做该转换）
+       │              这一步是在 exportTree 的副本上操作，不写回磁盘
+       │
+       ├─ Step 3: 查询是否已发布过（custom-liandi-articleid）
+       │    ├─ GET /api/v2/article/update/{id}
+       │    └─ 200/404 判定是否存在
+       │
+       ├─ Step 4: 发帖/更帖
+       │    ├─ POST 或 PUT {accountServer}/api/v2/article
+       │    └─ Body: {articleTitle, articleTags, articleContent=渲染的Markdown}
+       │
+       └─ Step 5: ★ 唯一的回写操作
+            └─ 首次发布成功 → 给根文档块 IAL 添加 custom-liandi-articleid 属性
+                 这一步通过 writeTreeUpsertQueue(tree) 写回磁盘，但完全不涉及资源链接字段
+```
+
+**关键证据：**
+- `assetsDestSpace2Underscore=true` 对应社区图床对含空格文件的自动重命名逻辑
+- `GetCloudForumAssetsServer`（社区）≠ `GetCloudAssetsServer`（订阅者导出）—— 两套独立服务域名
+- 回写只有 `custom-liandi-articleid` 属性这一处
 
 ---
 
@@ -588,40 +649,22 @@ if "" != existAssetPath {
 
 ## 外部服务异常处理
 
-### 云端图床上传
+### 云端图床上传（uploadAssets2Cloud）
 
-`kernel/model/assets.go#L662-L776` 的 `uploadAssets2Cloud` 核心逻辑：
+`kernel/model/assets.go#L662-L776` 已在前文详述，异常处理总结：
 
-```
-参数检查 → IsSubscriber() 订阅者校验
-    │
-    ▼
-GetAssetAbsPath 批量解析路径 → 去重
-    │
-    ▼
-LoadUploadToken() → 有效期 3600s，失败直接返回
-    │
-    ▼
-单文件校验：
-  ├─ size > 3MB（非订阅）/ 10MB（订阅）→ 跳过 + 提示（最多 3 条）
-  ├─ Stat 失败 → 立即中止（返回已上传数量）
-    │
-    ▼
-逐文件上传 HTTP：
-  ├─ endpoint: {cloudServer}/apis/siyuan/upload
-  ├─ auth: Cookie symphony={uploadToken}
-  ├─ headers: meta-type（5=图床, 4=社区发帖）, biz-type
-  ├─ 失败返回：
-  │   ├─ 401 → 登录失效（ErrCode 31）
-  │   ├─ 网络错误 → ErrFailedToConnectCloudServer
-  │   └─ 业务错误 → 包装服务端消息
-  └─ 成功 → 记录 completedUploadAssets
-    │
-    ▼
-返回成功计数 count
-```
+| 异常类型 | 处理方式 | 是否中断 |
+|---------|---------|---------|
+| 资源路径解析失败 | LogWarnf + return | 是，返回错误 |
+| 资源找不到 | LogErrorf + continue | 否，跳过该文件 |
+| LoadUploadToken 失败 | PushErrMsg + return | 是 |
+| Stat 失败（文件消失/权限） | LogErrorf + return count, statErr | 是，保留已成功 count |
+| 文件超 3MB / 10MB 限制 | PushErrMsg（最多 3 条） + continue | 否，跳过超限文件 |
+| 网络连接错误 | LogErrorf + ErrFailedToConnectCloudServer | 是 |
+| HTTP 401 | 返回 Language(31)（未登录） | 是 |
+| 业务 code ≠ 0 | LogErrorf + Language(94) 包装 | 是 |
 
-**异常行为**：上传为顺序执行，中途任意文件失败会 **中止整个批量并返回当前 count**，不执行已上传文件的回滚。已成功上传的云端文件不会被清理。
+**⚠️ 注意：** 中途失败不执行已上传文件的回滚。云端已接收的文件不会被主动清理，这符合 CDN/对象存储的"最终一致"设计。
 
 ### 网络资源本地化
 
@@ -652,11 +695,15 @@ API 端点：
 
 ### 云端区域切换
 
-通过 `CurrentCloudRegion` 支持双区域：
-- `0` → 中国大陆（阿里云 + 七牛云）
-- `1` → 北美（Cloudflare + 七牛云）
+通过 `CurrentCloudRegion` 支持双区域，`kernel/util/cloud.go#L67-L84` 统一定义：
 
-所有服务端点在 `kernel/util/cloud.go#L67-L84` 统一定义，包括：同步服务、图床服务、社区图床、账号服务。
+| 服务 | 中国大陆 (0) | 北美 (1) |
+|------|-------------|---------|
+| 云端服务/同步 | `siyuan-sync.b3logfile.com` | `siyuan-cloud.liuyun.io` |
+| 同步 OSS | `siyuan-data.b3logfile.com/` | `siyuan-data.liuyun.io/` |
+| 订阅者导出图床 (GetCloudAssetsServer) | `assets.b3logfile.com/siyuan/` | `assets.liuyun.io/siyuan/` |
+| 社区图床 (GetCloudForumAssetsServer) | `b3logfile.com/file/` | `assets.liuyun.io/file/` |
+| 账号/发布服务 (GetCloudAccountServer) | `ld246.com` | `liuyun.io` |
 
 ---
 
@@ -672,10 +719,11 @@ Step 1: 文件系统层
   ├─ 同步复制 {old}.sya → {new}.sya（PDF 标注）
   └─ OCR 文本：util.SetAssetText(newPath, GetAssetText(oldPath))
 
-Step 2: 所有文档内容遍历
+Step 2: 所有文档内容遍历 ★（此处确实会回写正文，和 UploadAssets2Cloud 不同）
   ├─ 分页（32）遍历所有笔记本下的 .sy 文件
-  ├─ bytes 级全文替换：bytes.Replace(data, oldName, newName, -1)
-  ├─ 重新解析 tree → 生成历史版本 → 写入 SQL 队列
+  ├─ bytes.Contains → bytes.Replace(oldName, newName, -1)
+  ├─ filelock.WriteFile → 写回磁盘
+  ├─ 重新解析 tree → generateTreeHistory → UpsertBlockTree + UpsertTreeQueue
   └─ cache.RemoveTreeData 失效缓存
 
 Step 3: 数据库（Attribute View）JSON 替换
@@ -699,10 +747,11 @@ API 端点：`POST /api/asset/renameAsset`（`kernel/api/asset.go#L177-L198`）�
 
 | 导出格式 | 资源处理方式 | 关键实现 |
 |---------|-------------|---------|
-| **发布到链滴社区** | 调用 `uploadAssets2Cloud(bizTypeExport2Liandi)` 上传社区图床，替换链接前缀为 `{forumAssetsServer}/{yyyymm}/siyuan/{userId}/` | L338, L389 |
-| **标准 Markdown** | 订阅者模式下链接前缀为 `{cloudAssetsServer}/{userId}/`；否则保持本地相对路径 | L1686-L1688 |
-| **PDF / DOCX** | `removeAssets=false` 时复制资源文件到导出目录并嵌入；`removeAssets=true` 时保持链接不复制 | L755, L1245 |
-| **导出压缩包** | 遍历所有引用 → `copiedAssets` HashSet 去重 → 按相对路径复制到导出目录，AV JSON 同步替换 | L1957-L2008 |
+| **发布到链滴社区** | 见前文场景三：上传社区图床 + 内存前缀渲染（含空格→下划线），POST 到社区 API | `Export2Liandi` L322-L439 |
+| **标准 Markdown** | 订阅者 `IsSubscriber()` 情况下通过 `luteEngine.RenderOptions.LinkBase` 给输出 Markdown 加云端前缀，仅影响内存输出 | `ExportStdMarkdown` L1678-L1722 |
+| **PDF / DOCX (`removeAssets=false`)** | 复制 assets 目录到临时导出文件夹并嵌入（DOCX: `tmpAssets` 目录；PDF: 内嵌图片流） | `ExportDocx` L832、`ProcessPDF` L1291 |
+| **PDF / DOCX (`removeAssets=true`)** | 保持超链接形式，不复制资源文件到输出物 | `processPDFLinkEmbedAssets` L1488 |
+| **导出压缩包（批量）** | 遍历所有引用 → `copiedAssets` HashSet 去重 → 按相对路径复制到导出目录，AV JSON 同步替换路径 | `export.go` L1957-L2008 |
 
 ### 笔记本级资源迁移辅助
 
@@ -716,31 +765,33 @@ API 端点：`POST /api/asset/renameAsset`（`kernel/api/asset.go#L177-L198`）�
 
 | 文件 | 职责 |
 |------|------|
-| `kernel/model/assets.go` | 资源管理核心：清理、重命名、引用提取、云端上传、网络转本地 |
-| `kernel/model/upload.go` | 上传主流程、本地文件插入、三级目录选择、文件名规范化 |
-| `kernel/api/asset.go` | HTTP API 层：unused/missing/remove/rename/ocr/上传云端 |
+| `kernel/model/assets.go` | 资源管理核心：清理、重命名、引用提取、上传云端、网络转本地、Unused/Missing 算法 |
+| `kernel/model/upload.go` | 上传主流程、本地文件插入、三级目录选择、文件名规范化、七牛 ETag 查重 |
+| `kernel/api/asset.go` | HTTP API 层：unused/missing/remove/rename/ocr/上传云端两个端点 |
+| `kernel/api/export.go` | export2Liandi HTTP 封装、导出系列 API 参数解析 |
 | `kernel/api/router.go` | 所有 API 路由注册与中间件挂载（含鉴权链） |
 | `kernel/server/serve.go` | 文件上传端点 `/upload`、静态资源鉴权 Group |
-| `kernel/model/session.go` | CheckAuth/CheckAdminRole/CheckReadonly 权限中间件 |
-| `kernel/model/conf.go` | IsSubscriber/IsPaidUser 订阅状态判断 |
+| `kernel/model/session.go` | CheckAuth（7 种身份识别）/CheckAdminRole/CheckReadonly 权限中间件 |
+| `kernel/model/conf.go` | IsSubscriber/IsPaidUser 订阅状态判断、GetUser 用户配置 |
+| `kernel/model/export.go` | Export2Liandi 完整发布链路、ExportStdMarkdown、exportMarkdownContent0 前缀渲染、PDF/DOCX 导出 |
 | `kernel/cache/asset.go` | 哈希-路径双层缓存、全局资产搜索缓存 |
 | `kernel/sql/asset.go` | 资产数据库表 CRUD、按哈希查询 |
-| `kernel/model/cloud_service.go` | 上传 Token 获取与缓存（1h TTL） |
-| `kernel/util/cloud.go` | 双区域云端端点配置 |
-| `kernel/util/etag.go` | 七牛云 ETag 哈希算法实现 |
-| `kernel/util/file.go` | 文件名规范化、长度截断、非法字符过滤 |
-| `kernel/util/path.go` | 资源链接判定、MIME 类型、工作空间路径校验 |
-| `kernel/util/websocket.go` | PushMsg/PushErrMsg 等消息广播函数 |
+| `kernel/model/cloud_service.go` | LoadUploadToken 获取与缓存（1h TTL） |
+| `kernel/util/cloud.go` | 双区域 6 组云端端点常量 |
+| `kernel/util/etag.go` | 七牛云 ETag 分块哈希算法实现 |
+| `kernel/util/file.go` | 文件名规范化、长度截断、非法字符过滤链 |
+| `kernel/util/path.go` | IsAssetLinkDest 资源链接判定、工作空间路径校验 |
+| `kernel/util/websocket.go` | PushMsg/PushErrMsg/PushUpdateMsg 等 WebSocket 广播函数 |
 | `kernel/model/assets_watcher.go` | 非 macOS 平台文件系统监视器（fsnotify + 100ms 防抖） |
-| `kernel/model/history.go` | 历史生成定时任务、保留策略 |
+| `kernel/model/history.go` | 历史生成定时任务、保留策略、rollbackAssetsHistory 实现 |
 | `kernel/job/cron.go` | 所有周期任务注册：历史清理、OCR、SQL 刷盘等 |
-| `kernel/model/transaction.go` | 文档级事务执行与错误分类处理 |
+| `kernel/model/transaction.go` | 文档级事务 performTx 执行与 5 类错误码分类处理 |
 | `kernel/conf/editor.go` | Editor 配置结构体（含 HistoryRetentionDays） |
-| `app/src/protyle/upload/index.ts` | 前端上传：校验、进度、结果渲染、事务回滚 |
-| `app/src/protyle/util/Options.ts` | Protyle 默认 upload 配置初始化 |
-| `app/src/protyle/breadcrumb/index.ts` | 面包屑菜单：上传到云端图床、发布到链滴、网络资源本地化 |
-| `app/src/config/image.ts` | 前端资源管理面板：未引用 / 缺失 / AV 清理 UI |
+| `app/src/protyle/upload/index.ts` | 前端上传：三阶段校验、XMLHttpRequest 进度、结果智能渲染、事务 undo/redo |
+| `app/src/protyle/util/Options.ts` | Protyle 默认 upload 18 项配置初始化值 |
+| `app/src/protyle/breadcrumb/index.ts` | 面包屑菜单：上传到云端图床 L363、分享到链滴 L375、网络资源本地化 L345 |
+| `app/src/config/image.ts` | 前端资源管理面板：未引用 / 缺失 / AV 清理三个 Tab UI |
 | `app/src/util/fetch.ts` | fetchPost 统一 HTTP 封装、401 自动刷新、processMessage 路由 |
-| `app/src/util/needSubscribe.ts` | 前端订阅者判断 + showMessage 提示 |
-| `app/src/util/processMessage.ts` | WebSocket 消息分发与 Toast 呈现 |
-| `app/src/types/protyle.d.ts` | IUpload 接口类型定义（完整字段文档） |
+| `app/src/util/needSubscribe.ts` | 前端订阅者判断（含 iOS 平台差异化提示）+ showMessage 拦截 |
+| `app/src/util/processMessage.ts` | WebSocket 消息分发（按 code 分支）与 Toast 呈现 |
+| `app/src/types/protyle.d.ts` | IUpload 接口类型定义（18 字段完整文档） |
