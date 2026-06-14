@@ -28,47 +28,135 @@ Protyle 是 SiYuan 笔记应用的核心富文本编辑器，采用 **所见即�
 
 ## 2. 内容模型 (Content Model)
 
-### 2.1 数据结构
+### 2.1 块类型定义与前后端协作
 
-Protyle 采用 **Block DOM** 模型，每个块元素具有以下核心属性：
+#### 2.1.1 块类型定义来源
 
-```typescript
-// 核心块属性
-interface BlockElement {
-    "data-node-id": string;           // 块唯一标识 (Lute.NewNodeID())
-    "data-type": string;              // 块类型: NodeParagraph, NodeHeading, NodeList 等
-    "data-subtype"?: string;          // 子类型: u/o/t (列表类型), 1-6 (标题级别)
-    "updated"?: string;               // 更新时间戳 YYYYMMDDHHmmss
-    "fold"?: "1";                     // 是否折叠
-    "custom-*"?: string;              // 自定义属性
+> **重要修正**：块类型常量并非在 SiYuan 代码库中定义，而是来自第三方 Markdown 解析引擎 **Lute**（`github.com/88250/lute/ast`）。内核（Go）和前端（TypeScript）均通过 Lute 暴露的 API 引用这些类型。
+
+| 层级 | 类型表示方式 | 定义位置 |
+|------|-------------|----------|
+| 内核（Go） | `ast.NodeHeading`, `ast.NodeParagraph` 等常量 | Lute 引擎 `github.com/88250/lute/ast` 包 |
+| 内核→数据库 | 类型缩写（`h`, `p`, `l`, `i` 等） | [treenode/node.go#L370-L398](kernel/treenode/node.go#L370-L398) 的 `typeAbbrMap` |
+| 内核→前端 | 完整类型名（`NodeHeading`, `NodeParagraph` 等） | Lute 引擎 `Md2BlockDOM()` 输出的 Block DOM HTML 的 `data-type` 属性 |
+| 前端 | 通过 DOM `data-type` 属性字符串匹配 | 前端代码中无集中类型常量，使用字符串直接比较 |
+
+#### 2.1.2 内核块类型映射（数据库存储）
+
+内核通过 `typeAbbrMap` 将完整块类型名映射为缩写后存储到 SQLite `blocks` 表的 `type` 字段（参见 [database.go#L123](kernel/sql/database.go#L123) 表结构定义）：
+
+```go
+// treenode/node.go 中的类型缩写映射
+var typeAbbrMap = map[string]string{
+    "NodeDocument":         "d",
+    "NodeHeading":          "h",
+    "NodeList":             "l",
+    "NodeListItem":         "i",
+    "NodeCodeBlock":        "c",
+    "NodeMathBlock":        "m",
+    "NodeTable":            "t",
+    "NodeBlockquote":       "b",
+    "NodeSuperBlock":       "s",
+    "NodeParagraph":        "p",
+    "NodeHTMLBlock":        "html",
+    "NodeBlockQueryEmbed":  "query_embed",
+    "NodeAttributeView":    "av",
+    "NodeCallout":          "callout",
+    "NodeThematicBreak":    "tb",
+    "NodeIFrame":           "iframe",
+    "NodeWidget":           "widget",
+    "NodeVideo":            "video",
+    "NodeAudio":            "audio",
 }
 ```
 
-**块类型定义**参见 [protyle.d.ts](app/src/types/protyle.d.ts#L27-L141)，支持的块类型包括：
-- `NodeDocument` - 文档块
-- `NodeParagraph` - 段落块
-- `NodeHeading` - 标题块 (1-6级)
-- `NodeList` / `NodeListItem` - 列表块
-- `NodeCodeBlock` - 代码块
-- `NodeMathBlock` - 数学公式块
-- `NodeTable` - 表格块
-- `NodeBlockQueryEmbed` - 嵌入查询块
-- `NodeBlockquote` / `NodeCallout` - 引用/提示块
+子类型（subtype）通过 `SubTypeAbbr()` 函数生成（参见 [node.go#L416-L451](kernel/treenode/node.go#L416-L451)）：
+- 列表：`u`=无序列表, `o`=有序列表, `t`=任务列表
+- 标题：`h1`~`h6`
+- Callout：`info`/`warning`/`success`/`danger` 等
 
-### 2.2 内容流转
+#### 2.1.3 前端 Block DOM 数据结构
 
-#### 2.2.1 文档加载流程
+内核通过 Lute 的 `Md2BlockDOM()` 方法将 Markdown AST 转换为带 `data-*` 属性的 HTML，前端接收的每个块元素具有以下核心属性：
 
-1. **发起请求** - [Protyle.getDoc()](app/src/protyle/index.ts#L354-L373) 调用 `/api/filetree/getDoc`
-2. **数据接收** - [onGet()](app/src/protyle/util/onGet.ts#L24-L131) 处理内核返回的 Block DOM HTML
-3. **XSS 净化** - 使用 DOMPurify 净化行级备注内容 ([onGet.ts#L148-L156](app/src/protyle/util/onGet.ts#L148-L156))
-4. **DOM 注入** - [setHTML()](app/src/protyle/util/onGet.ts#L133-L333) 将内容注入到 `protyle-wysiwyg` 容器
+```html
+<div data-node-id="20240102150405-abc123"    <!-- 块唯一标识 (Lute.NewNodeID()) -->
+     data-type="NodeHeading"                  <!-- 块类型：完整类型名 -->
+     data-subtype="h2"                        <!-- 子类型 -->
+     updated="20240102150405"                 <!-- 更新时间戳 -->
+     fold="1"                                 <!-- 是否折叠 -->
+     custom-icon="📝"                         <!-- 自定义属性 -->
+     class="h2">
+  ...
+</div>
+```
 
-#### 2.2.2 动态加载策略
+### 2.2 内核 → 前端的数据流转
+
+#### 2.2.1 文档加载完整链路
+
+```
+前端 Protyle.getDoc()
+    ↓ POST /api/filetree/getDoc
+内核 GetDoc() [file.go#L460](kernel/model/file.go#L460)
+    ├─ FlushTxQueue()                        // 先刷新事务队列，保证数据一致性
+    ├─ LoadTreeByBlockID(id) → parse.Tree     // 从 SQLite 加载为 Lute AST
+    ├─ 遍历树节点，截断超出 dynamicLoadBlocks 的部分
+    └─ Tree2BlockDOMHTML() → <div data-type="Node*"> HTML 字符串
+    ↓ 返回 { dom: HTML, blockCount, eof, ... }
+前端 onGet() [onGet.ts#L24-L131](app/src/protyle/util/onGet.ts#L24-L131)
+    ├─ DOMPurify 净化行级备注内容
+    ├─ setHTML() 注入到 protyle-wysiwyg 容器
+    └─ 执行渲染管道 processRender()
+```
+
+#### 2.2.2 内核侧关键数据转换
+
+1. **SQLite 存储**：`blocks` 表中 `type` 字段存缩写（如 `h`），`subtype` 存子类型缩写
+2. **AST 构建**：`LoadTreeByBlockID()` 从数据库还原为 Lute `ast.Node` 树，恢复完整类型常量
+3. **Block DOM 生成**：通过 Lute 渲染器输出 `data-type="NodeHeading"` 等完整类型名
+
+#### 2.2.3 动态加载策略
 
 - **批量加载** - 通过 `window.siyuan.config.editor.dynamicLoadBlocks` 配置，默认加载 **192** 块，内核配置可调整范围 **[48, 1024]**（参见 [editor.go#L49-L93](kernel/conf/editor.go#L49-L93)，前端设置仅有 `min="48"` 下限限制（参见 [config/editor.ts#L199](app/src/config/editor.ts#L199)），上限由内核配置校验逻辑保证
 - **方向加载** - 向上滚动使用 `CB_GET_BEFORE`，向下滚动使用 `CB_GET_APPEND`
 - **高度阈值** - `REMOVED_OVER_HEIGHT = contentElement.clientHeight * 8`，超过此高度时从视口外的块将被移除以节省内存 ([onGet.ts#L157](app/src/protyle/util/onGet.ts#L157))
+
+### 2.3 前端块类型渲染使用位置
+
+前端通过读取 DOM 元素的 `data-type` 属性字符串进行匹配，在以下场景中使用块类型：
+
+#### 2.3.1 交互处理场景
+
+| 模块 | 关键代码位置 | 块类型处理逻辑 |
+|------|-------------|---------------|
+| 输入处理 | [input.ts#L37](app/src/protyle/wysiwyg/input.ts#L37) | `NodeBlockQueryEmbed` 嵌入块按回车时跳到下一个块，不换行 |
+| 回车处理 | [enter.ts#L52](app/src/protyle/wysiwyg/enter.ts#L52) | `NodeAttributeView` 行回车时新增 AV 行而非普通段落 |
+| 删除处理 | [remove.ts#L359](app/src/protyle/wysiwyg/remove.ts#L359) | `NodeCodeBlock` / `NodeTable` / `NodeAttributeView` 整块删除后不自动插入空段落 |
+| 选择处理 | [selection.ts#L655](app/src/protyle/util/selection.ts#L655) | `NodeBlockQueryEmbed` / `NodeAttributeView` 选择时跳过内部可编辑区域 |
+| 粘贴处理 | [paste.ts#L29](app/src/protyle/util/paste.ts#L29) | `NodeAttributeView` 粘贴时解析为 AV 数据而非普通 Markdown |
+| 快捷键处理 | [commonHotkey.ts#L287](app/src/protyle/wysiwyg/commonHotkey.ts#L287) | 折叠操作跳过 `NodeBlockQueryEmbed` 块 |
+
+#### 2.3.2 渲染与事务场景
+
+| 模块 | 关键代码位置 | 块类型处理逻辑 |
+|------|-------------|---------------|
+| 嵌入块渲染 | [blockRender.ts#L14](app/src/protyle/render/blockRender.ts#L14) | 只处理 `data-type="NodeBlockQueryEmbed"` 的元素，其他类型跳过 |
+| AV 渲染 | [av/render.ts#L454](app/src/protyle/render/av/render.ts#L454) | 只处理 `data-type="NodeAttributeView"` 的元素 |
+| 事务应用 | [transaction.ts#L133](app/src/protyle/wysiwyg/transaction.ts#L133) | update 操作后重新查询所有 `NodeBlockQueryEmbed` 并刷新 |
+| 事务应用 | [transaction.ts#L614](app/src/protyle/wysiwyg/transaction.ts#L614) | insert 操作后对 `NodeThematicBreak` 分割线进行特殊渲染 |
+| 浮动提示 | [renderBacklink.ts#L133](app/src/protyle/wysiwyg/renderBacklink.ts#L133) | 检测是否在嵌入块内部，决定反链渲染方式 |
+
+#### 2.3.3 工具栏与上下文菜单
+
+| 模块 | 关键代码位置 | 块类型处理逻辑 |
+|------|-------------|---------------|
+| 工具栏 | [toolbar/index.ts#L905](app/src/protyle/toolbar/index.ts#L905) | 根据选中块类型显示/隐藏相应的工具按钮（嵌入块隐藏刷新按钮等） |
+| 上下文菜单 | [gutter/index.ts#L1302](app/src/protyle/gutter/index.ts#L1302) | `NodeCallout` 类型显示 Callout 类型切换子菜单 |
+| 上下文菜单 | [gutter/index.ts#L1461](app/src/protyle/gutter/index.ts#L1461) | `NodeSuperBlock` 类型显示布局调整子菜单 |
+| 上下文菜单 | [gutter/index.ts#L1693](app/src/protyle/gutter/index.ts#L1693) | `NodeBlockQueryEmbed` 类型显示查询编辑/刷新菜单项 |
+
+> **设计洞察**：前端没有集中的块类型枚举或常量定义，所有类型判断都通过硬编码的字符串比较完成（如 `element.getAttribute("data-type") === "NodeBlockQueryEmbed"`）。这种设计的优势是灵活，缺点是类型安全缺失——拼写错误不会在编译时发现。
 
 ---
 
@@ -368,6 +456,52 @@ Protyle (入口)
 | undo/index.ts | transaction.ts | 调用 `onTransaction(..., isUndo=true)` 应用撤销 |
 | scroll/event.ts | onGet.ts | 滚动时调用 `onGet` 加载更多块 |
 
+### 6.4 前后端协作关系（块类型视角）
+
+#### 6.4.1 块类型完整流转链路
+
+块类型在系统中历经三次表示形式的转换：
+
+```
+内核 SQLite 存储 (blocks.type = "h" 缩写)
+         ↓ [LoadTreeByBlockID]
+Lute AST 节点 (n.Type = ast.NodeHeading 常量)
+         ↓ [Md2BlockDOM / Tree2BlockDOMHTML]
+前端 Block DOM HTML (data-type="NodeHeading" 完整字符串)
+         ↓ [getAttribute("data-type")]
+前端逻辑判断 (字符串比较 "NodeHeading")
+```
+
+#### 6.4.2 内核与前端的职责边界
+
+| 层级 | 块类型处理职责 | 关键文件 |
+|------|-------------|----------|
+| **内核侧** | | |
+| 持久化层 | 块类型缩写存储、查询过滤 | [sql/block.go](kernel/sql/block.go), [database.go](kernel/sql/database.go) |
+| 业务逻辑层 | AST 节点类型判断、树结构操作 | [treenode/node.go](kernel/treenode/node.go), [model/block.go](kernel/model/block.go) |
+| 渲染输出层 | Block DOM HTML 生成、`data-type` 属性输出 | Lute 引擎 `Md2BlockDOM()` |
+| **前端侧** | | |
+| 数据接收层 | 解析内核返回的 Block DOM HTML | [util/onGet.ts](app/src/protyle/util/onGet.ts) |
+| 交互处理层 | 根据 `data-type` 决定编辑行为 | [wysiwyg/input.ts](app/src/protyle/wysiwyg/input.ts), [wysiwyg/enter.ts](app/src/protyle/wysiwyg/enter.ts) |
+| 视图渲染层 | 根据 `data-type` 执行特殊渲染 | [render/blockRender.ts](app/src/protyle/render/blockRender.ts), [render/av/render.ts](app/src/protyle/render/av/render.ts) |
+| 事务处理层 | 根据 `data-type` 决定事务后处理 | [wysiwyg/transaction.ts](app/src/protyle/wysiwyg/transaction.ts) |
+
+#### 6.4.3 关键协作点
+
+1. **事务提交流程**：
+   - 前端：`updateInput()` 提取块 HTML 和 `data-type`，构造 `IOperation`
+   - 内核：接收事务，根据 `operation.action` 和块类型执行数据库更新，更新 `blocks.type` 字段（存缩写）
+
+2. **增量同步流程**：
+   - 内核：事务提交后通过 WebSocket 推送 `transactions` 事件，包含 `doOperations`
+   - 前端：`Protyle.onTransaction()` 接收后调用 `onTransaction()` 根据块类型更新本地 DOM
+
+3. **动态加载流程**：
+   - 前端：滚动触发 `getDoc()`，传入 `startID`、`endID`、`size`
+   - 内核：`GetDoc()` 查询数据库，按 `sort` 排序，截断超过 `dynamicLoadBlocks` 的块，生成 Block DOM HTML 返回
+
+> **设计权衡**：内核→前端使用完整类型名（`NodeHeading`）而非缩写，保证前端代码的可读性；但前端因此失去编译时类型检查，所有 `data-type` 比较都是字符串级别的运行时判断。
+
 ---
 
 ## 7. 性能限制与优化
@@ -556,7 +690,29 @@ fetchPost("/api/transactions", ...);     // 后发送
 - 复杂块结构（表格、列表）中光标定位不准确
 - IME 输入法连续输入时光标位置计算错误
 
-#### 10.2.3 撤销栈不一致
+#### 10.2.3 块类型映射风险
+
+块类型在系统中经过三次表示形式转换，任何一个环节出错都会导致渲染或编辑异常：
+
+```
+缩写存储 ("h") → AST 常量 (ast.NodeHeading) → DOM 属性 ("NodeHeading") → 字符串比较
+```
+
+| 风险点 | 说明 | 影响 |
+|--------|------|------|
+| **前后端类型不一致** | 内核新增块类型但前端未同步处理逻辑 | 新类型块无法正确渲染或编辑 |
+| **类型缩写映射错误** | `typeAbbrMap` 新增项遗漏或拼写错误 | 数据库块无法正确还原为 AST 节点 |
+| **前端字符串比较错误** | 硬编码字符串 `"NodeBlockQueryEmbed"` 拼写错误 | 类型判断失效，嵌入块/AV 等无法正常工作 |
+| **Lute 引擎升级** | Lute 引擎修改类型常量名称或语义 | 整个渲染链断裂 |
+
+#### 10.2.4 类型安全缺失风险
+
+前端无集中的块类型常量定义，全部通过字符串字面量比较（参见 [2.3 节设计洞察](#23-前端块类型渲染使用位置)）：
+- 编译时无法检测拼写错误
+- 块类型重命名需要全局搜索替换
+- 新增块类型需要修改 30+ 处判断逻辑
+
+#### 10.2.5 撤销栈不一致
 
 - 远程推送的操作不进入本地撤销栈
 - 撤销时可能与远程更改产生冲突
@@ -613,9 +769,11 @@ fetchPost("/api/transactions", ...);     // 后发送
 #### 10.5.3 可维护性改进
 
 1. **状态管理** - 引入状态管理库集中管理编辑器状态
-2. **类型强化** - 补充 `IOperation` 等核心类型的完整定义
-3. **单元测试** - 为事务合并、光标定位等复杂逻辑添加测试
-4. **文档完善** - 补充关键算法的设计文档和流程图
+2. **类型安全** - 建立块类型常量枚举，将 30+ 处硬编码字符串替换为常量引用，编译时检查类型正确性
+3. **类型强化** - 补充 `IOperation` 等核心类型的完整定义
+4. **前后端类型同步** - 建立内核 `typeAbbrMap` 与前端类型常量的代码生成机制，确保自动同步
+5. **单元测试** - 为事务合并、光标定位等复杂逻辑添加测试
+6. **文档完善** - 补充关键算法的设计文档和流程图
 
 ---
 
