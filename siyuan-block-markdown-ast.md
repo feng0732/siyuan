@@ -61,13 +61,13 @@ SiYuan 的块级 Markdown 解析体系采用 **三层解析 + 一层编排** 的
 
 Lute 解析器按以下优先级识别块边界（从高到低）：
 
-```
+`````
 1. 空行分隔（连续 2 个换行符 \n\n）
    └── 绝大多数块的显式边界
 
 2. 行首标记识别（行首 0-3 空格后的特殊字符）
    ├── # + 空格          → 标题块 (NodeHeading)
-   ├── 三反引号 / ~~~    → 代码块开始 (NodeCodeBlock)
+   ├── ``` / ~~~         → 代码块开始 (NodeCodeBlock)
    ├── > + 空格          → 引用块 (NodeBlockquote)
    ├── -/*/+ + 空格      → 无序列表项 (NodeListItem, subtype=u)
    ├── 数字 + . + 空格   → 有序列表项 (NodeListItem, subtype=o)
@@ -86,7 +86,7 @@ Lute 解析器按以下优先级识别块边界（从高到低）：
 
 4. 兜底规则
    └── 无匹配 → 段落块 (NodeParagraph)
-```
+`````
 
 #### 2.1.2 WYSIWYG 模式对拆分的影响
 
@@ -281,15 +281,17 @@ if nil != srcEmptyList {
 
 **Markdown 语法**:
 
-使用三反引号 + 语言标识开启围栏，内容原样保留，三反引号关闭围栏：
+使用 ``` + 语言标识开启围栏，内容原样保留，``` 关闭围栏（围栏反引号数量 ≥ 3 且内外数量匹配）：
 
-    ```go
-    package main
-
-    func main() {
-        fmt.Println("Hello SiYuan")
-    }
-    ```
+> 示例如下（使用缩进代码块展示，避免嵌套围栏冲突）：
+>
+>     ```go
+>     package main
+>
+>     func main() {
+>         fmt.Println("Hello SiYuan")
+>     }
+>     ```
 
 围栏后可附加 IAL 属性，如 `{#code-block-id .custom-class}`。
 
@@ -301,22 +303,23 @@ if nil != srcEmptyList {
 5. 围栏后 IAL 提取为属性
 6. 围栏间内容 **原样保留**，不进行行级解析
 
-**AST 节点结构**:
-```go
+**AST 节点结构**（外层使用 5 反引号围栏，避免内层 ``` 冲突）:
+
+`````go
 &ast.Node{
     Type:              ast.NodeCodeBlock,
     ID:                "20250101120000-code12",
-    CodeBlockMarker:   []byte("三反引号"),    // 开始围栏标记
-    CodeBlockOpenMarker: []byte("三反引号"),  // 结束围栏标记
-    CodeBlockInfo:     []byte("go"),          // 语言标识
-    IsFencedCodeBlock: true,                  // 是否围栏代码块
-    Tokens:            []byte("package main..."),  // 代码内容（未转义）
+    CodeBlockMarker:   []byte("```"),       // 开始围栏标记（原始字符）
+    CodeBlockOpenMarker: []byte("```"),     // 结束围栏标记（原始字符）
+    CodeBlockInfo:     []byte("go"),        // 语言标识
+    IsFencedCodeBlock: true,                // 是否围栏代码块
+    Tokens:            []byte("package main\n\nfunc main() {\n    fmt.Println(\"Hello SiYuan\")\n}"),
     KramdownIAL:       [][]string{
         {"id", "20250101120000-code12"},
         {"custom-class", "custom-class"},
     },
 }
-```
+`````
 
 **注意**: 缩进代码块（4 空格缩进）在 WYSIWYG 模式下被 `SetIndentCodeBlock(false)` 禁用。
 
