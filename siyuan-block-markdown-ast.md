@@ -1,701 +1,382 @@
-# SiYuan 块级 Markdown 解析与 AST 构建机制分析
+# SiYuan 块级 Markdown 拆分规则与 AST 构建机制深度分析
 
-## 1. 整体架构概述
+## 1. 整体架构：解析分层与职责边界
 
-SiYuan（思源笔记）采用**前后端分离**的架构设计，前端使用 TypeScript 实现 Protyle 富文本编辑器，后端使用 Go 语言实现核心业务逻辑。块级 Markdown 解析与 AST 构建是整个系统的核心引擎，负责将用户输入的内容转换为结构化的块级数据模型。
+SiYuan 的块级 Markdown 解析体系采用 **三层解析 + 一层编排** 的架构设计，通过明确的职责划分实现解析的稳定性和可扩展性。
 
-### 1.1 核心依赖
-
-SiYuan 核心的 Markdown 解析能力来自外部依赖 **Lute** 引擎：
-
-- **Lute** (`github.com/88250/lute v1.7.7`)：一个结构化的 Markdown 解析引擎，专为中文语境优化，支持块级引用、属性列表（IAL）、超级块等扩展语法
-- **dataparser** (`github.com/siyuan-note/dataparser`)：负责 JSON 格式的树数据解析与修复
-
-### 1.2 模块分层结构
+### 1.1 四层架构总览
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                     前端 Protyle 编辑器                  │
-│  [app/src/protyle/]                                    │
-│  ├─ wysiwyg/       所见即所得编辑逻辑                   │
-│  ├─ render/        块渲染器                             │
-│  ├─ toolbar/       工具栏                               │
-│  └─ transaction.ts 事务提交逻辑                         │
-└────────────────────────┬────────────────────────────────┘
-                         │ HTTP/WebSocket
-┌────────────────────────▼────────────────────────────────┐
-│                     后端 Go Kernel                       │
-│  ┌───────────────────────────────────────────────────┐  │
-│  │  API 层 [kernel/api/]                            │  │
-│  │  ├─ block.go         块操作接口                   │  │
-│  │  ├─ block_op.go      块原子操作接口               │  │
-│  │  └─ lute.go          Markdown 转换接口            │  │
-│  └───────────────────┬───────────────────────────────┘  │
-│                      │                                  │
-│  ┌───────────────────▼───────────────────────────────┐  │
-│  │  业务模型层 [kernel/model/]                       │  │
-│  │  ├─ transaction.go   事务执行引擎                 │  │
-│  │  ├─ block.go         块数据模型                   │  │
-│  │  ├─ tree.go          树加载与构建                 │  │
-│  │  ├─ file.go          文件操作                     │  │
-│  │  ├─ index.go         索引构建                     │  │
-│  │  └─ format.go        格式化处理                   │  │
-│  └───────────────────┬───────────────────────────────┘  │
-│                      │                                  │
-│  ┌───────────────────▼───────────────────────────────┐  │
-│  │  核心数据层 [kernel/treenode/, kernel/filesys/]  │  │
-│  │  ├─ treenode/tree.go    树操作辅助函数            │  │
-│  │  ├─ treenode/node.go    节点操作与类型映射        │  │
-│  │  ├─ treenode/blocktree.go 块树索引（SQLite）     │  │
-│  │  └─ filesys/tree.go     文件系统读写（.sy）       │  │
-│  └───────────────────┬───────────────────────────────┘  │
-│                      │                                  │
-│  ┌───────────────────▼───────────────────────────────┐  │
-│  │  存储层 [kernel/sql/, kernel/cache/]              │  │
-│  │  ├─ sql/block.go       块 SQL 索引                │  │
-│  │  ├─ sql/upsert.go      数据批量插入               │  │
-│  │  └─ cache/             内存缓存                   │  │
-│  └───────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────────────┐
+│  Layer 4: 应用编排层 (Kernel Model)                               │
+│  [kernel/model/]                                                  │
+│  职责: 事务管理、业务校验、数据一致性、多系统同步                  │
+│  核心: transaction.go / block.go / file.go / tree.go             │
+└──────────────────────────┬────────────────────────────────────────┘
+                           │ Block DOM / parse.Tree / ast.Node
+┌──────────────────────────▼────────────────────────────────────────┐
+│  Layer 3: 数据持久化层 (Filesys / Treenode)                       │
+│  [kernel/filesys/] + [kernel/treenode/]                           │
+│  职责: .sy JSON 读写、版本升级、ID 修正、XSS 修复、块树索引        │
+│  核心: LoadTree / WriteTree / fixTreeJSONData / UpsertBlockTree   │
+└──────────────────────────┬────────────────────────────────────────┘
+                           │ Block DOM ↔ Tree 转换
+┌──────────────────────────▼────────────────────────────────────────┐
+│  Layer 2: 结构转换层 (Lute Engine)                                │
+│  [kernel/util/lute.go] + [github.com/88250/lute]                 │
+│  职责: Markdown ↔ Block DOM ↔ AST Tree 双向转换                  │
+│  核心: Md2BlockDOM / BlockDOM2Tree / Md2Tree / Tree2Md           │
+└──────────────────────────┬────────────────────────────────────────┘
+                           │ 纯文本 Markdown
+┌──────────────────────────▼────────────────────────────────────────┐
+│  Layer 1: 语法分词层 (Lute Parser)                                │
+│  [github.com/88250/lute/parse]                                    │
+│  职责: 词法分析、块级拆分、行级解析、IAL 提取                     │
+│  核心: Block 识别器 / Inline 解析器 / IAL 解析器                  │
+└───────────────────────────────────────────────────────────────────┘
 ```
 
----
+### 1.2 核心转换路径
 
-## 2. 核心模块职责分析
-
-### 2.1 Lute 引擎集成层
-
-**文件**: [util/lute.go](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/util/lute.go#L1-L115)
-
-Lute 引擎是整个解析体系的基石，SiYuan 对其进行了深度定制：
-
-```go
-func NewLute() (ret *lute.Lute) {
-    ret = lute.New()
-    ret.SetProtyleWYSIWYG(true)       // 启用所见即所得模式
-    ret.SetBlockRef(true)              // 启用块引用
-    ret.SetKramdownIAL(true)           // 启用属性列表
-    ret.SetSuperBlock(true)            // 启用超级块
-    ret.SetCallout(true)               // 启用 Callout
-    ret.SetDataTask(true)              // 启用任务列表
-    // ... 约40+ 项配置
-}
-```
-
-**核心职责**:
-- Markdown ↔ Block DOM 双向转换
-- Block DOM ↔ AST Tree 双向转换
-- 行级元素解析（加粗、斜体、链接、块引用等）
-- 代码语法高亮、数学公式渲染
-
-**双引擎设计**:
-
-SiYuan 配置了两种 Lute 实例，用于不同场景：
-
-| 实例 | 创建函数 | 用途 | 关键配置差异 |
-|------|---------|------|-------------|
-| 编辑引擎 | `NewLute()` | 日常编辑、块操作 | `SetProtyleWYSIWYG(true)`、`SetSanitize(true)`、缩进代码块禁用 |
-| 导入引擎 | `NewStdLute()` | Markdown 导入 | `SetIndentCodeBlock(true)`、`SetGFMAutoLink(false)`、无 Sanitize |
-
-**代码参考**: [util/lute.go#L90-L115](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/util/lute.go#L90-L115)
-
-**关键解析选项**（约40+项配置）:
-- `SetProtyleWYSIWYG(true)` - 启用所见即所得模式，这是块级解析的核心开关
-- `SetKramdownIAL(true)` - 启用属性列表，支持块元数据存储
-- `SetBlockRef(true)` - 启用块引用语法 `((id))`
-- `SetSuperBlock(true)` - 启用超级块 `{{{...}}}`
-- `SetCallout(true)` - 启用 Callout 提示块
-- `SetSanitize(true)` - 启用 XSS 防护，过滤恶意脚本
-
-### 2.2 树节点操作层（treenode）
-
-**核心文件**:
-- [treenode/tree.go](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/treenode/tree.go#L1-L192)
-- [treenode/node.go](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/treenode/node.go#L1-L528)
-- [treenode/blocktree.go](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/treenode/blocktree.go#L1-L724)
-
-#### 2.2.1 块类型映射
-
-SiYuan 定义了丰富的块类型，并使用缩写进行存储优化：
-
-| 完整类型名 | 缩写 | 说明 |
-|-----------|------|------|
-| `NodeDocument` | `d` | 文档块 |
-| `NodeHeading` | `h` | 标题块 |
-| `NodeParagraph` | `p` | 段落块 |
-| `NodeList` | `l` | 列表块 |
-| `NodeListItem` | `i` | 列表项块 |
-| `NodeCodeBlock` | `c` | 代码块 |
-| `NodeTable` | `t` | 表格块 |
-| `NodeBlockquote` | `b` | 引用块 |
-| `NodeSuperBlock` | `s` | 超级块 |
-| `NodeCallout` | `callout` | 提示块 |
-| `NodeBlockQueryEmbed` | `query_embed` | 嵌入块 |
-| `NodeAttributeView` | `av` | 属性视图块 |
-
-**代码参考**: [treenode/node.go#L370-L398](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/treenode/node.go#L370-L398)
-
-#### 2.2.2 关键操作函数
-
-| 函数 | 职责 |
-|------|------|
-| `GetNodeInTree()` | 在树中按 ID 查找节点 |
-| `ParentBlock()` | 获取父级块节点 |
-| `ChildBlockNodes()` | 获取所有子块节点 |
-| `RefreshUpdated()` | 更新节点及其父节点的时间戳 |
-| `CreatedUpdated()` | 补全创建/更新时间 |
-| `NodeHash()` | 计算节点哈希值 |
-| `CheckSpec()` | 检查数据版本兼容性 |
-| `UpgradeSpec()` | 升级数据格式版本 |
-| `IndexBlockTree()` | 将块树索引到 SQLite |
-
-### 2.3 文件系统层（filesys）
-
-**核心文件**: [filesys/tree.go](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/filesys/tree.go#L1-L508)
-
-**核心职责**:
-- `.sy` 文件的读写（JSON 格式存储的 AST 树）
-- 使用内存映射（mmap）提升大文件写入性能
-- 树数据 JSON 解析与自动修复
-- 文档路径（HPath）构建
-- 缓存管理
-
-**关键流程**:
-```go
-func LoadTree(boxID, p string, luteEngine *lute.Lute) (*parse.Tree, error) {
-    // 1. 读取 .sy 文件
-    data, _ := filelock.ReadFile(filePath)
-    // 2. 数据修复（版本升级、属性转义、ID 修正）
-    data, needFix, _ := fixTreeJSONData(boxID, p, data, luteEngine)
-    // 3. JSON 解析为 AST 树
-    ret, _ := dataparser.ParseJSON(data, luteEngine.ParseOptions)
-    // 4. 构建 HPath（人类可读路径）
-    ret.HPath = buildHPath(ret)
-    return ret, nil
-}
-```
-
-### 2.4 事务处理层（Transaction）
-
-**核心文件**: [model/transaction.go](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/model/transaction.go#L1-L1950)
-
-这是整个系统的核心执行引擎，采用 **队列 + 异步** 架构：
-
-#### 2.4.1 数据结构
-
-```go
-type Operation struct {
-    Action     string         // 操作类型: create/update/insert/delete/move
-    Data       any            // 操作数据（Block DOM 或树）
-    ID         string         // 目标块 ID
-    ParentID   string         // 父块 ID
-    PreviousID string         // 前一个块 ID
-    NextID     string         // 后一个块 ID
-    // ... 其他字段
-}
-
-type Transaction struct {
-    DoOperations   []*Operation   // 执行操作
-    UndoOperations []*Operation   // 撤销操作
-    trees          map[string]*parse.Tree  // 事务中变更的树
-    nodes          map[string]*ast.Node    // 事务中变更的节点
-    luteEngine     *lute.Lute     // 解析引擎实例
-}
-```
-
-#### 2.4.2 事务队列机制
-
-```go
-var txQueue = make(chan *Transaction, 7)  // 容量为7的事务队列
-
-func flushQueue() {
-    for {
-        select {
-        case tx := <-txQueue:
-            flushTx(tx)  // 串行执行事务
-        }
-    }
-}
-```
-
-**设计特点**:
-- 单线程串行执行，避免并发冲突
-- 带有超时检测（>2000ms 打印警告）
-- 支持 panic 恢复，保证服务稳定性
-- 队列容量固定为7，超过时阻塞等待
-
-**错误处理机制**:
-
-事务执行失败时，根据错误代码执行不同的降级策略：
-
-| 错误码 | 类型 | 处理方式 | 代码位置 |
-|-------|------|---------|---------|
-| 0 | `TxErrCodeBlockNotFound` | 推送错误消息，不崩溃 | [transaction.go#L95-L108](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/model/transaction.go#L95-L108) |
-| 1 | `TxErrCodeDataIsSyncing` | 提示用户稍后重试（多语言） | [transaction.go#L109-L111](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/model/transaction.go#L109-L111) |
-| 2 | `TxErrCodeWriteTree` | **致命错误**，终止进程（`log.Fatalf`） | [transaction.go#L115-L116](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/model/transaction.go#L115-L116) |
-| 3 | `TxErrHandleAttributeView` | 提示错误，记录日志，继续运行 | [transaction.go#L112-L114](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/model/transaction.go#L112-L114) |
-| 4 | `TxErrCodePushMsg` | 推送自定义错误消息 | [transaction.go#L95-L108](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/model/transaction.go#L95-L108) |
-
-**Panic 恢复**:
-```go
-func flushTx(tx *Transaction) {
-    defer logging.Recover()  // 捕获 panic，保证服务不崩溃
-    flushLock.Lock()
-    // ... 执行事务
-}
-```
-
-#### 2.4.3 核心操作类型
-
-| 操作类型 | 处理函数 | 主要职责 |
+| 路径方向 | 入口函数 | 调用链路 |
 |---------|---------|---------|
-| `update` | `doUpdate()` | 更新单个块内容（DOM → AST 转换） |
-| `insert` | `doInsert()` | 插入新块 |
-| `delete` | `doDelete()` | 删除块 |
-| `move` | `doMove()` | 移动块位置 |
-| `append` | `doAppend()` | 追加块 |
-| `foldHeading` | `doFoldHeading()` | 折叠标题 |
-| `setAttrs` | `doSetAttrs()` | 设置块属性 |
+| **Markdown → Block DOM** | `Md2BlockDOM()` | `L1语法分词` → `L2 MarkdownAST` → `ProtyleRenderer` → `HTML(Block DOM)` |
+| **Block DOM → AST Tree** | `BlockDOM2Tree()` | `HTML Parser` → `DOM AST` → `转换规则` → `parse.Tree` |
+| **Markdown → AST Tree** | `Md2BlockDOMTree()` | `Md2BlockDOM()` → `BlockDOM2Tree()` |
+| **AST Tree → Markdown** | `FormatNodeSync()` | `ast.Node` → `Markdown Renderer` → `纯文本 Markdown` |
+| **AST Tree → Block DOM** | `RenderNodeBlockDOM()` | `ast.Node` → `ProtyleRenderer` → `HTML(Block DOM)` |
+
+**代码参考**:
+- Lute 引擎配置: [util/lute.go](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/util/lute.go)
+- Markdown 导入入口: [model/file.go#L1018-L1042](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/model/file.go#L1018-L1042)
+- 文档创建核心: [model/file.go#L1744-L1859](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/model/file.go#L1744-L1859)
 
 ---
 
-## 3. 完整运行链路分析
+## 2. 块级 Markdown 拆分规则详解
 
-### 3.0 前端事务处理机制
+### 2.1 块拆分的底层机制
 
-**核心文件**: [app/src/protyle/wysiwyg/transaction.ts](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/app/src/protyle/wysiwyg/transaction.ts)
+#### 2.1.1 块识别触发条件
 
-#### 3.0.1 前端事务队列
-
-前端维护独立的事务队列 `window.siyuan.transactions`，实现操作合并与顺序保证：
-
-```typescript
-// 事务入队
-export const transaction = (protyle: IProtyle, doOperations: IOperation[], undoOperations: IOperation[]) => {
-    window.siyuan.transactions.push({ protyle, doOperations, undoOperations });
-    if (window.siyuan.transactions.length === 1) {
-        promiseTransaction();  // 启动消费
-    }
-};
-
-// 消费队列
-const promiseTransaction = () => {
-    if (window.siyuan.transactions.length === 0) return;
-    
-    // 取出第一个事务
-    const { protyle, doOperations, undoOperations } = window.siyuan.transactions[0];
-    window.siyuan.transactions.splice(0, 1);  // 立即移除，避免并发问题
-    
-    // 发送到后端
-    fetchPost("/api/transactions", {
-        session: protyle.id,
-        transactions: [{ doOperations, undoOperations }]
-    }, (response) => {
-        // 回调中继续消费下一个
-        if (window.siyuan.transactions.length > 0) {
-            promiseTransaction();
-        }
-        // 处理响应，更新本地 DOM
-        processTransactionResponse(response, protyle);
-    });
-};
-```
-
-**关键设计**:
-1. **立即移除队列项**: 请求发送前就从队列移除，避免快速连续输入导致的"block not found"错误
-2. **串行执行**: 前一个请求返回后才发送下一个，保证后端执行顺序
-3. **操作合并**: 快速输入时，多个 `update` 操作可能在队列中合并
-
-#### 3.0.2 操作类型与本地更新
-
-| 操作类型 | 前端处理逻辑 |
-|---------|-------------|
-| `update` | 局部 DOM 替换，跳过正在编辑的块（光标位置保护） |
-| `insert` | 按 `previousID` / `parentID` 定位插入，特殊处理列表、Callout |
-| `delete` | 移除元素，删除最后一块时自动补空段落 |
-| `move` | 先移除原位置，再插入新位置，多窗口同步处理 |
-| `foldHeading` | 设置 `fold` 属性，移除/恢复子块 DOM |
-| `updateAttrs` | 更新块属性，同步更新图标、标签、背景等视觉元素 |
-
-**光标保护机制**:
-```typescript
-// 更新时跳过包含光标的块，避免光标丢失
-if (range && (item === range.startContainer || item.contains(range.startContainer))) {
-    // 正在编辑的块不能进行更新
-} else {
-    item.outerHTML = operation.data.replace("<wbr>", "");
-}
-```
-
-### 3.1 链路总览
+Lute 解析器按以下优先级识别块边界（从高到低）：
 
 ```
-用户输入
-    │
-    ▼
-[前端 Protyle 编辑器]
-    │  input/keydown 事件
-    ▼
-  生成 Operation
-    │  { action: "update", id: "...", data: "<div data-node-id=..." }
-    ▼
-[transaction.ts]
-    │  fetchPost("/api/transactions", ...)
-    ▼
-[后端 API 层]
-    │  api/router.go → PerformTransactions()
-    ▼
-[事务队列]
-    │  txQueue <- tx
-    ▼
-[事务执行引擎]
-    ├─ doUpdate() / doInsert() / ...
-    │   ├─ BlockDOM2Tree()  # DOM 转 AST 子树
-    │   ├─ AST 节点插入/替换
-    │   ├─ 引用关系处理
-    │   └─ writeTree()      # 标记树为待写入
-    ├─ commit()
-    │   ├─ writeTreeUpsertQueue()  # 写入 .sy 文件
-    │   ├─ UpsertBlockTree()       # 更新块树索引
-    │   └─ UpsertTreeQueue()       # 更新 SQL 索引
-    └─ WebSocket 广播更新
-         └─ [前端] → 局部 DOM 更新
+1. 空行分隔（连续 2 个换行符 \n\n）
+   └── 绝大多数块的显式边界
+
+2. 行首标记识别（行首 0-3 空格后的特殊字符）
+   ├── # + 空格          → 标题块 (NodeHeading)
+   ├── ``` / ~~~         → 代码块开始 (NodeCodeBlock)
+   ├── > + 空格          → 引用块 (NodeBlockquote)
+   ├── -/*/+ + 空格      → 无序列表项 (NodeListItem, subtype=u)
+   ├── 数字 + . + 空格   → 有序列表项 (NodeListItem, subtype=o)
+   ├── - [ ] + 空格      → 任务列表项 (NodeListItem, subtype=t)
+   ├── | 开头            → 表格块 (NodeTable)
+   ├── --- / *** / ___   → 分隔线块 (NodeThematicBreak)
+   ├── {{{ / }}}         → 超级块开始/结束 (NodeSuperBlock)
+   ├── {: ... }          → 属性列表 (NodeKramdownBlockIAL)
+   └── <tag              → HTML 块开始 (NodeHTMLBlock)
+
+3. 容器块嵌套规则（递归解析）
+   ├── 引用块: 每行 > 前缀递增
+   ├── 列表块: 缩进 2-4 空格为子级
+   ├── 超级块: {{{ / }}} 匹配对
+   └── Callout: > [!NOTE] 变体
+
+4. 兜底规则
+   └── 无匹配 → 段落块 (NodeParagraph)
 ```
 
-### 3.2 详细链路分解
+#### 2.1.2 WYSIWYG 模式对拆分的影响
 
-#### 3.2.1 Markdown 导入链路
+`SetProtyleWYSIWYG(true)`（SiYuan 强制启用）会改变以下拆分行为：
 
-**入口**: `CreateDocByMd()` → [model/file.go#L1018-L1042](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/model/file.go#L1018-L1042)
+| 选项 | 标准 Markdown | WYSIWYG 模式 |
+|------|-------------|-------------|
+| 缩进代码块 | 4 空格 = 代码块 | **禁用**（仅围栏代码块） |
+| Setext 标题 | `===` / `---` | **禁用**（仅 ATX `#` 标题） |
+| YAML Front Matter | `---` 元数据 | **禁用** |
+| 链接引用定义 | `[id]: url` | **禁用** |
+| 段落首空格 | 忽略 | **保留**（`SetParagraphBeginningSpace(true)`） |
+| 自动空格 | 中英文间插空格 | **禁用** |
 
-```
-Markdown 文本
-    │
-    ▼  luteEngine.Md2BlockDOM()
-  Block DOM (HTML 格式，带 data-node-id)
-    │
-    ▼  luteEngine.BlockDOM2Tree()
-  parse.Tree (AST 树)
-    │
-    ├─ 设置根节点属性（ID、标题、路径）
-    ├─ 自动补全空段落
-    ├─ 特殊节点转换（MP3→音频块、MP4→视频块）
-    ├─ 块 ID 生成与 IAL 属性设置
-    ▼
-  createTreeTx() → 事务提交
-    │
-    ├─ 写入 .sy 文件（JSON 格式）
-    ├─ 索引到 blocktrees 表
-    └─ 索引到 blocks SQL 表
-```
+**代码参考**: [util/lute.go#L50-L88](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/util/lute.go#L50-L88)
 
-#### 3.2.2 块更新链路（最核心）
+---
 
-**入口**: `doUpdate()` → [model/transaction.go#L1410-L1594](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/model/transaction.go#L1410-L1594)
+### 2.2 各块类型拆分与 AST 转换规则
 
-```
-前端传来 Block DOM（<div data-type="NodeParagraph" data-node-id="...">...</div>）
-    │
-    ├─ 1. 移除前端插入的光标标记
-    │    data = strings.ReplaceAll(data, editor.FrontEndCaret, "")
-    │
-    ├─ 2. DOM → AST 转换（Lute 引擎核心）
-    │    subTree := tx.luteEngine.BlockDOM2Tree(data)
-    │    └─ 内部将 HTML 结构解析为 ast.Node 树
-    │
-    ├─ 3. 加载目标树
-    │    tree, _ := tx.loadTree(id)
-    │    └─ 从缓存或 .sy 文件加载完整文档树
-    │
-    ├─ 4. 查找旧节点
-    │    oldNode := treenode.GetNodeInTree(tree, id)
-    │
-    ├─ 5. 引用关系处理（AST 全遍历）
-    │    ├─ 收集旧引用 def IDs（getRefDefIDs）
-    │    ├─ ast.Walk() 遍历新树
-    │    │   ├─ 剔除空白行级公式
-    │    │   ├─ sql.CacheRef() 缓存块引用
-    │    │   ├─ 动态锚文本覆盖（从缓存读取）
-    │    │   └─ 收集新引用 def IDs
-    │    ├─ 引用变更检测（slices.Equal 比较）
-    │    └─ 异步刷新引用计数（task.AppendAsyncTaskWithDelay）
-    │
-    ├─ 6. 特殊块类型处理
-    │    ├─ 容器块：折叠标题下方块迁移（MoveFoldHeading）
-    │    ├─ HTML块：剔除连续空行（issue #15377）
-    │    ├─ 属性视图块：设置视图类型
-    │    └─ 列表块：节点层级调整（FirstChild 跳过父列表）
-    │
-    ├─ 7. 节点替换（原子操作）
-    │    oldNode.InsertAfter(updatedNode)
-    │    oldNode.Unlink()
-    │
-    ├─ 8. 属性视图关联处理
-    │    ├─ 移除节点同步到 AV（syncDelete2AvBlock）
-    │    ├─ 插入/更新节点关联到 AV（upsertAvBlockRel）
-    │    └─ AV 视图名称异步更新（延迟 200ms）
-    │
-    ├─ 9. 折叠标题层级处理
-    │    ├─ 标题降级需展开父折叠标题
-    │    └─ 标题升级需在原折叠标题后插入
-    │       └─ 主动推送 insert 操作到前端
-    │
-    ├─10. 更新时间戳与缓存
-    │    ├─ treenode.CreatedUpdated(updatedNode)
-    │    │   └─ 递归更新所有父节点 updated 字段
-    │    ├─ cache.PutBlockIAL() 缓存块属性
-    │    └─ tx.nodes[updatedNode.ID] = updatedNode
-    │
-    ├─11. 标记树为待写入
-    │    tx.writeTree(tree)  // 放入 tx.trees 缓存
-    │
-    └─12. 事务提交时执行
-         ├─ filesys.WriteTree()  # 写入 .sy 文件
-         ├─ treenode.UpsertBlockTree()  # 更新 SQLite 块树索引
-         └─ sql.UpsertTreeQueue()  # 更新 SQL 全文索引
+#### 2.2.1 标题块 (Heading → `ast.NodeHeading`)
+
+**Markdown 语法**:
+```markdown
+# 一级标题
+## 二级标题 {#custom-id .custom-class name="别名"}
+### 三级标题 ^blockref-id
 ```
 
-**关键设计决策**:
+**拆分规则**:
+1. 行首 0-3 空格后匹配 `#{1,6}\s` 正则
+2. 提取 `#` 数量 → `HeadingLevel` (1-6)
+3. 移除行尾 IAL（属性列表），单独解析为 `NodeKramdownBlockIAL`
+4. 剩余内容作为行级元素递归解析（`heading → inline nodes`）
 
-1. **引用计数延迟刷新**: 使用 `task.AppendAsyncTaskWithDelay` 延迟 `util.SQLFlushInterval`（默认2000ms）执行，避免频繁更新
-2. **属性视图异步更新**: AV 块名称更新延迟 200ms 执行，避免与主事务竞争
-3. **列表节点特殊处理**: 当更新列表项时，自动跳过 `NodeList` 父节点，直接处理 `NodeListItem`
-4. **动态锚文本缓存**: 文档标题引用的动态锚文本从缓存读取，强制覆盖避免偶发不更新问题（issue #5891）
-
-#### 3.2.3 文件加载链路
-
-**入口**: `LoadTreeByBlockID()` → [model/tree.go#L217-L242](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/model/tree.go#L217-L242)
-
-```
-块 ID
-    │
-    ▼  treenode.GetBlockTree(id)
-  BlockTree（从 SQLite 块树索引获取）
-    │
-    ├─ BoxID       笔记本 ID
-    ├─ Path        .sy 文件路径
-    ├─ RootID      根文档 ID
-    └─ Type        块类型缩写
-    │
-    ▼  filesys.LoadTree(boxID, path, luteEngine)
-  parse.Tree（完整 AST 树）
-    │
-    ├─ 从 .sy 文件读取 JSON
-    ├─ dataparser.ParseJSON() 解析
-    ├─ 数据版本检查（CheckSpec）
-    ├─ 数据版本升级（UpgradeSpec）
-    ├─ 构建 HPath（人类可读路径）
-    └─ 计算 Hash
-```
-
-### 3.3 数据格式：.sy 文件结构
-
-SiYuan 的文档以 JSON 格式存储在 `.sy` 文件中，这是 AST 树的持久化形式：
-
-```json
-{
-  "ID": "20250101120000-abc123",
-  "Root": {
-    "ID": "20250101120000-abc123",
-    "Type": "NodeDocument",
-    "Properties": {
-      "id": "20250101120000-abc123",
-      "title": "文档标题",
-      "updated": "20250101120000"
+**AST 节点结构**:
+```go
+&ast.Node{
+    Type:         ast.NodeHeading,
+    ID:           "20250101120000-abc123",          // SiYuan 块 ID
+    HeadingLevel: 1,                               // 1-6
+    HeadingMarker: "#",                            // 标记字符
+    Tokens:       []byte("一级标题"),              // 原始文本
+    KramdownIAL:  [][]string{                      // IAL 属性
+        {"id", "20250101120000-abc123"},
+        {"updated", "20250101120000"},
+        {"custom-id", "自定义 ID"},
     },
-    "Children": [
-      {
-        "ID": "20250101120001-def456",
-        "Type": "NodeHeading",
-        "HeadingLevel": 1,
-        "Properties": {
-          "id": "20250101120001-def456",
-          "updated": "20250101120000"
-        },
-        "Children": [
-          {
-            "Type": "NodeText",
-            "Tokens": "标题内容"
-          }
-        ]
-      },
-      {
-        "ID": "20250101120002-ghi789",
-        "Type": "NodeParagraph",
-        "Properties": {
-          "id": "20250101120002-ghi789",
-          "updated": "20250101120000"
-        },
-        "Children": [...]
-      }
-    ]
-  },
-  "Box": "notebook-id",
-  "Path": "/20250101120000-abc123.sy",
-  "HPath": "/文档标题",
-  "Spec": "2"
+    Children:     []*ast.Node{                     // 行级子节点
+        {Type: ast.NodeText, Tokens: []byte("一级标题")},
+    },
 }
 ```
+
+**应用层处理**:
+- 创建空文档时自动补空段落 → [treenode/tree.go#L77-L80](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/treenode/tree.go#L77-L80)
+- 折叠标题下方子块移动 → `MoveFoldHeading()`
+- 标题层级变化触发展开/插入逻辑 → [model/transaction.go#L1514-L1556](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/model/transaction.go#L1514-L1556)
 
 ---
 
-## 4. 数据校验与异常处理边界
+#### 2.2.2 段落块 (Paragraph → `ast.NodeParagraph`)
 
-### 4.1 版本兼容性检查
+**Markdown 语法**:
+```markdown
+这是普通段落文本，支持**加粗**、*斜体*、[链接](url)等行级语法。
+{: #paragraph-id name="段落别名" style="color:red"}
+```
 
-**位置**: [treenode/tree.go#L139-L192](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/treenode/tree.go#L139-L192)
+**拆分规则**:
+1. 不能被识别为其他块类型的文本行 → 段落
+2. 连续非空行合并为同一段落（空行终止）
+3. 行尾 IAL 单独提取
+4. 内容进入行级解析管道（Inline Parser）
 
+**AST 节点结构**:
 ```go
-var CurrentSpec = "2"  // 当前数据格式版本
-var ErrSpecTooNew = fmt.Errorf("the document spec is too new")
+&ast.Node{
+    Type:     ast.NodeParagraph,
+    ID:       "20250101120000-def456",
+    Tokens:   []byte("这是普通段落文本..."),
+    Children: []*ast.Node{
+        {Type: ast.NodeText, Tokens: []byte("这是普通段落文本，支持")},
+        {Type: ast.NodeTextMark, TextMarkType: "strong"},  // **加粗**
+        {Type: ast.NodeTextMark, TextMarkType: "em"},      // *斜体*
+        {Type: ast.NodeLinkText, ...},                     // [链接]
+        {Type: ast.NodeLinkDest, ...},                     // (url)
+    },
+}
+```
 
-func CheckSpec(tree *parse.Tree) (err error) {
-    if CurrentSpec == tree.Root.Spec || "" == tree.Root.Spec {
-        return
+**应用层特殊处理** ([model/file.go#L1823-L1853](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/model/file.go#L1823-L1853)):
+- 段落中仅包含 `.mp3` 链接 → 自动转换为 `NodeAudio` 块
+- 段落中仅包含 `.mp4` 链接 → 自动转换为 `NodeVideo` 块
+- 空文档自动补空段落 → `NewParagraph("")`
+
+**段落创建辅助函数**:
+```go
+func NewParagraph(id string) (ret *ast.Node) {
+    newID := id
+    if "" == newID {
+        newID = ast.NewNodeID()  // 生成 YYYYMMDDHHmmss-xxxxxx 格式 ID
     }
-    
-    spec, err := strconv.Atoi(tree.Root.Spec)
-    if nil != err {
-        logging.LogErrorf("parse spec [%s] failed: %s", tree.Root.Spec, err)
-        return
-    }
-    
-    currentSpec, _ := strconv.Atoi(CurrentSpec)
-    if spec > currentSpec {
-        logging.LogErrorf("tree spec [%s] is newer than current spec [%s]", tree.Root.Spec, CurrentSpec)
-        return ErrSpecTooNew
-    }
+    ret = &ast.Node{ID: newID, Type: ast.NodeParagraph}
+    ret.SetIALAttr("id", newID)
+    ret.SetIALAttr("updated", newID[:14])  // ID 前 14 位 = 时间戳
     return
 }
 ```
 
-**版本升级机制**:
+**代码参考**: [treenode/tree.go#L116-L125](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/treenode/tree.go#L116-L125)
 
+---
+
+#### 2.2.3 列表块 (List / ListItem)
+
+**Markdown 语法**:
+```markdown
+- 无序列表项 1
+- 无序列表项 2
+  - 嵌套列表项
+  - [ ] 任务项未完成
+  - [x] 任务项已完成
+
+1. 有序列表项 1
+2. 有序列表项 2
+```
+
+**拆分规则**:
+1. 行首匹配列表标记（`-/*/+` 或 `数字.`）后接 1 空格
+2. 连续缩进相同的列表项合并为同一个 `NodeList`
+3. 缩进增加 → 创建子级 `NodeList`（嵌套）
+4. 方括号 `[ ]` / `[x]` → `ListData.Typ = 3` (任务列表)
+
+**AST 双层结构**:
+```
+NodeList (l, subtype=u/o/t)
+├── ListData.Typ: 0=无序列表, 1=有序列表, 3=任务列表
+├── ListData.OrderedListStart: 起始序号
+└── NodeListItem (i) × N
+    ├── ListData.Typ: 继承自父级
+    ├── ListData.Task: 0=未完成, 1=已完成
+    └── 内容节点 (Paragraph / CodeBlock / 嵌套 List ...)
+```
+
+**子类型缩写**: [treenode/node.go#L416-L427](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/treenode/node.go#L416-L427)
+- `u` = Unordered (无序)
+- `o` = Ordered (有序)
+- `t` = Task (任务)
+
+**应用层容器约束** ([model/transaction.go#L687-L703](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/model/transaction.go#L687-L703)):
+
+插入块到列表时的强制规则：
 ```go
-func UpgradeSpec(tree *parse.Tree) (upgraded bool) {
-    if CurrentSpec == tree.Root.Spec {
-        return
+if ast.NodeList == node.Type {
+    // 列表下只能挂列表项！
+    if ast.NodeList == toInsert.Type {
+        // 插入的是列表 → 提取所有 ListItem 逐个追加
+        for childLi := toInsert.FirstChild; nil != childLi; childLi = childLi.Next {
+            node.AppendChild(childLi)
+        }
+    } else {
+        // 插入的是非列表 → 自动包装一个新 ListItem
+        newLi := &ast.Node{
+            ID: ast.NewNodeID(),
+            Type: ast.NodeListItem,
+            ListData: &ast.ListData{Typ: node.ListData.Typ},  // 继承类型
+        }
+        node.AppendChild(newLi)
+        newLi.AppendChild(toInsert)  // 内容放入 ListItem
     }
-    upgradeSpec1(tree)  // "" → 1: 行级节点扁平化
-    upgradeSpec2(tree)  // 1 → 2: 增加 Callout 块支持
-    return true
-}
-
-func upgradeSpec1(tree *parse.Tree) {
-    if "" != tree.Root.Spec {
-        return
-    }
-    parse.NestedInlines2FlattedSpans(tree, false)  // 嵌套行级节点转扁平化 Spans
-    tree.Root.Spec = "1"
-}
-
-func upgradeSpec2(tree *parse.Tree) {
-    oldSpec, _ := strconv.Atoi(tree.Root.Spec)
-    if 2 <= oldSpec {
-        return
-    }
-    // 增加了 Callout 块类型支持
-    tree.Root.Spec = "2"
 }
 ```
 
-**设计原则**:
-- **向前兼容**: 新版本可以读取旧版本数据并自动升级
-- **向后不兼容**: 旧版本拒绝读取新版本数据（`ErrSpecTooNew`）
-- **幂等性**: 重复调用 `UpgradeSpec()` 不会产生副作用
-
-### 4.2 数据自动修复机制
-
-**位置**: [filesys/tree.go#L398-L508](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/filesys/tree.go#L398-L508)
-
+**删除列表项时的清理**:
 ```go
-func fixTreeJSONData(boxID, p string, jsonData []byte, luteEngine *lute.Lute) (data []byte, needFix bool, err error) {
-    // 1. 移除未转义的 Unicode 空字符（避免 JSON 解析失败）
-    jsonData = removeUnescapedUnicodeNull(jsonData)
-    
-    // 2. 解析 JSON（dataparser 内置自动修复：缺失字段、类型错误、语法错误）
-    ret, needFix, err := dataparser.ParseJSON(jsonData, luteEngine.ParseOptions)
-    if err != nil {
-        logging.LogErrorf("parse json [%s] to tree failed: %s", boxID+p, err)
-        return
-    }
-    
-    // 3. 版本兼容性检查
-    if err = treenode.CheckSpec(ret); errors.Is(err, treenode.ErrSpecTooNew) {
-        return  // 版本过高，拒绝处理
-    }
-    
-    // 4. 数据版本升级（向前兼容）
-    if treenode.UpgradeSpec(ret) {
-        needFix = true
-    }
-    
-    // 5. XSS 防护：属性值转义修复（v3.5.2 引入，修复 GHSA-ff66-236v-p4fg）
-    // 漏洞场景: "title": "&\" onmouseenter=\"require('child_process').exec('calc')"
-    if escapeAttributeValues(ret) {
-        needFix = true
-    }
-    
-    // 6. ID 一致性检查（文件名与内部 ID 必须一致）
-    if pathID := util.GetTreeID(p); pathID != ret.Root.ID {
-        needFix = true
-        logging.LogInfof("reset tree id from [%s] to [%s]", ret.Root.ID, pathID)
-        ret.Root.ID = pathID
-        ret.ID = pathID
-        ret.Root.SetIALAttr("id", ret.ID)
-    }
-    
-    // 7. 如需修复，重新序列化并写回文件
-    if !needFix {
-        return jsonData, false, nil
-    }
-    
-    renderer := render.NewJSONRenderer(ret, luteEngine.RenderOptions, luteEngine.ParseOptions)
-    data = renderer.Render()
-    
-    // 8. 格式化 JSON（可选，由 UseSingleLineSave 配置控制）
-    if !util.UseSingleLineSave {
-        buf := bytes.Buffer{}
-        buf.Grow(1024 * 1024 * 2)  // 预分配 2MB 缓冲区
-        if err = json.Indent(&buf, data, "", "\t"); err != nil {
-            return
-        }
-        data = buf.Bytes()
-    }
-    
-    // 9. 原子写入（filelock 保证文件完整性）
-    filePath := filepath.Join(util.DataDir, ret.Box, ret.Path)
-    if err = os.MkdirAll(filepath.Dir(filePath), 0755); err != nil {
-        return
-    }
-    if err = filelock.WriteFile(filePath, data); err != nil {
-        logging.LogErrorf("write data [%s] failed: %s", filePath, err)
-    }
-    return
+if srcNode.Parent.FirstChild == srcNode.Parent.LastChild {
+    // 列表中唯一的列表项被移除 → 删除整个空列表
+    srcEmptyList = srcNode.Parent
+}
+// ...
+if nil != srcEmptyList {
+    srcEmptyList.Unlink()
 }
 ```
 
-#### 4.2.1 XSS 防护：属性值转义
+**代码参考**: [model/transaction.go#L869-L915](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/model/transaction.go#L869-L915)
 
-**核心修复逻辑**: [filesys/tree.go#L474-L508](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/filesys/tree.go#L474-L508)
+---
 
+#### 2.2.4 代码块 (CodeBlock → `ast.NodeCodeBlock`)
+
+**Markdown 语法**:
+```markdown
 ```go
-func escapeAttributeValues(tree *parse.Tree) (hasEscaped bool) {
-    ast.Walk(tree.Root, func(n *ast.Node, entering bool) ast.WalkStatus {
-        if !entering || !n.IsBlock() || "" == n.ID || 0 == len(n.KramdownIAL) {
-            return ast.WalkContinue
-        }
-        if escaped := escapeNodeAttributeValues(n); escaped {
-            hasEscaped = true
-        }
-        return ast.WalkContinue
-    })
-    return hasEscaped
-}
+package main
 
+func main() {
+    fmt.Println("Hello SiYuan")
+}
+``` {#code-block-id .custom-class}
+```
+
+**拆分规则**:
+1. 围栏代码块（仅在 WYSIWYG 模式下支持）
+2. 行首 0-3 空格 + 连续 3+ 反引号 `` ` `` 或波浪号 `~`
+3. 开始围栏后可指定语言标识（`go` / `python` 等）
+4. 结束围栏必须与开始围栏字符相同，数量 ≥ 开始围栏
+5. 围栏后 IAL 提取为属性
+6. 围栏间内容 **原样保留**，不进行行级解析
+
+**AST 节点结构**:
+```go
+&ast.Node{
+    Type:              ast.NodeCodeBlock,
+    ID:                "20250101120000-code12",
+    CodeBlockMarker:   []byte("```"),       // 开始围栏
+    CodeBlockOpenMarker: []byte("```"),     // 结束围栏
+    CodeBlockInfo:     []byte("go"),        // 语言标识
+    IsFencedCodeBlock: true,                // 是否围栏代码块
+    Tokens:            []byte("package main..."),  // 代码内容（未转义）
+    KramdownIAL:       [][]string{
+        {"id", "20250101120000-code12"},
+        {"custom-class", "custom-class"},
+    },
+}
+```
+
+**注意**: 缩进代码块（4 空格缩进）在 WYSIWYG 模式下被 `SetIndentCodeBlock(false)` 禁用。
+
+---
+
+#### 2.2.5 属性列表 (IAL → `ast.NodeKramdownBlockIAL`)
+
+**Markdown 语法**:
+```markdown
+## 标题块
+{: #heading-id name="标题别名" icon="📝" tags="tag1,tag2" custom-key="自定义值"}
+
+段落内容行。
+{: #para-id updated="20250101120000"}
+```
+
+**拆分规则**:
+1. 块后紧邻的 `{: ... }` 行（可前接 0-3 空格）
+2. 键值对格式: `key=value`、`#id`（简写 `id=xxx`）、`.class`（简写 `class=xxx`）
+3. 无引号值、单引号值、双引号值均支持
+4. 所有键值对解析为 `[][]string` 二维数组
+5. **不独立存在** → IAL 属性被合并到前一个块的 `KramdownIAL` 字段
+
+**应用层 IAL 处理**:
+
+IAL 在系统中承担元数据存储的核心角色，常用属性:
+
+| 属性键 | 用途 | 示例值 |
+|-------|------|-------|
+| `id` | 块唯一标识（必填） | `20250101120000-abc123` |
+| `title` | 文档标题（仅根节点） | `我的笔记` |
+| `updated` | 更新时间戳（秒） | `20250101120000` |
+| `name` | 块命名/别名 | `重要段落` |
+| `alias` | 块别名（用于引用锚点） | `定义-1` |
+| `memo` | 块备注信息 | `待补充细节` |
+| `bookmark` | 书签描述 | `**第3章**重点` |
+| `icon` | 块图标 | `📝` |
+| `tags` | 标签列表（逗号分隔） | `工作,优先级高` |
+| `fold` | 是否折叠（仅标题/超级块） | `1` |
+| `heading-fold` | 折叠标题子块标记 | `1` |
+| `custom-*` | 用户自定义属性前缀 | `custom-复习次数=3` |
+| `custom-avs` | 属性视图关联数据 | JSON 字符串 |
+| `custom-hidden` | 文档隐藏标记 | `true` |
+
+**IAL ↔ Map 转换**:
+```go
+// IAL 二维数组 → Map（便于属性查询）
+ialMap := parse.IAL2Map(node.KramdownIAL)
+val := ialMap["custom-key"]
+
+// 属性写入（自动去重/更新）
+node.SetIALAttr("updated", util.CurrentTimeSecondsStr())
+
+// 缓存热点 IAL（避免频繁遍历 AST）
+cache.PutBlockIAL(node.ID, parse.IAL2Map(node.KramdownIAL))
+```
+
+**XSS 防护修复** (GHSA-ff66-236v-p4fg):
+```go
 func escapeNodeAttributeValues(node *ast.Node) (escaped bool) {
     for _, kv := range node.KramdownIAL {
-        // 解码再编码后发生变化，说明未正确转义或存在恶意拼接
+        // 解码 → 重新编码 → 比对
+        // 不一致 = 未正确转义 / 恶意拼接
         canonical := html.EscapeAttrVal(html.UnescapeAttrVal(kv[1]))
         if canonical != kv[1] {
             kv[1] = canonical
@@ -706,382 +387,583 @@ func escapeNodeAttributeValues(node *ast.Node) (escaped bool) {
 }
 ```
 
-**修复原理**: 采用"解码-重编码"的规范式修复，确保所有属性值都经过正确的 HTML 转义。这是针对 v3.5.1 引入的 XSS 漏洞的专门修复。
+**代码参考**: [filesys/tree.go#L494-L507](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/filesys/tree.go#L494-L507)
 
-### 4.3 错误码与边界处理
+---
 
-| 错误类型 | 代码 | 触发场景 | 处理方式 |
-|---------|------|---------|---------|
-| `TxErrCodeBlockNotFound` | 0 | 块不存在 | 推送错误消息，不崩溃 |
-| `TxErrCodeDataIsSyncing` | 1 | 数据同步中 | 提示用户稍后重试 |
-| `TxErrCodeWriteTree` | 2 | 文件写入失败 | 致命错误，终止进程 |
-| `TxErrHandleAttributeView` | 3 | 属性视图处理失败 | 提示错误，记录日志 |
-| `ErrSpecTooNew` | - | 数据版本过高 | 记录错误，跳过处理 |
-| `ErrBlockNotFound` | - | 块索引不存在 | 尝试从文件系统重建索引 |
-| `ErrIndexing` | - | 正在建立索引 | 返回忙状态 |
+#### 2.2.6 超级块 (SuperBlock → `ast.NodeSuperBlock`)
 
-### 4.4 块 ID 格式校验
+**Markdown 语法**:
+```markdown
+{{{row
+  :PROPERTIES:
+  :layout: col2
+  :END:
 
-**ID 格式**: `YYYYMMDDHHmmss-xxxxxx`（14位时间戳 + 6位随机十六进制）
+  ## 左栏内容
 
+---
+
+  ## 右栏内容
+}}}
+{: #super-id layout="col2"}
+```
+
+**拆分规则**:
+1. 行首 `{{{` 标记超级块开始（可后接布局标识）
+2. 内部 `---` 分隔符划分子块区域
+3. 行首 `}}}` 标记超级块结束
+4. 结束后 IAL 合并到超级块节点
+5. 内部块按标准块规则递归解析
+
+**应用层插入规则** ([model/transaction.go#L704-L710](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/model/transaction.go#L704-L710)):
 ```go
-// 加载前校验
-func LoadTreeByBlockID(id string) (*parse.Tree, error) {
-    if !ast.IsNodeIDPattern(id) {
-        return nil, ErrTreeNotFound
+if ast.NodeSuperBlock == node.Type {
+    // 超级块插入需跳过布局标记节点
+    layout := node.ChildByType(ast.NodeSuperBlockLayoutMarker)
+    if nil != layout {
+        // Prepend: 布局标记后插入
+        layout.InsertAfter(toInsert)
+    } else {
+        // Append: 最后一个子节点前插入
+        node.LastChild.InsertBefore(toInsert)
     }
-    // ...
 }
+```
 
-// 插入时自动补全
-if !ast.IsNodeIDPattern(insertedNode.ID) {
-    insertedNode.ID = ast.NewNodeID()
+---
+
+#### 2.2.7 其他块类型速查
+
+| 块类型 | 缩写 | 触发语法 | AST 关键字段 |
+|-------|------|---------|-------------|
+| 引用块 (Blockquote) | `b` | 行首 `> ` | 纯容器，子块递归 |
+| Callout | `callout` | `> [!NOTE]` | `CalloutType: "NOTE/TIP/IMPORTANT/CAUTION/WARNING"` |
+| 表格 (Table) | `t` | 行首 `\|` | `TableAligns[]`, `NodeTableHead/Body/Row/Cell` |
+| 数学公式块 (MathBlock) | `m` | `$$ ... $$` | `MathBlockScript: TeX 内容` |
+| 嵌入查询块 | `query_embed` | 代码块语言 `query` | `NodeBlockQueryEmbedScript: SQL 语句` |
+| 属性视图 (AttributeView) | `av` | `av` 代码块 | `AttributeViewID`, `AttributeViewType` |
+| HTML 块 | `html` | HTML 标签 | `Tokens: 原始 HTML` |
+| 分隔线 | `tb` | `---` / `***` / `___` | 无子节点 |
+| 视频块 | `video` | `.mp4` 链接段落 | `Tokens: <video> HTML` |
+| 音频块 | `audio` | `.mp3` 链接段落 | `Tokens: <audio> HTML` |
+| 文档根 (Document) | `d` | 整个 `.sy` 文件 | `Spec: "2"`, `Box`, `Path`, `HPath` |
+
+**完整类型映射表**: [treenode/node.go#L370-L398](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/treenode/node.go#L370-L398)
+
+---
+
+### 2.3 行级元素解析 (Inline Elements)
+
+行级元素在块内容内部进行二次解析（Paragraph / Heading / TableCell 等）：
+
+| 行级类型 | `NodeTextMark` 子类型 | 语法示例 |
+|---------|---------------------|---------|
+| 加粗 | `strong` | `**text**` / `__text__` |
+| 斜体 | `em` | `*text*` / `_text_` |
+| 删除线 | `strikethrough` | `~~text~~` |
+| 标记 | `mark` | `==text==` |
+| 行级代码 | `code` | `` `code` `` |
+| 行级公式 | `inline-math` | `$E=mc^2$` |
+| 上标 | `sup` | `^text^` |
+| 下标 | `sub` | `~text~` |
+| 标签 | `tag` | `#tag#` |
+| 块引用 | `block-ref` | `((block-id))` |
+| 文件标注引用 | `file-annotation-ref` | `((file.pdf$page=1))` |
+| 超链接 | `a` | `[text](url)` |
+| 图片 | `img` | `![alt](url)` |
+| 行级 HTML | `inline-html` | `<span>text</span>` |
+
+**行级结构扁平化**:
+
+Spec 版本升级 ""→1 时执行 `NestedInlines2FlattedSpans()`，将嵌套的行级节点转换为扁平的 `TextMark` 跨度序列，简化 WYSIWYG 编辑器处理。
+
+---
+
+## 3. 解析引擎与应用层职责划分
+
+### 3.1 Lute 解析引擎 (L1-L2) 的纯职责
+
+| 维度 | Lute 引擎职责 | 明确不做的事 |
+|-----|-------------|------------|
+| **结构化** | Markdown 语法规则识别、块/行级拆分、AST 构建、IAL 提取 | 不生成块 ID、不设置业务属性 |
+| **校验** | 语法层面校验（围栏闭合、列表完整性）、HTML 白名单过滤 | 不校验 ID 格式、不校验业务约束 |
+| **转换** | Markdown ↔ Block DOM ↔ Tree 格式双向转换 | 不做类型升级（段落→音视频块） |
+| **渲染** | 纯文本输出、HTML 渲染、JSON 序列化 | 不处理索引、不广播事件 |
+| **安全** | `SetSanitize(true)` HTML 恶意脚本过滤 | 不处理属性值二次转义 |
+
+---
+
+### 3.2 Kernel 应用层 (L3-L4) 的扩展职责
+
+#### 3.2.1 结构化增强 (Structural Enhancement)
+
+**ID 注入与补全**:
+```go
+// 插入块时检查并补全缺失的 ID
+if "" == insertedNode.ID {
+    insertedNode.ID = ast.NewNodeID()  // YYYYMMDDHHmmss-random
     insertedNode.SetIALAttr("id", insertedNode.ID)
 }
 ```
 
----
+**容器约束强制**（参见列表/超级块规则）:
+- `NodeList` 下只能有 `NodeListItem`，自动包装
+- `NodeHeading` 下方块使用逻辑父子（HeadingChildren），非 AST 直接父子
+- `NodeSuperBlock` 布局标记节点的插入位置特殊处理
 
-## 5. 模块间协作关系
-
-### 5.1 核心数据流图
-
-```
-  前端编辑器 (Protyle)
-       │
-       │ 1. 用户编辑产生 Block DOM
-       ▼
-  Transaction 事务生成
-       │
-       │ 2. POST /api/transactions
-       ▼
-  API 层 (api/router.go)
-       │
-       │ 3. PerformTransactions() 入队
-       ▼
-  事务队列 (txQueue chan *Transaction)
-       │
-       │ 4. flushTx() 串行执行
-       ▼
-  ┌───────────────────────────────────────────┐
-  │  事务执行引擎 (performTx)                  │
-  │  ┌────────────┐  ┌───────────────────┐   │
-  │  │  begin()   │  │  lute.NewLute()   │   │
-  │  └─────┬──────┘  └─────────┬─────────┘   │
-  │        │                   │             │
-  │        ▼                   ▼             │
-  │  doUpdate()/doInsert()/doDelete()        │
-  │        │                                 │
-  │        ├─ BlockDOM2Tree()  ◄─────────────┘
-  │        ├─ AST 操作（插入/替换/删除）
-  │        ├─ 引用关系更新
-  │        └─ writeTree() → 缓存到 tx.trees
-  │                  │
-  └──────────────────┼─────────────────────────┘
-                     │
-  ┌──────────────────▼─────────────────────────┐
-  │  commit() 提交阶段                          │
-  │  ┌──────────────────────────────────────┐ │
-  │  │ writeTreeUpsertQueue(tree)           │ │
-  │  │  ├─ filesys.WriteTree() → .sy 文件   │ │
-  │  │  ├─ treenode.UpsertBlockTree()       │ │
-  │  │  │   └─ SQLite blocktrees 表         │ │
-  │  │  └─ sql.UpsertTreeQueue()            │ │
-  │  │      └─ SQLite blocks 表 + FTS 索引  │ │
-  │  └──────────────────────────────────────┘ │
-  └──────────────────┬─────────────────────────┘
-                     │
-  ┌──────────────────▼─────────────────────────┐
-  │  WebSocket 广播更新                         │
-  │  ├─ 刷新前端编辑器局部 DOM                 │
-  │  ├─ 更新大纲、反链面板                     │
-  │  └─ 刷新属性视图                           │
-  └────────────────────────────────────────────┘
-```
-
-### 5.2 关键协作接口
-
-#### 5.2.1 treenode ↔ sql 协作
-
+**特殊类型转换**:
 ```go
-// 块变更后，同步更新 SQL 索引
-func doUpdate(operation *Operation) *TxErr {
-    // ... 修改 AST ...
-    tx.writeTree(tree)          // treenode 标记
-    // commit 时:
-    sql.UpsertTreeQueue(tree)   // sql 索引更新
-}
-```
-
-#### 5.2.2 treenode ↔ filesys 协作
-
-```go
-// 从文件加载树 → 建立块索引
-func LoadTree(boxID, p string, luteEngine *lute.Lute) *parse.Tree {
-    tree, _ := parseJSON2Tree(...)          // filesys 解析
-    treenode.IndexBlockTree(tree)           // treenode 索引
-    return tree
-}
-```
-
-#### 5.2.3 model ↔ cache 协作
-
-```go
-// 缓存块 IAL 属性，避免频繁遍历 AST
-func CreatedUpdated(node *ast.Node) {
-    // ... 更新属性 ...
-    cache.PutBlockIAL(parent.ID, parse.IAL2Map(parent.KramdownIAL))
-}
-```
-
----
-
-## 6. 可扩展性设计
-
-### 6.1 插件系统
-
-**前端插件点**: [app/src/protyle/index.ts#L64-L69](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/app/src/protyle/index.ts#L64-L69)
-
-```typescript
-// Protyle 构造时自动合并插件配置
-app.plugins.forEach(item => {
-    if (item.protyleOptions) {
-        pluginsOptions = merge(pluginsOptions, item.protyleOptions);
+// 段落 → 音频块 / 视频块
+if ast.NodeParagraph == n.Type {
+    link := n.FirstChild
+    if nil != link && link.IsTextMarkType("a") {
+        if strings.HasSuffix(link.TextMarkAHref, ".mp3") {
+            audio := &ast.Node{Type: ast.NodeAudio, ID: n.ID, ...}
+            n.InsertBefore(audio)
+            n.Unlink()
+        }
     }
-});
-```
-
-**后端插件点**:
-- [kernel/bazaar/plugin.go](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/bazaar/plugin.go)
-- [kernel/plugin/](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/app/src/plugin/)
-
-### 6.2 事件总线
-
-使用 `github.com/asaskevich/EventBus` 实现模块解耦：
-
-```go
-// 发布事件
-eventbus.Publish(eventbus.EvtSQLInsertBlocksFTS, context, blockCount, hash)
-
-// 订阅事件
-eventbus.Subscribe(eventbus.EvtSQLInsertBlocksFTS, func(context map[string]any, ...) {
-    // 处理事件
-})
-```
-
-**核心事件类型**:
-- `EvtSQLInsertBlocks` / `EvtSQLInsertBlocksFTS` - 块索引插入
-- `EvtSQLDeleteBlocks` - 块索引删除
-- `EvtSQLIndexChanged` - 索引状态变更
-
-### 6.3 自定义块渲染
-
-**文件**: [app/src/plugin/customBlockRender.ts](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/app/src/plugin/customBlockRender.ts)
-
-插件可注册自定义块类型的渲染逻辑，扩展编辑器能力。
-
-### 6.4 Lute 解析选项可配置
-
-[util/lute.go#L27-L88](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/util/lute.go#L27-L88) 提供了丰富的可配置项：
-
-```go
-type Markdown struct {
-    InlineAsterisk      bool  // 是否启用行级 * 语法
-    InlineUnderscore    bool  // 是否启用行级 _ 语法
-    InlineSup           bool  // 是否启用上标
-    InlineSub           bool  // 是否启用下标
-    InlineTag           bool  // 是否启用行级标签
-    InlineMath          bool  // 是否启用行级公式
-    InlineStrikethrough bool  // 是否启用删除线
-    InlineMark          bool  // 是否启用标记
 }
+```
+
+**代码参考**: [model/file.go#L1823-L1853](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/model/file.go#L1823-L1853)
+
+---
+
+#### 3.2.2 业务校验 (Business Validation)
+
+**文档级校验** ([model/file.go#L1744-L1804](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/model/file.go#L1744-L1804)):
+
+| 校验项 | 规则 | 失败处理 |
+|-------|------|---------|
+| 标题长度 | ≤ 512 个 Unicode 字符 | 返回错误语言包 (106) |
+| ID 合法性 | 文件名必须包含合法 ID | 返回语言 (16) |
+| 隐藏文件 | 文件名不能以 `.` 开头 | 返回语言 (13) |
+| 笔记本存在 | BoxID 必须已注册 | 返回语言 (0) |
+| 路径深度 | `/` 分隔 ≤ 7 层 (可配置) | 返回语言 (118) |
+| 文件存在 | 目标 `.sy` 不能已存在 | 返回语言 (1) |
+| 标题规范化 | 移除 `/`、非法字符、ZWJ 保护 | 自动修正 |
+
+**事务级校验** ([model/transaction.go#doUpdate](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/model/transaction.go#L1410-L1594)):
+
+| 校验项 | 规则 | 失败处理 |
+|-------|------|---------|
+| 目标树加载 | `tx.loadTree(id)` 必须成功 | `TxErrCodeBlockNotFound` |
+| 节点存在性 | `GetNodeInTree(tree, id)` 非 nil | `TxErrCodeBlockNotFound` |
+| 更新数据非空 | `operation.Data` 去除光标标记后非空 | `TxErrCodeBlockNotFound` |
+| 子树有效性 | `BlockDOM2Tree` 返回的根至少有一子节点 | `TxErrCodeBlockNotFound` |
+
+---
+
+#### 3.2.3 编辑流程编排 (Editing Orchestration)
+
+**事务执行矩阵**（`performTx` 中的 25+ 种操作类型）:
+
+| 操作类别 | 操作类型 | 核心处理函数 |
+|---------|---------|-------------|
+| **基础 CRUD** | `create` / `update` / `delete` | `doCreate` / `doUpdate` / `doDelete` |
+| **位置插入** | `insert` / `appendInsert` / `prependInsert` | `doInsert` / `doAppendInsert` / `doPrependInsert` |
+| **位置移动** | `move` / `moveOutlineHeading` / `append` | `doMove` / `doMoveOutlineHeading` / `doAppend` |
+| **折叠控制** | `foldHeading` / `unfoldHeading` | `doFoldHeading` / `doUnfoldHeading` |
+| **属性修改** | `setAttrs` / `updateAttrs` / `doUpdateUpdated` | `doSetAttrs` / 属性更新 API |
+| **AV 操作** | `addAttrViewCol` / `updateAttrViewCell` 等 30+ 种 | AV 子系统专门处理 |
+| **闪卡操作** | `addFlashcards` / `removeFlashcards` | 闪卡子系统处理 |
+
+**事务状态机**:
+```
+tx.begin()           → 初始化 Lute、准备 nodes/trees 缓存
+     │
+processLargeInsert() → 大块插入优化（跳过逐节点处理）
+processLargeDelete() → 批量删除优化
+     │
+逐个执行 DoOperations
+  for op in tx.DoOperations:
+      switch op.Action: do*() handlers
+     │
+tx.commit()          → 写 .sy 文件 / 写 SQLite / 写 FTS 索引 / 推送 WS
+tx.state = 完成
+```
+
+**代码参考**: [model/transaction.go#L148-L247](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/model/transaction.go#L148-L247)
+
+---
+
+#### 3.2.4 存储与同步 (Storage & Sync)
+
+**三层写入管道**（事务提交阶段）:
+
+```
+tx.trees（变更中的树缓存）
+    │
+    ▼  indexWriteTreeUpsertQueue()
+┌─────────────────────────────────────────────┐
+│ 1. filesys.WriteTree()                      │
+│    ├─ tree → JSON（JSONRenderer）          │
+│    ├─ 可选：json.Indent 格式化              │
+│    ├─ filelock.WriteFile（原子写）          │
+│    └─ 写入 data/{box}/{path}.sy            │
+└────────────────────┬────────────────────────┘
+                     │
+                     ▼
+┌─────────────────────────────────────────────┐
+│ 2. treenode.UpsertBlockTree()               │
+│    └─ SQLite → blocktrees 表（ID → 路径映射）│
+└────────────────────┬────────────────────────┘
+                     │
+                     ▼
+┌─────────────────────────────────────────────┐
+│ 3. sql.UpsertTreeQueue()                    │
+│    ├─ blocks 表（块内容、类型、属性）        │
+│    ├─ block_refs 表（引用关系）             │
+│    └─ blocks_fts 表（FTS5 全文索引）        │
+└─────────────────────────────────────────────┘
+```
+
+**同步标记**:
+- 每次写入后调用 `IncSync()` 递增同步计数器
+- 云同步模块监听计数器变化，增量推送变更
+
+---
+
+## 4. 解析异常检查顺序与处理流程
+
+### 4.1 导入/加载路径的异常检查链
+
+#### 4.1.1 Markdown 导入检查顺序 (CreateDocByMd)
+
+```
+Step 1: 环境校验
+  ├─ createDocLock 互斥锁（串行化文档创建）
+  ├─ BoxID 存在性检查
+  └─ └─ 不存在 → 返回 Conf.Language(0)
+
+Step 2: Lute 解析层（内部）
+  ├─ Md2BlockDOM(md) → Block DOM
+  ├─ 语法错误 → Lute 内部容错（通常不报错，降级为段落）
+  └─ 围栏不闭合 → 合并到下一个块 / 直到文档结束
+
+Step 3: 标题规范化
+  ├─ normalizeDocTitle(title)
+  │   ├─ 移除 '/' 字符
+  │   ├─ 非法字符过滤（RemoveInvalid）
+  │   ├─ ZWJ 保护（避免 Emoji 变形）
+  │   └─ TrimSpace
+  ├─ 长度 ≤ 512 Unicode 字符
+  │   └─ 超长 → Conf.Language(106)
+  └─ 空标题 → 替换为 Conf.Language(16) "未命名文档"
+
+Step 4: 路径合法性
+  ├─ 文件名提取合法 ID（GetTreeID）
+  ├─ 不以 '.' 开头（隐藏文件）
+  ├─ 路径深度 ≤ 7 层（可配置 AllowCreateDeeper）
+  ├─ 父级文档存在（否则 ErrBlockNotFound）
+  └─ 目标 .sy 文件不存在（否则 Conf.Language(1) 已存在）
+
+Step 5: Block DOM → Tree 转换
+  ├─ BlockDOM2Tree(dom) → parse.Tree
+  ├─ Root 设置 ID / Box / Path / HPath / Spec
+  ├─ 空文档补空段落（NewParagraph）
+  └─ 特殊节点转换（MP3→Audio / MP4→Video）
+
+Step 6: 事务提交
+  ├─ doCreate(tree) → 通过
+  ├─ FlushTxQueue() → 强制同步执行
+  └─ 建立排序索引
+```
+
+**代码参考**: [model/file.go#L1018-L1042](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/model/file.go#L1018-L1042)
+
+---
+
+#### 4.1.2 .sy 文件加载检查顺序 (LoadTree)
+
+```
+Step 1: 物理读取
+  ├─ filelock.ReadFile 读取 .sy 文件
+  └─ IO 错误 → 记录日志 + 返回 err（上层降级处理）
+
+Step 2: 二进制清理
+  └─ removeUnescapedUnicodeNull() → 移除未转义 \0 避免 JSON 解析失败
+
+Step 3: JSON 解析（含自动修复）
+  ├─ dataparser.ParseJSON()
+  ├─ 缺失字段 → 补默认值（needFix = true）
+  ├─ 类型错误 → 自动转换（字符串→数字等）
+  ├─ 语法错误 → 尽量修复 + needFix = true
+  └─ 不可修复 → 返回 err，终止加载
+
+Step 4: 版本兼容性
+  ├─ CheckSpec(tree) → 比较 tree.Root.Spec 与 CurrentSpec("2")
+  ├─ Spec > Current → ErrSpecTooNew（数据来自未来版本，拒绝加载）
+  ├─ Spec 非法（非数字）→ 记录日志 + 跳过升级
+  └─ Spec < Current → 标记 needFix = true，进入升级流程
+
+Step 5: 版本升级（向前兼容）
+  ├─ UpgradeSpec("" → 1 → 2)
+  │   ├─ Spec "" → 1: NestedInlines2FlattedSpans（行级扁平化）
+  │   └─ Spec 1  → 2: 增加 Callout 块类型支持
+  └─ 升级后 tree.Root.Spec = CurrentSpec
+
+Step 6: 安全修复（XSS）
+  ├─ escapeAttributeValues() → 全树遍历
+  │   ├─ 解码属性值 html.UnescapeAttrVal()
+  │   ├─ 重新编码 html.EscapeAttrVal()
+  │   └─ 前后不同 → 修正 + hasEscaped = true
+  └─ 适用版本: v3.5.2+（修复 #16686 XSS 漏洞）
+
+Step 7: ID 一致性
+  ├─ 从路径提取 ID（文件名去 .sy）
+  ├─ 与 tree.Root.ID 比对
+  └─ 不一致 → 强制重置为路径 ID（重命名后常见情况）
+
+Step 8: 修复持久化（needFix = true 时）
+  ├─ JSONRenderer 重新序列化
+  ├─ 可选 json.Indent 格式化（UseSingleLineSave 控制）
+  ├─ os.MkdirAll 确保目录存在
+  └─ filelock.WriteFile 原子写回
+```
+
+**代码参考**:
+- 加载入口: [filesys/tree.go#L398-L456](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/filesys/tree.go#L398-L456)
+- XSS 修复: [filesys/tree.go#L474-L508](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/filesys/tree.go#L474-L508)
+- 版本升级: [treenode/tree.go#L158-L192](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/treenode/tree.go#L158-L192)
+
+---
+
+### 4.2 编辑/更新路径的异常检查链
+
+#### 4.2.1 块更新异常顺序 (doUpdate)
+
+```
+输入: operation { id, data (Block DOM 字符串) }
+
+Step 1: 目标定位
+  ├─ tx.loadTree(id) → 加载所在树
+  └─ 失败 → TxErrCodeBlockNotFound + 日志
+
+Step 2: 输入清洗
+  ├─ 移除前端光标标记: strings.Replace(data, FrontEndCaret, "")
+  └─ 空数据 → TxErrCodeBlockNotFound
+
+Step 3: DOM → AST 转换
+  ├─ luteEngine.BlockDOM2Tree(data) → 子树
+  │   ├─ DOM 解析失败 → 返回空树（后续捕获）
+  │   └─ 非法标签 → 按段落 / 文本降级
+  └─ 继承原树 ID / Box / Path（子树根信息）
+
+Step 4: 旧节点验证
+  ├─ GetNodeInTree(tree, id) → 找到被替换的节点
+  └─ 不存在 → TxErrCodeBlockNotFound + msg
+
+Step 5: 引用关系收集
+  ├─ ast.Walk 全遍历新子树
+  │   ├─ 空白 inline-math → 标记删除（n.Unlink()）
+  │   ├─ block-ref → sql.CacheRef() 缓存 + 收集 defID
+  │   └─ 文档标题引用 → DynamicRefTexts 缓存覆盖锚文本
+  └─ 引用变更 → 异步延迟刷新计数（SQLFlushInterval）
+
+Step 6: 子节点有效性
+  ├─ subTree.Root.FirstChild 必须存在
+  │   └─ 不存在 → TxErrCodeBlockNotFound
+  ├─ 列表特殊处理（List 父下更新 ListItem）
+  │   └─ ast.NodeList == updatedNode.Type → 取 FirstChild（跳过包装 List）
+  └─ 容器块折叠迁移
+      └─ oldNode.IsContainerBlock() → MoveFoldHeading(new, old)
+
+Step 7: 类型特定处理
+  ├─ HTML 块 → 剔除连续空行（含纯空格行）
+  ├─ AV 节点 → 解析视图 + 设置 ViewType/ViewID
+  └─ 删除节点同步 → syncDelete2AvBlock()
+
+Step 8: 折叠标题层级
+  ├─ needUnfoldParentHeading（标题降级）
+  │   └─ 展开父折叠标题 + 推送 unfold WS 消息
+  └─ needInsertAfterParentHeading（标题升级）
+      └─ 主动推送 insert WS 消息插入到原折叠标题后
+
+Step 9: 原子替换 + 元数据
+  ├─ oldNode.InsertAfter(updatedNode)
+  ├─ oldNode.Unlink()
+  ├─ CreatedUpdated(updatedNode) → 递归更新所有父节点 updated
+  ├─ cache.PutBlockIAL() → 更新属性缓存
+  ├─ tx.nodes[] / tx.trees[] → 事务变更缓存
+  └─ 提交时统一写入（管道 1-2-3）
+```
+
+**代码参考**: [model/transaction.go#L1410-L1594](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/model/transaction.go#L1410-L1594)
+
+---
+
+### 4.3 事务执行级别的异常分类处理
+
+**位置**: [model/transaction.go#L83-L125](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/model/transaction.go#L83-L125)
+
+```go
+func flushTx(tx *Transaction) {
+    defer logging.Recover()                    // 第 0 层：Panic 捕获
+    flushLock.Lock()                           // 第 0 层：全局互斥（串行保证）
+    isFlushing = true
+    defer flushLock.Unlock()
+
+    start := time.Now()
+    if txErr := performTx(tx); nil != txErr {
+        switch txErr.code {
+        case TxErrCodeBlockNotFound (0):
+            // 可恢复错误：推送消息 + 继续服务
+            → util.PushTxErr(msg, 0, nil)
+            return
+
+        case TxErrCodeDataIsSyncing (1):
+            // 临时状态：用户稍后重试
+            → util.PushMsg(Conf.Language(222), 5000)
+            // 不返回，不崩溃
+
+        case TxErrHandleAttributeView (3):
+            // 子系统错误：日志 + 提示，不影响主流程
+            → util.PushMsg(Conf.Language(258), 5000)
+            logging.LogErrorf(...)
+            // 不返回，不崩溃
+
+        case TxErrCodeWriteTree (2):
+            // 致命错误：数据一致性无法保证
+            → logging.LogFatalf(ExitCodeFatal, ...)
+            // os.Exit(1) 终止进程！
+
+        default / TxErrCodePushMsg (4):
+            // 同 0，可恢复
+            → util.PushTxErr(...)
+            return
+        }
+    }
+
+    // 性能监控
+    elapsed := time.Since(start).Milliseconds()
+    if 2000 < elapsed {
+        logging.LogWarnf("op tx [%dms] > 2000ms")  // >2秒告警
+    }
+}
+```
+
+**Panic 恢复（内层）** ([model/transaction.go#L168-L178](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/model/transaction.go#L168-L178)):
+```go
+defer func() {
+    if e := recover(); nil != e {
+        logging.LogErrorf("PANIC RECOVERED: %v\n\t%s", e, logging.ShortStack())
+        if 1 == tx.state.Load() {
+            tx.rollback()  // 事务状态=执行中 → 尝试回滚
+            return
+        }
+    }
+}()
 ```
 
 ---
 
-## 7. 潜在风险点分析
+### 4.4 索引损坏的降级恢复链
 
-### 7.1 性能风险
+当块 ID 在数据库索引中找不到（索引与文件不一致）时的自动修复：
 
-| 风险点 | 影响 | 代码位置 |
-|-------|------|---------|
-| 单事务队列长度限制（7） | 高并发编辑时可能阻塞 | [model/transaction.go#L65](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/model/transaction.go#L65) |
-| 大文档全量 AST 遍历 | 大文档操作延迟 | 大量 `ast.Walk()` 调用 |
-| 每次操作全量写 .sy 文件 | 大文档频繁写入 IO 开销 | [filesys/tree.go#L244-L265](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/filesys/tree.go#L244-L265) |
-| SQL 索引队列异步刷新 | 搜索结果暂时性不一致 | [sql/queue.go](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/sql/queue.go) |
-
-### 7.2 数据一致性风险
-
-| 风险点 | 影响 | 现有防护 |
-|-------|------|---------|
-| 进程崩溃时事务未提交 | 数据丢失 | 文件锁、事务原子性、崩溃恢复 |
-| 索引与文件数据不一致 | 搜索/查询异常 | 启动时重建索引、`indexTreeInFilesystem()` 修复 |
-| 跨文档块引用失效 | 引用显示异常 | `indexTreeInFilesystem()` 自动修复 |
-| 并发编辑冲突 | 数据覆盖 | WebSocket 实时同步、最后写入胜（LWW） |
-
-### 7.3 安全风险
-
-| 风险点 | 影响 | 防护措施 |
-|-------|------|---------|
-| XSS 攻击 | 恶意脚本执行 | `SetSanitize(true)`、属性值转义 |
-| 路径遍历 | 任意文件读写 | 路径合法性校验、敏感路径检测 |
-| 恶意 JSON 注入 | 解析崩溃 | `dataparser.ParseJSON()` 含修复逻辑 |
-
-### 7.4 兼容性风险
-
-| 风险点 | 影响 | 防护措施 |
-|-------|------|---------|
-| 数据版本不兼容 | 旧版本打不开新数据 | `CheckSpec()` + `ErrSpecTooNew` |
-| Lute 引擎升级 | 解析结果变化 | 固定版本号、集成测试 |
-| 不同客户端版本 | 功能差异 | 启动时版本检查 |
+```
+GetBlockTree(id) → nil（索引缺失）
+     │
+     ▼
+ErrBlockNotFound 触发
+     │
+     ▼
+indexTreeInFilesystem() 从文件系统恢复
+     ├─ 1. 全局搜索：在 data/ 所有 .sy 文件中 grep 块 ID
+     ├─ 2. 找到匹配 → filesys.LoadTree(box, path) 加载完整树
+     ├─ 3. treenode.UpsertBlockTree(tree) → 重建 blocktrees 索引
+     └─ 4. sql.IndexTreeQueue(tree) → 重建 blocks / block_refs / FTS 索引
+          │
+          ▼ 仍失败
+     用户触发：设置 → 搜索 → 重建索引
+          │
+          ▼
+     /api/filetree/reindexTree API
+     → 全量遍历 data/ → 逐文件重建所有索引
+```
 
 ---
 
-## 8. 问题追踪与调试方法
+## 5. 附录：关键数据结构与转换表
 
-### 8.1 日志分析
+### 5.1 Block DOM → AST Node 映射表
 
-**关键日志输出位置**:
-- 事务执行超时: `model/transaction.go#L121-L124` - `log.Warnf("op tx [%dms]", elapsed)`
-- 块树加载失败: `model/tree.go` - 多处 `logging.LogErrorf`
-- 数据库异常: `treenode/blocktree.go` - 包含 `logging.ShortStack()` 调用栈
+前端编辑后产生的 Block DOM（HTML）通过 `BlockDOM2Tree()` 转换为 AST 节点：
 
-**日志级别控制**:
-```go
-// 开发模式下输出警告
-if "dev" == util.Mode {
-    logging.LogWarnf("block tree not found [id=%s], stack: [%s]", id, logging.ShortStack())
-}
-```
+| data-type | → ast.Node.Type | 缩写 |
+|-----------|----------------|------|
+| `NodeDocument` | `ast.NodeDocument` | `d` |
+| `NodeHeading` | `ast.NodeHeading` | `h` |
+| `NodeParagraph` | `ast.NodeParagraph` | `p` |
+| `NodeList` | `ast.NodeList` | `l` |
+| `NodeListItem` | `ast.NodeListItem` | `i` |
+| `NodeCodeBlock` | `ast.NodeCodeBlock` | `c` |
+| `NodeMathBlock` | `ast.NodeMathBlock` | `m` |
+| `NodeTable` | `ast.NodeTable` | `t` |
+| `NodeBlockquote` | `ast.NodeBlockquote` | `b` |
+| `NodeSuperBlock` | `ast.NodeSuperBlock` | `s` |
+| `NodeCallout` | `ast.NodeCallout` | `callout` |
+| `NodeBlockQueryEmbed` | `ast.NodeBlockQueryEmbed` | `query_embed` |
+| `NodeAttributeView` | `ast.NodeAttributeView` | `av` |
+| `NodeHTMLBlock` | `ast.NodeHTMLBlock` | `html` |
+| `NodeThematicBreak` | `ast.NodeThematicBreak` | `tb` |
+| `NodeVideo` | `ast.NodeVideo` | `video` |
+| `NodeAudio` | `ast.NodeAudio` | `audio` |
+| `NodeIFrame` | `ast.NodeIFrame` | `iframe` |
+| `NodeWidget` | `ast.NodeWidget` | `widget` |
+| `NodeText` | `ast.NodeText` | `text`（行级） |
+| `NodeTextMark` | `ast.NodeTextMark` | `textmark`（行级） |
 
-### 8.2 关键调试函数
+**代码参考**: [treenode/node.go#L370-L414](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/treenode/node.go#L370-L414)
 
-| 函数 | 用途 | 位置 |
-|-----|------|------|
-| `logging.ShortStack()` | 打印调用栈 | 多处使用 |
-| `ast.Walk()` + 打印 | AST 结构遍历 | 可插入调试代码 |
-| `luteEngine.RenderNodeBlockDOM()` | AST → DOM 转换 | 验证 AST 正确性 |
-| `luteEngine.FormatNodeSync()` | AST → Markdown | 验证解析正确性 |
-| `treenode.FormatNode()` | 节点格式化 | [treenode/node.go#L146-L153](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/treenode/node.go#L146-L153) |
+### 5.2 双 Lute 引擎对比
 
-### 8.3 数据完整性检查
+| 配置项 | 编辑引擎 NewLute() | 导入引擎 NewStdLute() |
+|-------|-------------------|---------------------|
+| `SetProtyleWYSIWYG` | **true** | false |
+| `SetSanitize` | **true** | false |
+| `SetIndentCodeBlock` | **false**（禁用 4 空格） | **true**（支持缩进代码块） |
+| `SetGFMAutoLink` | - | **false**（导入时不自动链接） |
+| `SetCodeSyntaxHighlight` | false | false |
+| `SetCallout` | **true** | - |
+| `SetDataTask` | **true** | - |
+| `SetKramdownIAL` | **true** | - |
+| `SetBlockRef` | **true** | - |
+| `SetSuperBlock` | **true** | - |
 
-**启动时检查**:
-```go
-// 索引缺失时自动从文件系统重建
-func indexTreeInFilesystem(blockID string) error {
-    // 1. 在所有 .sy 文件中搜索 ID
-    paths := search.FindAllMatchedPaths(root, []string{blockID})
-    // 2. 加载并重新索引
-    tree, _ := filesys.LoadTree(boxID, path, luteEngine)
-    treenode.UpsertBlockTree(tree)
-    sql.IndexTreeQueue(tree)
-}
-```
+**代码参考**: [util/lute.go#L50-L115](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/util/lute.go#L50-L115)
 
-**手动重建索引**:
-- API: `/api/filetree/reindexTree`
-- 触发: 设置页 → 搜索 → 重建索引
+### 5.3 关键代码路径速查
 
-### 8.4 性能分析方法
-
-1. **事务耗时监控**
-   ```go
-   start := time.Now()
-   performTx(tx)
-   elapsed := time.Since(start).Milliseconds()
-   if 2000 < elapsed {
-       log.Warnf("op tx [%dms]", elapsed)  // >2s 告警
-   }
-   ```
-
-2. **大文件警告**
-   ```go
-   if util.ExceedLargeFileWarningSize(len(data)) {
-       util.PushErrMsg("文件过大警告", 7000)
-   }
-   ```
-
-3. **并发池监控**
-   - 加载池: `runtime.NumCPU()` 控制并发数
-   - 索引池: `min(runtime.NumCPU(), 4)` 限制并发
-
-### 8.5 常见问题定位路径
-
-**块引用不显示**:
-1. 检查 `block_refs` 表中是否有记录
-2. 检查 `defID` 对应的块是否存在
-3. 运行 `IndexRefs()` 重建引用索引
-
-**搜索不到内容**:
-1. 检查 `blocks` 表的 `content` 字段
-2. 检查 FTS 索引是否同步
-3. 触发 `/api/search/reindex` 重建
-
-**块丢失但文件存在**:
-1. 检查 `blocktrees` 表索引
-2. 调用 `indexTreeInFilesystem()` 重建
-3. 检查 `.sy` 文件 JSON 格式是否合法
+| 功能 | 文件 | 行号 |
+|-----|------|-----|
+| Lute 初始化 | [util/lute.go](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/util/lute.go) | L50-L115 |
+| Markdown → 文档 | [model/file.go](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/model/file.go) | L1018-L1042 |
+| 文档创建核心 | [model/file.go](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/model/file.go) | L1744-L1859 |
+| 块更新 doUpdate | [model/transaction.go](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/model/transaction.go) | L1410-L1594 |
+| 列表插入约束 | [model/transaction.go](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/model/transaction.go) | L687-L703 |
+| 超级块插入规则 | [model/transaction.go](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/model/transaction.go) | L704-L710 |
+| 事务执行错误分类 | [model/transaction.go](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/model/transaction.go) | L83-L125 |
+| 类型缩写映射 | [treenode/node.go](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/treenode/node.go) | L370-L414 |
+| 空段落创建 | [treenode/tree.go](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/treenode/tree.go) | L116-L125 |
+| 文件加载+修复 | [filesys/tree.go](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/filesys/tree.go) | L398-L456 |
+| XSS 属性修复 | [filesys/tree.go](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/filesys/tree.go) | L474-L508 |
+| 版本兼容性 | [treenode/tree.go](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/treenode/tree.go) | L139-L192 |
+| 前端事务队列 | [transaction.ts](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/app/src/protyle/wysiwyg/transaction.ts) | L64-L275 |
+| HTML→BlockDOM API | [api/lute.go](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/api/lute.go) | L78-L202 |
 
 ---
 
-## 9. 总结
+## 6. 总结
 
-SiYuan 的块级 Markdown 解析与 AST 构建机制采用了 **"DOM 作为中间层 + AST 作为核心模型 + JSON 持久化"** 的三层架构，通过 Lute 引擎提供强大的解析能力，通过事务队列保证数据一致性，通过多层次缓存和索引保证查询性能。
+SiYuan 的块级 Markdown 解析体系设计遵循以下核心原则：
 
-### 9.1 架构亮点
-
-1. **清晰的分层设计**: 各模块职责明确，耦合度低
-2. **完善的容错机制**: 自动数据修复、版本兼容、崩溃恢复
-3. **可扩展性**: 插件系统、事件总线、可配置解析选项
-4. **性能优化**: mmap 写入、并发加载、增量 SQL 队列
-
-### 9.2 可优化点
-
-1. **增量写入**: 当前每次修改全量重写 .sy 文件，大文档性能可优化（可考虑 JSON Patch 或分段写入）
-2. **事务并发**: 单队列串行执行可考虑按文档分片并行（不同文档的事务可安全并行）
-3. **缓存策略**: 可引入更智能的缓存失效机制（目前 IAL 缓存未设置 TTL）
-4. **冲突处理**: 目前采用 LWW（最后写入胜），可考虑 OT 或 CRDT 算法提升多端协作体验
-5. **错误恢复**: `TxErrCodeWriteTree` 直接终止进程，可增加重试机制和损坏文件隔离
-6. **队列监控**: 事务队列长度达到阈值时可主动通知用户，避免无感知阻塞
-
-### 9.3 新增关键代码路径速查（补充）
-
-| 功能 | 入口文件 | 核心函数 |
-|-----|---------|---------|
-| 前端事务队列 | [transaction.ts](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/app/src/protyle/wysiwyg/transaction.ts) | `promiseTransaction()` |
-| 属性值 XSS 修复 | [filesys/tree.go](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/filesys/tree.go) | `escapeAttributeValues()` |
-| 数据版本升级 | [treenode/tree.go](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/treenode/tree.go) | `UpgradeSpec()` |
-| 引用计数刷新 | [model/transaction.go](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/model/transaction.go) | `refreshRefCount()` |
-| 导入专用 Lute | [util/lute.go](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/util/lute.go) | `NewStdLute()` |
-| 事务错误分类 | [model/transaction.go](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/model/transaction.go) | `flushTx()` error switch |
-
-### 9.4 历史 Issue 参考
-
-分析中涉及的已知问题与修复：
-
-| Issue | 描述 | 影响模块 |
-|-------|------|---------|
-| #5891 | 编辑文档标题后引用处动态锚文本不更新 | 块引用处理 |
-| #15377 | HTML 块连续空行处理 | 块更新 |
-| #16686 | v3.5.1 属性值未转义导致 XSS 漏洞（GHSA-ff66-236v-p4fg） | 数据修复 |
-| #16712 | 属性值转义修复逻辑 | 数据修复 |
-| #14429 | 导入 Markdown 时支持缩进代码块语法 | Lute 配置 |
-| #14731 | 导入 Markdown 时遵循编辑器语法设置 | Lute 配置 |
-
-### 9.5 完整关键代码路径速查
-
-| 功能 | 入口文件 | 核心函数 |
-|-----|---------|---------|
-| Markdown → 文档 | [model/file.go](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/model/file.go) | `CreateDocByMd()` |
-| 块更新 | [model/transaction.go](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/model/transaction.go) | `doUpdate()` |
-| DOM → AST | Lute 引擎 | `BlockDOM2Tree()` |
-| 文件加载 | [filesys/tree.go](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/filesys/tree.go) | `LoadTree()` |
-| 块树索引 | [treenode/blocktree.go](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/treenode/blocktree.go) | `IndexBlockTree()` |
-| SQL 索引 | [sql/upsert.go](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/sql/upsert.go) | `UpsertTreeQueue()` |
-| 前端事务 | [app/src/protyle/wysiwyg/transaction.ts](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/app/src/protyle/wysiwyg/transaction.ts) | `transaction()` |
-| 前端事务队列 | [transaction.ts](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/app/src/protyle/wysiwyg/transaction.ts) | `promiseTransaction()` |
-| 属性值 XSS 修复 | [filesys/tree.go](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/filesys/tree.go) | `escapeAttributeValues()` |
-| 数据版本升级 | [treenode/tree.go](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/treenode/tree.go) | `UpgradeSpec()` |
-| 导入专用 Lute | [util/lute.go](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/util/lute.go) | `NewStdLute()` |
-| 事务错误处理 | [model/transaction.go](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/model/transaction.go) | `flushTx()` |
+1. **解析引擎纯粹性**：Lute 专注语法规则与格式转换，不掺杂业务逻辑
+2. **应用层兜底**：Kernel 在 Lute 输出基础上进行 ID 补全、容器约束、类型升级、属性注入
+3. **多层校验纵深**：语法校验→业务校验→事务校验→数据修复→索引恢复，每层有降级策略
+4. **数据自我修复**：加载时 9 步检查流程自动修正 ID、转义、版本、格式等不一致问题
+5. **错误分级处理**：可恢复错误推送消息，致命错误终止进程避免数据进一步损坏
+6. **最终一致性优先**：通过串行事务队列、原子文件写入、延迟索引刷新保证数据最终一致
