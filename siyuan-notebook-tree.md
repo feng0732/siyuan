@@ -190,53 +190,83 @@ blocktrees 表记录每个块的位置信息
 
 ### 5.2 文档移动核心流程
 
-[MoveDocs()](file:///d:/fz/0601/solo-dogfeeding/code/292-siyuan/kernel/model/file.go#L1000-L1100)：
+[MoveDocs()](file:///d:/fz/0601/solo-dogfeeding/code/292-siyuan/kernel/model/file.go#L1296-L1356)：
 
 ```
 1. 前置检查
-   ├─> 权限检查（只读角色禁止）
-   ├─> 深度检查（最大 7 层限制）
-   └─> 循环引用检查（禁止将父移入子）
+   ├─> 笔记本存在性检查
+   ├─> 过滤无效路径（移动到自身父级视为不移动）
+   └─> 深度检查（最大 7 层限制，除非 AllowCreateDeeper 开启）
 
-2. 执行移动
-   ├─> 文件系统重命名（filelock.Rename()
-   ├─> 递归移动子文档
-   ├─> 更新所有子文档 HPath
-   ├─> 更新 BlockTree 索引
-   └─> 更新排序配置
-   └─> 清除缓存
+2. 事务同步
+   └─> FlushTxQueue() // 先清空事务队列，确保移动前所有数据落盘
 
-3. 后置处理
-   ├─> 更新祖先节点 updated 时间
-   └─> 广播变更
+3. 逐文档移动
+   └─> moveDoc()
+        ├─> 加载源文档和目标文档
+        ├─> 创建目标目录
+        ├─> 移动子文档目录（如果有）
+        ├─> filelock.Rename() 文件系统重命名
+        ├─> 重新加载文档
+        ├─> moveTree() 更新索引
+        │    ├─> treenode.SetBlockTreePath()  // 更新 BlockTree 索引
+        │    └─> sql.MoveTreeQueue()          // SQL 索引队列
+        ├─> moveSorts() // 跨笔记本时迁移排序配置
+        └─> 递归处理子文档并推送事件
+
+4. 后置处理
+   ├─> cache.ClearDocsIAL() // 清空全部 docIAL 缓存
+   └─> IncSync() // 增加同步计数
 ```
+
+> **重要**：文档移动是**非事务操作**，直接操作文件系统。移动前调用 `FlushTxQueue()` 确保没有未提交的块事务，避免数据不一致。
 
 ### 5.3 移动验证机制
 
-**关键验证函数：
+**块级移动验证**（事务内移动块时）：
 
-1. **isMovingParentIntoChild()](file:///d:/fz/0601/solo-dogfeeding/code/292-siyuan/kernel/model/transaction.go#L800-L850)
+1. **isMovingParentIntoChild()](file:///d:/fz/0601/solo-dogfeeding/code/292-siyuan/kernel/model/transaction.go)
    - 检查是否将父节点移动到其子节点中
-   - 防止循环引用
+   - 防止循环引用和结构破坏
 
-2. **isMovingFoldHeadingIntoSelf()](file:///d:/fz/0601/solo-dogfeeding/code/292-siyuan/kernel/model/transaction.go#L850-L900)
-   - 检查折叠标题移动验证
-   - 防止数据丢失
+2. **isMovingFoldHeadingIntoSelf()](file:///d:/fz/0601/solo-dogfeeding/code/292-siyuan/kernel/model/transaction.go)
+   - 检查折叠标题移动到自身内部
+   - 防止折叠内容丢失
+
+> **文档级移动**：文档级移动通过 `MoveDocs()` 函数执行，在文件系统层面重命名，不经过事务队列，因此没有上述验证。文档级移动的循环引用检查通过路径比较实现。
 
 ### 5.4 子文档级联移动
 
-当移动包含子文档的文档时：
+[moveTree()](file:///d:/fz/0601/solo-dogfeeding/code/292-siyuan/kernel/model/box.go#L467-L491)：
 
 ```go
-// 伪代码
-func moveTree() {
-    // 1. 移动当前文档
+func moveTree(tree *parse.Tree) {
+    // 1. 更新当前文档的 BlockTree 索引
+    treenode.SetBlockTreePath(tree)
+    sql.MoveTreeQueue(tree)
+
     // 2. 遍历子文档目录
-    // 3. 递归移动每个子文档
-    // 4. 重构所有子文档的 Path 和 HPath
-    // 5. 更新 BlockTree 索引
+    box := Conf.Box(tree.Box)
+    subFiles := box.ListFiles(tree.Path)
+    for _, subFile := range subFiles {
+        if !strings.HasSuffix(subFile.path, ".sy") {
+            continue
+        }
+
+        // 3. 加载子文档（LoadTree 会重新构造 HPath）
+        subTree, err := filesys.LoadTree(box.ID, subFile.path, luteEngine)
+        
+        // 4. 更新子文档索引
+        treenode.SetBlockTreePath(subTree)
+        sql.MoveTreeQueue(subTree)
+    }
+
+    // 5. 刷新文档信息
+    refreshDocInfo(tree)
 }
 ```
+
+> **关键点**：子文档的 HPath 由 `LoadTree` 自动重新构造，通过读取各级父文档的标题拼接而成。
 
 ## 6. 排序状态管理
 
@@ -415,27 +445,34 @@ type PublishAccessItem struct {
 
 ### 8.2 写入主流程
 
-[WriteTree()](file:///d:/fz/0601/solo-dogfeeding/code/292-siyuan/kernel/filesys/tree.go#L250-L300)：
+[WriteTree()](file:///d:/fz/0601/solo-dogfeeding/code/292-siyuan/kernel/filesys/tree.go#L244-L260)：
 
 ```go
 func WriteTree(tree *parse.Tree) (uint64, error) {
-    // 1. 准备写入数据
+    // 1. 准备写入数据（序列化为 JSON）
     data, filePath, err := prepareWriteTree(tree)
     
-    // 2. 双写策略：mmap 优先
-    if err = writeTreeByMmap(filePath, data); err != nil {
-        if err = writeTreeByWriteFile(filePath, data); err != nil {
+    // 2. 双写策略：mmap 优先，失败降级到 writeFile
+    if err = writeTreeByMmap(filePath, data); nil != err {
+        if err = writeTreeByWriteFile(filePath, data); nil != err {
             return 0, err
         }
     }
     
-    // 3. 更新缓存
+    // 3. 更新树数据缓存
     cache.SetTreeData(tree.ID, data)
     
-    // 4. 后置处理（更新索引等）
+    // 4. 后置处理：更新 docIAL 缓存
     afterWriteTree(tree)
 }
 ```
+
+**执行顺序确认**：
+1. 先写入文件系统（mmap → writeFile 降级）
+2. 再更新 `treeCache`（原始 JSON 数据缓存）
+3. 最后更新 `docIALCache`（文档属性缓存）
+
+> **重要**：文件写入成功后才更新缓存。若文件写入失败，缓存保持不变。
 
 ### 8.3 mmap 写入策略
 
@@ -522,14 +559,41 @@ var (
 )
 ```
 
-### 9.2 并发控制锁
+### 9.2 并发控制锁与协作范围
 
-| 锁名称 | 位置 | 保护资源 |
-|--------|------|----------|
-| `flushLock | transaction.go | 事务串行执行 |
-| `indexBlockTreeLock | blocktree.go | BlockTree 索引操作 |
-| `publishAccessLock | publish_access.go | 发布访问配置 |
-| `initDatabaseLock | blocktree.go | 数据库初始化 |
+| 锁名称 | 位置 | 保护资源 | 锁范围 |
+|--------|------|----------|--------|
+| `flushLock` | [transaction.go L64](file:///d:/fz/0601/solo-dogfeeding/code/292-siyuan/kernel/model/transaction.go#L64-L68) | 事务串行执行 | 整个 `flushTx()` 函数，包括 `performTx |
+| `tx.m` | [transaction.go L1860](file:///d:/fz/0601/solo-dogfeeding/code/292-siyuan/kernel/model/transaction.go#L1860-L1862) | 单个事务内部状态 | begin 获取，commit/rollback 释放 |
+| `indexBlockTreeLock` | [blocktree.go L522](file:///d:/fz/0601/solo-dogfeeding/code/292-siyuan/kernel/treenode/blocktree.go#L522-L523) | BlockTree 索引表读写 | IndexBlockTree / UpsertBlockTree 内部 |
+| `initDatabaseLock` | [blocktree.go L50](file:///d:/fz/0601/solo-dogfeeding/code/292-siyuan/kernel/treenode/blocktree.go#L50-L51) | 数据库初始化 | initDatabase 函数内部 |
+
+**锁的层级关系：
+```
+flushLock (事务级，最外层)
+    │
+    ├─> tx.m (事务内部状态保护
+    │
+    └─> indexBlockTreeLock (BlockTree 索引操作，可重入？不，是独立的)
+```
+
+> **注意**：`flushLock` 和 `indexBlockTreeLock` 是**嵌套关系。`flushLock` 保护整个事务执行过程，在事务执行过程中会调用 `UpsertBlockTree()`，后者内部再获取 `indexBlockTreeLock`。由于事务串行执行 + indexBlockTreeLock 是冗余吗？不，indexBlockTreeLock 还被非事务路径调用（如 moveTree、rename 等）。
+
+**事务状态机：
+
+```
+    begin() → state=1 → 执行操作 → commit() → state=2
+        ↑                │
+        │                └─> 出错/panic → rollback() → state=3
+        │
+        └─> 释放 tx.m
+```
+
+状态值：
+- `0`：未开始
+- `1`：进行中（已获取 tx.m）
+- `2`：已提交
+- `3`：已回滚
 
 ### 9.3 跨进程文件锁
 
@@ -551,257 +615,605 @@ err := filelock.WriteFile(filePath, data)  // 写锁
 └─> 提升性能
 ```
 
-## 10. 缓存刷新策略
+## 10. 缓存刷新与索引更新联动
 
 ### 10.1 缓存层设计
 
-[cache/tree.go](file:///d:/fz/0601/solo-dogfeeding/code/292-siyuan/kernel/cache/tree.go)：
+SiYuan 有**两套独立的 Ristretto 缓存**：
 
-**Ristretto 缓存配置：
+**1. 树数据缓存** [cache/tree.go](file:///d:/fz/0601/solo-dogfeeding/code/292-siyuan/kernel/cache/tree.go)：
 ```go
 treeCache, _ = ristretto.NewCache(&ristretto.Config{
-    NumCounters: 100000,   // 计数器数量
+    NumCounters: 100000,
     MaxCost:     200 * 1024 * 1024,  // 200MB
-    BufferItems: 64,           // 缓冲区
+    BufferItems: 64,
 })
 ```
+- Key：`rootID`（文档根块 ID）
+- Value：原始 JSON 字节数据
+- 作用：加速文档树加载，避免重复读取文件和解析 JSON
 
-### 10.2 缓存命中流程
+**2. 文档 IAL 缓存** [cache/ial.go](file:///d:/fz/0601/solo-dogfeeding/code/292-siyuan/kernel/cache/ial.go)：
+```go
+docIALCache, _ = ristretto.NewCache(&ristretto.Config{
+    NumCounters: 100000,
+    MaxCost:     200 * 1024 * 1024,  // 200MB
+    BufferItems: 64,
+})
+```
+- Key：文档路径（path）
+- Value：文档 IAL 属性 map（id、title、updated 等）
+- 作用：加速文件树列表渲染，避免逐个打开 .sy 文件
+
+### 10.2 事务中的索引与缓存更新顺序
+
+**块操作事务（create/update/delete/move 等）**：
 
 ```
-读取路径：
-LoadTreeWithFix()
-      │
-      ├─> cache.GetTreeData() -> 命中 -> 返回
-      │
-      └─> 未命中
-            │
-            ├─> filelock.ReadFile() -> 读取文件
-            ├─> fixTreeJSONData() -> 修复数据
-            ├─> parseJSON2Tree() -> 解析 AST
-            └─> cache.SetTreeData() -> 写入缓存
+performTx()
+    │
+    ├─> begin()
+    │    └─> 初始化 tx.trees、tx.nodes
+    │
+    ├─> 执行 doXxx 操作
+    │    └─> tx.writeTree(tree)
+    │         ├─> tx.trees[tree.ID] = tree   // 暂存到事务上下文中
+    │         └─> treenode.UpsertBlockTree(tree)  // ⚠️ 立即更新 BlockTree 索引
+    │              └─> indexBlockTreeLock.Lock()
+    │                  └─> SQLite DELETE + INSERT
+    │
+    └─> commit()
+         └─> 遍历 tx.trees
+              └─> writeTreeUpsertQueue(tree)
+                   ├─> filesys.WriteTree(tree)  // 写入文件系统
+                   │    ├─> mmap / writeFile
+                   │    ├─> cache.SetTreeData()   // 更新树数据缓存
+                   │    └─> afterWriteTree()
+                   │         └─> cache.PutDocIAL()  // 更新 docIAL 缓存
+                   └─> sql.UpsertTreeQueue(tree)  // 加入 SQL 索引队列（异步）
 ```
 
-### 10.3 缓存失效时机
+**关键发现**：
+1. **BlockTree 索引在事务执行过程中就已更新**（不是在 commit 时才更新）
+2. **文件系统写入和缓存更新在 commit 阶段才执行**
+3. 若事务在操作阶段失败并 rollback，BlockTree 索引已变更，但**不会回滚**
+4. 但文件系统尚未写入，因此不会出现数据不一致（文件系统是权威数据源）
 
-| 操作 | 缓存操作 |
-|------|----------|
-| 写入文档 | `SetTreeData()` 更新缓存 |
-| 删除文档 | `RemoveTreeData()` 删除缓存 |
-| 移动文档 | `RemoveTreeData()` 删除缓存 |
-| 重建索引 | `ClearTreeCache()` 清空全部 |
+### 10.3 文档移动时的索引与缓存更新
+
+[MoveDocs()](file:///d:/fz/0601/solo-dogfeeding/code/292-siyuan/kernel/model/file.go#L1296-L1356)：
+
+```
+MoveDocs()
+    │
+    ├─> FlushTxQueue()              // 先清空事务队列，确保移动前数据落盘
+    │
+    ├─> filelock.Rename()           // 文件系统重命名（原子操作）
+    │
+    ├─> moveTree(tree)             // 更新索引
+    │    ├─> treenode.SetBlockTreePath(tree)  // 更新 BlockTree 索引
+    │    │    ├─> RemoveBlockTreesByRootID()
+    │    │    └─> IndexBlockTree()
+    │    └─> sql.MoveTreeQueue(tree)         // 加入 SQL 移动队列
+    │
+    ├─> 递归处理子文档
+    │
+    └─> cache.ClearDocsIAL()       // ⚠️ 清空全部 docIAL 缓存
+```
+
+> **注意**：文档移动是**非事务操作**，直接操作文件系统和索引，不经过事务队列。移动前先 `FlushTxQueue()` 确保没有未提交的事务。
+
+### 10.4 文档删除时的索引与缓存更新
+
+[removeDoc()](file:///d:/fz/0601/solo-dogfeeding/code/292-siyuan/kernel/model/file.go#L1562-L1642)：
+
+```
+removeDoc()
+    │
+    ├─> 备份到 history 目录
+    ├─> 删除文件和子目录
+    ├─> treenode.RemoveBlockTreesByPathPrefix()  // 删除 BlockTree 索引
+    ├─> cache.RemoveDocIAL(ret.Path)           // 删除 docIAL 缓存
+    ├─> cache.RemoveTreeData(ret.ID)            // 删除树数据缓存
+    └─> task.AppendTask(task.DatabaseIndex, ...) // 异步 SQL 索引清理
+```
+
+### 10.5 缓存失效时机汇总
+
+| 操作 | 触发位置 | treeCache | docIALCache | BlockTree 索引 |
+|------|----------|-----------|-------------|----------------|
+| 写入文档 | WriteTree() | SetTreeData() | PutDocIAL() | UpsertBlockTree() |
+| 删除文档 | removeDoc() | RemoveTreeData() | RemoveDocIAL() | RemoveBlockTreesByPathPrefix() |
+| 移动文档 | MoveDocs() | 不直接操作 | ClearDocsIAL()（全量清空） | SetBlockTreePath() |
+| 重命名文档 | RenameDoc() | 不直接操作 | 不直接操作 | SetBlockTreePath() |
+| 重建索引 | Reindex | ClearTreeCache() | ClearDocsIAL() | 全量重建 |
+
+> **注意**：移动文档时清空了**全部** docIAL 缓存（`ClearDocsIAL()`），而不是只清除受影响的文档。这是因为移动会导致大量文档的 HPath 变化，逐个清除效率更低。
 
 ## 11. 异常恢复机制
 
-### 11.1 Panic 恢复
+### 11.1 Panic 恢复与事务回滚
 
 [performTx()](file:///d:/fz/0601/solo-dogfeeding/code/292-siyuan/kernel/model/transaction.go#L168-L178)：
 
 ```go
 defer func() {
     if e := recover(); nil != e {
-        // 记录错误日志
-        logging.LogErrorf("PANIC RECOVERED: %v", e)
-        
-        // 事务回滚
-        if 1 == tx.state.Load() {
+        logging.LogErrorf("PANIC RECOVERED: %v\n\t%s", e, logging.ShortStack())
+
+        if 1 == tx.state.Load() {  // 只有进行中状态才回滚
             tx.rollback()
+            return
         }
     }
 }()
 ```
 
-### 11.2 数据库损坏恢复
+**回滚行为**：
+- `tx.rollback()` 仅**清空内存中的 trees 和 nodes 引用**
+- **不会回滚**已经更新的 BlockTree 索引
+- **不会回滚**文件系统（因为 commit 前还没写文件）
+- 释放 `tx.m` 互斥锁
+- 最终由 `defer` 释放 `flushLock`
 
-[execInsertBlocktrees()](file:///d:/fz/0601/solo-dogfeeding/code/292-siyuan/kernel/treenode/blocktree.go#L600-L650)：
+> **关键点**：事务回滚是"软回滚"，只回滚内存状态，不回滚已持久化的数据。由于文件系统写入在 commit 阶段才执行，所以操作阶段失败不会导致文件系统损坏。
 
+### 11.2 事务失败分类与处理
+
+[flushTx()](file:///d:/fz/0601/solo-dogfeeding/code/292-siyuan/kernel/model/transaction.go#L83-L125) 中的错误码处理：
+
+| 错误码 | 名称 | 处理方式 |
+|--------|------|----------|
+| 0 | TxErrCodeBlockNotFound | 推送错误消息给前端，不退出 |
+| 1 | TxErrCodeDataIsSyncing | 推送提示消息，不退出 |
+| 2 | TxErrCodeWriteTree | **致命错误**，`LogFatalf` 退出程序 |
+| 3 | TxErrHandleAttributeView | 推送错误消息，记录日志，不退出 |
+| 4 | TxErrCodePushMsg | 推送错误消息，不退出 |
+
+**失败恢复顺序**：
 ```
-检测到 "database disk image is malformed" 错误：
-├─> initDatabase(true) 强制重建数据库
-└─> logging.LogFatalf() 退出程序
-```
-
-### 11.3 损坏文件处理
-
-[docIAL()](file:///d:/fz/0601/solo-dogfeeding/code/292-siyuan/kernel/model/file.go#L700-L750)：
-
-```
-检测到损坏的 .sy 文件：
-├─> 创建 workspace/corrupted/ 目录
-├─> 移动损坏文件到该目录
-└─> 记录错误日志
-```
-
-### 11.4 临时文件清理
-
-[Box.Ls()](file:///d:/fz/0601/solo-dogfeeding/code/292-siyuan/kernel/model/box.go#L300-L350)：
-
-```
-清理 .tmp 文件：
-├─> 文件存在超过 30 分钟
-└─> 自动删除
-```
-
-### 11.5 孤儿文档处理
-
-[LoadTreeByData()](file:///d:/fz/0601/solo-dogfeeding/code/292-siyuan/kernel/filesys/tree.go#L147-L200)：
-
-```
-子文档存在但父文档不存在时：
-└─> 自动创建缺失的父文档
+事务执行失败
+    │
+    ├─> 操作执行中失败（doXxx 返回错误）
+    │    └─> tx.rollback() → 清空内存引用，释放 tx.m → 返回 TxErr
+    │
+    ├─> Panic 触发
+    │    └─> 检查 state==1 → tx.rollback() → 返回
+    │
+    └─> commit 失败
+         └─> 直接返回错误，不回滚（已写入的文件无法撤回）
+              │
+              └─> 根据错误码决定是否 Fatal 退出
 ```
 
-### 11.6 空文档规范化
+> **重要误判排除**：commit 阶段失败时，**部分文件可能已经写入成功**，不会回滚。这意味着如果 commit 中途失败，可能出现部分文档已更新、部分未更新的情况。但由于 BlockTree 索引在操作阶段已更新，索引与文件系统可能暂时不一致，下一次加载时会以文件系统为准。
 
-[normalizeTree()](file:///d:/fz/0601/solo-dogfeeding/code/292-siyuan/kernel/filesys/tree.go#L550-L600)：
+### 11.3 BlockTree 数据库损坏恢复
 
+[execInsertBlocktrees()](file:///d:/fz/0601/solo-dogfeeding/code/292-siyuan/kernel/treenode/blocktree.go#L618-L649)：
+
+```go
+if strings.Contains(err.Error(), "database disk image is malformed") {
+    initDatabase(true)  // 强制重建数据库
+    logging.LogFatalf(logging.ExitCodeUnavailableDatabase, 
+        "database disk image [%s] is malformed, please restart SiYuan kernel to rebuild it", 
+        util.BlockTreeDBPath, err)
+}
 ```
-文档没有内容节点时：
-└─> 自动添加一个空段落
+
+**恢复流程**：
+1. 检测到 "database disk image is malformed" 错误
+2. 调用 `initDatabase(true)` 重新建表（**只建表，不重建数据**）
+3. `LogFatalf` 退出程序
+4. 用户重启后，系统会自动重新索引所有文档
+
+> **关键点**：损坏后程序**直接退出**，不尝试在线恢复。用户需重启程序，启动时会重建索引。这是因为索引损坏后继续运行可能导致更多问题。
+
+### 11.4 损坏 .sy 文件处理
+
+[docIAL()](file:///d:/fz/0601/solo-dogfeeding/code/292-siyuan/kernel/model/file.go#L107-L141)：
+
+```go
+func (box *Box) docIAL(p string) (ret map[string]string) {
+    // 1. 先查缓存
+    ret = cache.GetDocIAL(p)
+    if nil != ret {
+        return ret
+    }
+
+    // 2. 读取文件
+    filePath := filepath.Join(util.DataDir, box.ID, p)
+    ret = filesys.DocIAL(filePath)
+    if 1 > len(ret) {  // Properties 不存在或为空
+        logging.LogWarnf("properties not found in file [%s]", filePath)
+        box.moveCorruptedData(filePath)  // 移走损坏文件
+        return nil
+    }
+
+    // 3. 写入缓存
+    cache.PutDocIAL(p, ret)
+    return ret
+}
 ```
 
-## 12. 潜在风险
+[moveCorruptedData()](file:///d:/fz/0601/solo-dogfeeding/code/292-siyuan/kernel/model/file.go#L129-L141)：
+```go
+func (box *Box) moveCorruptedData(filePath string) {
+    base := filepath.Base(filePath)
+    to := filepath.Join(util.WorkspaceDir, "corrupted", 
+        time.Now().Format("2006-01-02-150405"), box.ID, base)
+    
+    if copyErr := filelock.Copy(filePath, to); nil != copyErr {
+        return  // 复制失败则保留原文件
+    }
+    if removeErr := filelock.Remove(filePath); nil != removeErr {
+        return  // 删除失败则保留原文件
+    }
+}
+```
+
+**触发条件**：
+- 读取 .sy 文件时，无法解析出 `Properties` 字段
+- 或 `Properties` 为空 map
+
+**处理方式**：
+1. **先复制**到 `workspace/corrupted/日期/boxID/` 目录（保留备份）
+2. **再删除**原文件
+3. 若复制失败，保留原文件（不删除）
+4. 记录警告日志
+
+> **排查提示**：发现文档突然消失，先检查 `workspace/corrupted/` 目录。文件名保留原 ID，可手动恢复。
+
+### 11.5 孤儿文档（父文档缺失）自动补全
+
+[LoadTreeByData()](file:///d:/fz/0601/solo-dogfeeding/code/292-siyuan/kernel/filesys/tree.go#L170-L196)：
+
+```go
+// 构造 HPath 时，遍历父路径
+for i := range parts {
+    parentAbsPath := strings.Join(parts[:i+1], "/") + ".sy"
+    parentDocIAL := DocIAL(parentAbsPath)
+    
+    if 1 > len(parentDocIAL) {
+        // 子文档缺失父文档时自动补全
+        parentTree := treenode.NewTree(boxID, parentPath, 
+            hPathBuilder.String()+"Untitled", "Untitled")
+        
+        if _, writeErr := WriteTree(parentTree); nil != writeErr {
+            logging.LogErrorf("rebuild parent tree [%s] failed: %s", 
+                parentAbsPath, writeErr)
+        } else {
+            logging.LogInfof("rebuilt parent tree [%s]", parentAbsPath)
+            treenode.UpsertBlockTree(parentTree)  // 更新索引
+        }
+        hPathBuilder.WriteString("Untitled/")
+        continue
+    }
+    // ...
+}
+```
+
+**触发条件**：
+- 加载子文档时，向上查找父文档
+- 发现某个层级的父文档 .sy 文件不存在或 Properties 为空
+
+**处理方式**：
+1. 自动创建一个标题为 "Untitled" 的父文档
+2. 调用 `WriteTree()` 写入文件系统
+3. 调用 `UpsertBlockTree()` 更新 BlockTree 索引
+4. HPath 中使用 "Untitled" 作为缺失父文档的名称
+
+> **排查提示**：发现文档树中出现大量 "Untitled" 文档，可能是父文档文件丢失后自动补全的结果。检查 `workspace/corrupted/` 目录，或查看日志中的 `rebuilt parent tree` 记录。
+
+### 11.6 临时文件清理
+
+[Box.Ls()](file:///d:/fz/0601/solo-dogfeeding/code/292-siyuan/kernel/model/box.go) 相关逻辑：
+
+**清理规则**：
+- `.tmp` 后缀的文件
+- 文件存在时间超过 30 分钟
+- 自动删除
+
+> **排查提示**：大量 `.tmp` 文件残留可能意味着写入过程频繁中断。检查磁盘空间、文件系统权限或是否有其他进程锁定文件。
+
+### 11.7 空文档规范化
+
+文档加载时，如果文档没有内容节点，会自动添加一个空段落节点，保证文档最少有一个可编辑的块。
+
+## 12. 潜在风险分析
 
 ### 12.1 并发风险
 
 1. **事务队列溢出**
    - 风险：`txQueue` 仅缓冲 7 个事务
-   - 场景：高并发写入可能导致阻塞
-   - 影响：前端操作延迟
+   - 场景：高并发写入时可能阻塞发送方
+   - 影响：前端操作卡顿、延迟增加
+   - 实际情况：由于 `flushLock` 串行执行，队列满时 `PerformTransactions` 会阻塞
 
-2. **死锁风险**
-   - 风险：多锁顺序不一致可能导致死锁
-   - 场景：同时持有 `flushLock` 和 `indexBlockTreeLock`
-   - 建议：严格按顺序获取锁
+2. **BlockTree 索引与文件系统不一致窗口**
+   - 风险：事务操作阶段先更新 BlockTree 索引，commit 阶段才写文件
+   - 场景：操作阶段成功但 commit 阶段前进程崩溃
+   - 影响：BlockTree 索引中有记录但文件系统中没有
+   - 恢复：下次加载时会以文件系统为准，索引会逐步修正
 
-3. **缓存击穿**
-   - 风险：大量缓存失效瞬间大量请求穿透到数据库
+3. **锁粒度粗**
+   - 风险：`flushLock` 是全局锁，所有事务串行执行
+   - 场景：编辑不同文档也会互斥等待
+   - 影响：多用户并发编辑时吞吐量受限
 
 ### 12.2 数据一致性风险
 
-1. **文件系统与索引不一致**
-   - 风险：写入文件成功但索引更新失败
-   - 场景：进程在文件写入后、索引更新前崩溃
-   - 恢复：启动时重新索引
+1. **commit 部分失败**
+   - 风险：commit 阶段遍历多个树写入，中途失败则已写入的不会回滚
+   - 场景：一个事务修改了多个文档，写入第二个文档时磁盘满
+   - 影响：部分文档已更新，部分未更新
+   - 严重性：中等，因为每个文档是独立的
 
-2. **部分写入**
-   - 风险：mmap 写入过程中崩溃
-   - 场景：断电、进程被杀
-   - 恢复：WAL 日志重放
+2. **移动文档中途失败**
+   - 风险：文件系统重命名是原子的，但索引更新可能失败
+   - 场景：重命名成功但 BlockTree 更新失败
+   - 影响：文件在新位置，但索引还指向旧位置
+   - 恢复：重建索引即可
+
+3. **缓存与数据不一致**
+   - 风险：文件写入成功但缓存更新失败
+   - 场景：`cache.SetTreeData()` 内部出错（虽然概率极低）
+   - 影响：读取到旧数据
+   - 恢复：清除缓存或重启
 
 ### 12.3 性能风险
 
-1. **大事务阻塞**
-   - 风险：单个事务包含大量操作
-   - 场景：批量删除、批量移动
+1. **docIAL 缓存全量失效**
+   - 风险：移动文档时调用 `ClearDocsIAL()` 清空全部缓存
+   - 场景：频繁移动文档
+   - 影响：文件树列表加载变慢，需要逐个打开 .sy 文件
+
+2. **大事务阻塞**
+   - 风险：单个事务包含大量操作，会长时间占用 `flushLock`
+   - 场景：批量粘贴、批量删除
    - 影响：其他操作排队等待
 
-2. **缓存内存占用**
-   - 风险：200MB 缓存上限，大文档占满
-   - 场景：文档体积大、数量多
-   - 影响：频繁缓存失效
+3. **子文档级联加载**
+   - 风险：移动或重命名文档时需要遍历所有子文档
+   - 场景：深层级、多子文档的大树移动
+   - 影响：耗时较长，UI 可能卡顿
 
 ### 12.4 安全风险
 
 1. **XSS 攻击**
-   - 风险：属性值未正确转义
-   - 修复：`escapeAttributeValues()`
+   - 风险：属性值未正确转义可能导致 XSS
+   - 修复：`escapeAttributeValues()` 在加载时重新编码
+   - 历史漏洞：GHSA-ff66-236v-p4fg
 
 2. **路径遍历**
-   - 风险：路径参数未校验
-   - 修复：`ast.IsNodeIDPattern()` 校验
+   - 风险：路径参数未校验可能访问非预期文件
+   - 修复：`ast.IsNodeIDPattern()` 校验 ID 格式
+   - 保护：文件操作都限制在 data 目录内
+
+### 12.5 恢复能力边界
+
+| 故障类型 | 是否可自动恢复 | 数据丢失风险 | 恢复方式 |
+|---------|--------------|------------|----------|
+| .sy 文件损坏（Properties 丢失） | 是（自动移走） | 有（文件损坏） | 从 corrupted 目录手动恢复 |
+| BlockTree 索引损坏 | 否（需重启） | 无（索引可重建） | 删除 db 文件后重启 |
+| 事务执行中 panic | 是（自动回滚） | 低（只回滚内存状态） | 自动恢复 |
+| commit 中途失败 | 否 | 中（部分写入） | 手动检查一致性 |
+| 磁盘空间不足写入失败 | 否 | 低 | 释放空间后重试 |
+| 父文档缺失 | 是（自动补全） | 低（补全空白文档） | 自动恢复，可能需要手动编辑 |
 
 ## 13. 问题排查方法
 
-### 13.1 日志分析
+### 13.1 日志分析关键线索
 
-**关键日志点：
+**关键日志关键词**：
 
-1. **事务慢查询日志：
-```
-op tx [2000ms+  超过 2 秒的事务
-```
+| 日志关键词 | 含义 | 严重程度 |
+|-----------|------|----------|
+| `op tx [xxxxms]` | 事务执行超过 2 秒 | ⚠️ 警告 |
+| `database disk image is malformed` | BlockTree 数据库损坏 | 💀 致命 |
+| `PANIC RECOVERED` | 事务执行中发生 panic 已恢复 | ⚠️ 警告 |
+| `properties not found in file` | .sy 文件缺少 Properties，可能已损坏 | ⚠️ 警告 |
+| `moved corrupted data file` | 已将损坏文件移至 corrupted 目录 | ℹ️ 提示 |
+| `rebuilt parent tree` | 自动补全了缺失的父文档 | ℹ️ 提示 |
+| `transaction failed` | 事务执行失败 | ⚠️ 警告 |
+| `reinitialized database` | 数据库已重新初始化 | ℹ️ 提示 |
 
-2. **数据库大小日志：
-```
-reinitialized database [xxx]  数据库重建
-```
-
-3. **Panic 恢复日志：
-```
-PANIC RECOVERED: xxx  Panic 恢复
-```
+**日志位置**：
+- Windows：`%APPDATA%\siyuan\log\`
+- macOS：`~/Library/Application Support/siyuan/log/`
+- Linux：`~/.config/siyuan/log/`
 
 ### 13.2 常见问题排查
 
-**问题 1：文档树不显示
+#### 问题 1：文档树不显示某文档
 
-排查步骤：
-1. 检查 `blocktrees 表是否存在该文档记录
-2. 检查文件系统中 .sy 文件是否存在
-3. 检查缓存是否失效
-4. 执行 `重建索引
+**排查步骤（按顺序）**：
 
-**问题 2：移动文档失败
+1. **检查文件系统**：确认 `.sy` 文件是否存在
+   ```
+   data/笔记本ID/路径/文档ID.sy
+   ```
 
-排查步骤：
-1. 检查权限（是否只读角色
-2. 检查深度限制（是否超过 7 层）
-3. 检查循环引用
-4. 检查文件锁是否被占用
+2. **检查 BlockTree 索引**：
+   ```sql
+   SELECT * FROM blocktrees WHERE root_id = '文档ID' AND type = 'd';
+   ```
 
-**问题 3：数据库损坏
+3. **检查是否被标记为损坏**：
+   - 查看 `workspace/corrupted/` 目录
+   - 搜索日志中是否有 `properties not found` 或 `moved corrupted`
 
-排查步骤：
-1. 查看日志是否有 `database disk image is malformed
-2. 删除 `blocktrees.db` 文件
-3. 重启程序自动重建
+4. **检查是否为隐藏文档**：
+   - 文档 IAL 中 `hidden` 属性是否为 `true`
 
-**问题 4：缓存不一致
+5. **尝试重建索引**：
+   - 设置 → 搜索 → 重建索引
+   - 或调用 API：`POST /api/filetree/reindex`
 
-排查步骤：
-1. 调用 `/api/filetree/clearCache`
-2. 重启程序
-3. 检查缓存命中率监控
+> **常见误判排除**：
+> - 文档是否在已关闭的笔记本中？
+> - 文档是否被移到了其他笔记本？
+> - 是否是子文档，父文档被隐藏/删除？
 
-### 13.3 调试工具
+#### 问题 2：移动文档失败
 
-1. **索引重建 API：
-```
-POST /api/filetree/reindex
-```
+**排查步骤**：
 
-2. **缓存清除 API：
-```
-POST /api/filetree/clearCache
-```
+1. **检查权限**：
+   - 当前用户角色是否为 Reader 或 Visitor（只读）
+   - 发布模式下是否有编辑权限
 
-3. **数据库检查：
+2. **检查深度限制**：
+   - 目标路径深度 + 子文档深度是否超过 7 层
+   - 可在 `conf.json` 中启用 `fileTree.allowCreateDeeper`
+
+3. **检查文件锁**：
+   - 是否有其他进程占用文件
+   - 检查是否有未完成的同步操作
+
+4. **检查事务队列**：
+   - 移动前会 `FlushTxQueue()`，若事务队列卡住会导致移动等待
+
+> **常见误判排除**：
+> - 移动到自身父目录（不移动是正常的）
+> - 目标位置已有同名文档（ID 相同不会冲突，名称相同可能冲突）
+
+#### 问题 3：BlockTree 数据库损坏
+
+**症状**：
+- 文档树空白
+- 搜索全部失效
+- 日志出现 `database disk image is malformed`
+
+**恢复步骤**：
+
+1. 关闭思源笔记
+2. 删除 `storage/blocktrees.db` 文件
+3. 重新启动，程序会自动重建索引
+4. 或使用 `POST /api/filetree/reindex` API 重建
+
+> **注意**：BlockTree 是索引数据库，损坏不会丢失数据，只是查询变慢。所有数据都在 `.sy` 文件中。
+
+#### 问题 4：缓存不一致
+
+**症状**：
+- 文档列表显示旧标题
+- 修改后列表没刷新
+
+**排查步骤**：
+
+1. 刷新页面（前端缓存）
+2. 调用 `POST /api/filetree/clearCache` 清除缓存
+3. 检查 docIALCache 是否已失效
+4. 检查 treeCache 是否已失效
+
+> **常见误判排除**：
+> - 是前端缓存还是后端缓存？
+> - 移动文档会清空全部 docIAL 缓存，列表刷新慢是正常的
+
+#### 问题 5：大量 "Untitled" 文档突然出现
+
+**可能原因**：
+- 父文档文件损坏被移走，自动补全生成
+- 同步冲突导致父文档丢失
+
+**排查步骤**：
+
+1. 检查 `workspace/corrupted/` 目录
+2. 搜索日志中的 `rebuilt parent tree` 记录
+3. 确认是否有同步操作正在进行
+
+#### 问题 6：事务执行缓慢
+
+**症状**：
+- 编辑操作延迟高
+- 日志中频繁出现 `op tx [xxxxms]`
+
+**可能原因**：
+
+1. 大文档操作（内容很多）
+2. 事务队列堆积
+3. 磁盘 IO 慢
+4. BlockTree 索引锁竞争
+
+**排查步骤**：
+
+1. 查看慢事务日志（超过 2000ms）
+2. 检查是否有大文档在操作
+3. 检查磁盘 IO 性能
+4. 检查是否有大量并发操作
+
+### 13.3 调试工具与 API
+
+| 工具 | 类型 | 用途 |
+|------|------|------|
+| `POST /api/filetree/reindex` | API | 重建文件树索引 |
+| `POST /api/filetree/clearCache` | API | 清除文件树缓存 |
+| `POST /api/system/getConf` | API | 查看系统配置 |
+| `workspace/corrupted/` | 目录 | 损坏文件存放处 |
+| `storage/blocktrees.db` | 文件 | BlockTree 索引数据库 |
+| `data/*/.sy` | 文件 | 实际文档数据 |
+
+### 13.4 数据一致性检查方法
+
+**快速验证索引与文件一致性**：
+
+1. 统计文件系统中 .sy 文件数量
+2. 统计 BlockTree 中文档块（type='d'）数量
+3. 两者应大致相等（排除损坏、隐藏等）
+
 ```sql
-SELECT * FROM blocktrees WHERE root_id = 'xxx'
+-- 统计 BlockTree 中的文档数量
+SELECT COUNT(*) FROM blocktrees WHERE type = 'd';
 ```
+
+若差异较大，可能需要重建索引。
+
+### 13.5 避免误判的排查原则
+
+1. **先文件，后索引**：文件系统是权威数据源，索引只是加速查询
+2. **先日志，后猜测**：先查日志确认错误类型，不要盲目尝试
+3. **先备份，后操作**：任何修复操作前先备份数据目录
+4. **先单例，后并发**：关闭其他设备同步，排除并发干扰
+5. **区分缓存层级**：前端缓存、后端缓存、数据库缓存，逐层排查
 
 ## 14. 总结
 
-SiYuan 文档树管理采用了**三层架构**设计：
+SiYuan 文档树管理采用了**三层持久化 + 两级缓存**的架构设计：
 
-1. **文件系统**作为真实存储，保证数据可移植
-2. **SQLite 索引**提供快速查询
-3. **内存缓存**提升读取性能
+**三层持久化**：
+1. **文件系统**（权威数据源）：`.sy` JSON 文件，保证数据可移植性
+2. **SQLite BlockTree 索引**（二级索引）：加速块位置查找，可重建
+3. **SQL 搜索索引**（三级索引）：全文搜索加速，异步更新
 
-**核心机制：**
+**两级缓存**：
+1. **treeCache**：原始 JSON 数据缓存，200MB Ristretto
+2. **docIALCache**：文档属性缓存，200MB Ristretto
 
-- **事务队列**保证操作原子性
-- **多级锁**保证并发安全
-- **多维度**保证数据安全
-- **异常恢复**机制保证系统稳定性
+### 核心机制总结
 
-**设计亮点：**
+| 机制 | 实现方式 | 关键代码 |
+|------|----------|----------|
+| 事务串行化 | channel 队列 + flushLock 互斥 | [flushTx()](file:///d:/fz/0601/solo-dogfeeding/code/292-siyuan/kernel/model/transaction.go#L83-L125) |
+| 索引更新时机 | 操作阶段更新 BlockTree，commit 阶段写文件 | [tx.writeTree()](file:///d:/fz/0601/solo-dogfeeding/code/292-siyuan/kernel/model/transaction.go#L1945-L1948) |
+| 缓存更新时机 | 文件写入成功后更新缓存 | [WriteTree()](file:///d:/fz/0601/solo-dogfeeding/code/292-siyuan/kernel/filesys/tree.go#L244-L260) |
+| 损坏文件处理 | 先复制备份，再删除原文件 | [moveCorruptedData()](file:///d:/fz/0601/solo-dogfeeding/code/292-siyuan/kernel/model/file.go#L129-L141) |
+| 孤儿文档补全 | 加载子文档时自动补全缺失的父文档 | [LoadTreeByData()](file:///d:/fz/0601/solo-dogfeeding/code/292-siyuan/kernel/filesys/tree.go#L170-L196) |
+| 事务回滚 | 仅清空内存引用，不回滚索引 | [tx.rollback()](file:///d:/fz/0601/solo-dogfeeding/code/292-siyuan/kernel/model/transaction.go#L1897-L1902) |
+| 文档移动 | 非事务操作，移动前清空事务队列 | [MoveDocs()](file:///d:/fz/0601/solo-dogfeeding/code/292-siyuan/kernel/model/file.go#L1296-L1356) |
 
-- mmap 写入优化
-- WAL 模式
-- 自动数据修复
-- 损坏文件隔离
-- 发布访问控制
+### 设计亮点
 
-这是一个经过生产验证的健壮的文档树管理实现。
+1. **文件系统优先**：以文件系统为权威数据源，索引和缓存均可重建，数据安全性高
+2. **双写策略**：mmap 优先，writeFile 降级，兼顾性能和兼容性
+3. **软事务回滚**：操作阶段修改内存状态，commit 才落盘，简化回滚逻辑
+4. **多级异常恢复**：从 panic 恢复、损坏文件隔离到数据库重建，多维度保障系统稳定性
+5. **向前兼容的加载修复**：加载时自动修复 XSS、Unicode 空字符等历史问题
+
+### 权衡与取舍
+
+- **一致性 vs 性能**：选择最终一致性，优先保证写入性能
+- **粗粒度锁 vs 细粒度锁**：选择全局串行事务，简化实现，牺牲并发性能
+- **全量缓存失效 vs 精确失效**：移动文档时选择全量清空 docIAL 缓存，简化实现
+
+这是一个经过生产验证的、以**本地优先和数据安全**为核心设计原则的文档树管理实现。
