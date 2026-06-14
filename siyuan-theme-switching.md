@@ -297,9 +297,54 @@ export const addScript = (path: string, id: string) => {
 };
 ```
 
-**异常点**：`addScript()` **只处理了 `onload`，没有处理 `onerror`**。如果脚本文件不存在或加载失败，Promise 将永远处于 pending 状态，不会 reject。
+**异常点**：`addScript()` **只处理了 `onload`，没有处理 `onerror`**。如果脚本加载失败（如网络错误、非 theme.js 的其他脚本 404 等），Promise 将永远处于 pending 状态，不会 reject。
 
-### 5.3 主题脚本的生命周期
+> **但对于 theme.js 而言，服务端已做兜底处理**（见下一节），返回的是 HTTP 200 + 空内容，不会触发 onerror，因此 Promise 能正常 resolve。
+
+### 5.3 服务端资源兜底机制
+
+在 `/appearance/*` 路由的处理函数中，SiYuan 对 `theme.js` 做了特殊的兜底处理：
+
+**服务端处理逻辑**（[kernel/server/serve.go](kernel/server/serve.go#L451-L463)）：
+
+```go
+siyuan.GET("/appearance/*filepath", func(c *gin.Context) {
+    filePath := filepath.Join(appearancePath, strings.TrimPrefix(c.Request.URL.Path, "/appearance/"))
+    // 路径安全校验（防止目录穿越）
+    if !gulu.File.IsSubPath(appearancePath, filePath) {
+        c.Status(http.StatusUnauthorized)
+        return
+    }
+
+    if strings.HasSuffix(c.Request.URL.Path, "/theme.js") {
+        if !gulu.File.IsExist(filePath) {
+            // 主题 js 不存在时生成空内容返回
+            c.Data(200, "application/x-javascript", nil)
+            return
+        }
+    }
+    // ... 多语言兜底（略）
+    c.File(filePath)
+})
+```
+
+**兜底行为**：
+
+| 资源类型 | 文件存在 | 文件不存在 |
+|----------|----------|------------|
+| `theme.js` | 返回文件内容（HTTP 200） | 返回空内容（HTTP 200, `Content-Type: application/x-javascript`, body = nil） |
+| `theme.css` | 返回文件内容（HTTP 200） | HTTP 404（由 gin 的 `c.File()` 处理） |
+| `icon.js` | 返回文件内容（HTTP 200） | HTTP 404 |
+| 多语言 JSON | 返回文件内容（HTTP 200） | 返回 `en_US.json`（部分缺失时用英文补齐） |
+| 其他资源 | 返回文件内容（HTTP 200） | HTTP 404 |
+
+**对前端加载的影响**：
+
+- `theme.js` 缺失时返回 HTTP 200 + 空脚本，浏览器视为加载成功，`<script>` 的 `onload` 事件正常触发
+- `addScript()` 的 Promise 能够正常 `resolve(true)`，**不会悬挂**
+- 空脚本执行无副作用，`window.destroyTheme` 不会被定义，切换主题时走「刷新页面」分支
+
+### 5.4 主题脚本的生命周期
 
 ```
 主题加载时              主题切换时              页面卸载时
@@ -315,7 +360,7 @@ export const addScript = (path: string, id: string) => {
 
 主题脚本通过定义 `window.destroyTheme()` 函数提供清理能力。如果主题脚本未定义此函数，切换主题时将**刷新整个页面**以确保完全清理。
 
-### 5.4 destroyTheme 约定
+### 5.5 destroyTheme 约定
 
 [app/src/types/index.d.ts - destroyTheme()](app/src/types/index.d.ts#L310)
 
@@ -408,16 +453,16 @@ fetchPost("/api/system/setAppearanceMode", {...}, async response => {
 | 层面 | 机制 | 目的 |
 |------|------|------|
 | 决策层 | `themeJS` 标志 | 判断切换时是否需要特殊处理（销毁/刷新） |
-| 执行层 | `addScript()` 直接加载 | 不管标志如何，都尝试加载，失败静默 |
+| 执行层 | `addScript()` 直接加载 | 不管标志如何，都尝试加载；服务端兜底为空脚本 |
 
 **设计意图**：
 - `themeJS` 是**静态检测结果**，用于快速决策
-- 直接加载是**实际执行**，由浏览器处理 404 等异常
+- 直接加载是**实际执行**，由服务端兜底返回空脚本（非 404）
 - 两者可能不一致（如文件被手动删除），但不影响功能
 
 **潜在不一致场景**：
-1. 用户手动删除了主题的 `theme.js` 文件 → `themeJS` 仍为 true，但实际加载失败
-2. 用户手动添加了 `theme.js` → `themeJS` 仍为 false，但实际会加载
+1. 用户手动删除了主题的 `theme.js` 文件 → `themeJS` 仍为 true，但服务端返回空脚本（HTTP 200），前端加载成功但脚本无内容
+2. 用户手动添加了 `theme.js` → `themeJS` 仍为 false，但实际会加载执行
 3. 热更新只刷新 CSS 不更新 `themeJS` 状态
 
 ---
@@ -522,7 +567,8 @@ SiYuan 对异常资源采用**分级处理**策略，不同层级的异常有不
 | 配置错误 | 日志记录 + 默认值 | 仅该配置项 | conf.json 解析失败、字段缺失 |
 | 主题/图标解析失败 | 静默跳过 | 仅该主题/图标 | theme.json 损坏、目录结构异常 |
 | 资源加载失败（CSS） | 浏览器静默降级 | 样式缺失 | 主题 CSS 文件丢失、网络错误 |
-| 资源加载失败（JS） | Promise 永不 resolve | 脚本失效 | theme.js 不存在、语法错误 |
+| 资源加载失败（theme.js） | 服务端返回空脚本（HTTP 200） | 脚本功能缺失但不阻塞 | theme.js 不存在 |
+| 资源加载失败（其他 JS） | Promise 永不 resolve | 对应功能失效 | icon.js 404、网络异常 |
 | 脚本运行时错误 | try-catch 包裹 | 仅脚本功能 | destroyTheme 抛异常 |
 | 文件监听失败 | 日志警告 + 功能降级 | 热刷新失效 | watcher 初始化失败、权限不足 |
 
@@ -559,12 +605,21 @@ if nil != parseErr || nil == themeConf {
 - 已有的其他样式仍正常工作
 - 默认主题 CSS 作为兜底保障
 
-#### JS 加载失败
-- `addScript()` 没有 `onerror` 处理，加载失败时 Promise 永远 pending
-- `addScriptSync()` 同步加载时如果失败，`xhrObj.responseText` 为空，会执行空脚本
-- 主题脚本缺失时，`themeJS` 可能仍为 true（配置未更新），导致切换时误判
+#### theme.js 缺失（服务端兜底）
+- 服务端检测到 `theme.js` 文件不存在时，返回 HTTP 200 + 空内容（`Content-Type: application/x-javascript`，body = nil）
+- 浏览器视为加载成功，`onload` 正常触发
+- `addScript()` 的 Promise 正常 `resolve(true)`，**不会悬挂**
+- 空脚本无副作用，`window.destroyTheme` 不被定义
+- 主题切换时，因 `themeJS=true` 进入清理分支，检测到 `window.destroyTheme` 不存在后刷新页面
 
-**潜在风险**：`addScript` 的 Promise 永不 resolve 可能导致依赖它的后续逻辑卡住。目前 `loadAssets()` 中对 `addScript(themeScriptAddress)` 的返回值没有 await，所以不阻塞后续流程。
+#### 其他 JS 资源加载失败（icon.js、第三方脚本等）
+- `addScript()` 没有 `onerror` 处理，加载失败（如 404、网络错误）时 Promise **永远 pending**
+- `addScriptSync()` 同步加载时如果失败，`xhrObj.responseText` 为空，会执行空脚本
+- 主题脚本缺失时，`themeJS` 可能仍为 true（配置未更新），但因服务端兜底不会导致 Promise 悬挂
+
+**潜在风险**：`addScript` 的 Promise 永不 resolve 可能导致依赖它的后续逻辑卡住。目前：
+- `loadAssets()` 中对 `addScript(themeScriptAddress)` 的返回值没有 await，不阻塞后续流程
+- `icon.js` 缺失时，`addScript(iconThirdURL)` 被 await，**存在悬挂风险**（icon.js 无服务端兜底）
 
 ### 9.5 配置文件损坏的恢复
 
@@ -601,15 +656,17 @@ if err = themesWatcher.Add(themesDir); err != nil {
 **优点**：
 1. 分级容错，从致命错误到静默降级层次清晰
 2. 核心功能（内置主题）始终可用，第三方资源的异常不影响基础使用
-3. 文件锁保证配置写入的原子性，避免文件损坏
-4. 默认值补全机制确保配置完整性
+3. **服务端对 theme.js 做了兜底**：缺失时返回 HTTP 200 + 空脚本，避免前端 Promise 悬挂和 404 错误
+4. 多语言缺失时用英文配置补齐，保证界面可用
+5. 文件锁保证配置写入的原子性，避免文件损坏
+6. 默认值补全机制确保配置完整性
 
 **不足**：
-1. `addScript` 缺少错误处理，Promise 可能悬挂
+1. `addScript` 缺少 `onerror` 处理，icon.js 等非 theme.js 资源加载失败时 Promise 可能悬挂
 2. 主题解析失败无用户提示，排错困难
-3. `themeJS` 状态与实际文件可能不一致，无同步校验
+3. `themeJS` 状态与实际文件可能不一致，无同步校验（虽然服务端兜底避免了加载失败，但切换时仍可能误判需刷新）
 4. 配置文件损坏后自动重置为默认值，用户可能不知原因
-5. 部分资源（如图标 SVG）加载失败无监控
+5. 部分资源（如图标 SVG、theme.css）加载失败无监控和兜底
 
 ---
 
@@ -665,13 +722,14 @@ if err = themesWatcher.Add(themesDir); err != nil {
 
 ### 12.2 addScript 悬挂 Promise
 - `addScript()` 没有 `onerror` 处理
-- 脚本加载失败时 Promise 永不 resolve/reject
-- 虽然当前调用方不 await，但未来可能引入隐患
+- **theme.js 受服务端兜底保护**：缺失时返回 HTTP 200 + 空内容，不会触发 Promise 悬挂
+- **icon.js 等其他脚本无兜底**：加载失败（404/网络错误）时 Promise 永不 resolve/reject
+- `loadAssets()` 中 `icon.js` 的加载被 await，存在实际悬挂风险
 
 ### 12.3 themeJS 状态不一致
 - 配置中的 `themeJS` 与实际文件可能不同步
-- 手动增删 theme.js 文件后状态不准确
-- 切换时可能误判需要刷新或漏掉清理
+- 手动删除 theme.js 后：服务端返回空脚本，前端 Promise 正常 resolve，但 `themeJS=true` 导致切换时走清理分支，最终因无 `destroyTheme` 而刷新页面
+- 手动添加 theme.js 后：`themeJS=false` 导致切换时不做清理，但脚本实际被加载，可能产生残留
 
 ### 12.4 并发配置写入
 - 单进程内有 `m.Lock()` 保护
@@ -708,8 +766,9 @@ if err = themesWatcher.Add(themesDir); err != nil {
 - [ ] 删除当前使用的主题后是否正确回退
 - [ ] 损坏的 theme.json 是否被优雅跳过
 - [ ] conf.json 损坏时是否恢复默认值
-- [ ] 主题 JS 404 时是否不阻塞页面
-- [ ] addScript 加载失败是否有可见异常
+- [ ] 主题 JS 缺失时服务端是否返回空脚本（HTTP 200）
+- [ ] icon.js 缺失时 Promise 是否悬挂
+- [ ] addScript onerror 缺失时非 theme.js 资源 404 是否有影响
 - [ ] 文件监听失效时热刷新是否优雅降级
 - [ ] 无网络时代码高亮主题是否降级可用
 
@@ -779,7 +838,7 @@ BroadcastByType("main", "setAppearance", ...)
               ├── 系统主题同步检查（modeOS）
               ├── 默认主题 CSS 切换（先加载后移除，避免白屏）
               ├── 自定义主题 CSS 切换（非内置主题时叠加）
-              ├── 主题 JS 加载（addScript 直接加载，不检查 themeJS）
+              ├── 主题 JS 加载（addScript 直接加载；服务端兜底为空脚本）
               ├── 图标集加载（默认图标 + 第三方图标双层）
               ├── 代码高亮主题切换（setCodeTheme + 白名单回退）
               └── 移动端状态栏颜色更新
