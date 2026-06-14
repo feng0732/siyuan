@@ -1,467 +1,612 @@
-# SiYuan 闪卡制作与复习计划代码核对分析
+# SiYuan 闪卡制卡代码核对分析：返回值、事务与一致性
 
-## 一、同步状态检测的触发顺序问题修正
+## 一、核心结论速览
 
-### 1.1 两种同步检测函数的本质区别
+| 失败场景 | 块属性缓存 | 块属性磁盘 | 卡包内存 | 卡包磁盘 | 一致性 |
+|----------|-----------|-----------|----------|----------|--------|
+| **S1: deck.Save() 失败** | ✅ 已更新 | ✅ 已写入 | ✅ 已修改 | ❌ 未写入 | **磁盘级不一致** ⚠️ |
+| **S2: 后续操作失败 → rollback** | ✅ 已更新 | ❌ 被丢弃 | ✅ 已修改 | ✅ 已写入 | **三重不一致** 🚨 |
+| **S3: tx.commit() 失败** | ✅ 已更新 | ⚠️ 部分/未写入 | ✅ 已修改 | ✅ 已写入 | **部分不一致** ⚠️ |
+| **S0: 全部成功** | ✅ 已更新 | ✅ 已写入 | ✅ 已修改 | ✅ 已写入 | ✅ 一致 |
 
-SiYuan 闪卡系统中存在**两种不同的同步状态检测策略**，分别用于不同的操作类型，这是之前分析中被混淆的关键点。
+> **关键发现**：`doAddFlashcards` 在 `deck.Save()` 失败时**不返回错误**（仅记录日志），事务继续执行并 commit，导致块属性磁盘已写入但卡包磁盘未写入的**磁盘级不一致**。
 
-| 函数 | 行为 | 适用操作 | 代码位置 |
-|------|------|----------|----------|
-| `waitForSyncingStorages()` | **循环等待**同步完成，每秒轮询 | 复习类操作（读+写） | [repository.go#L1210-L1213](file:///d:/fz/0601/solo-dogfeeding/code/294-siyuan/kernel/model/repository.go#L1210-L1213) |
-| `isSyncingStorages()` | **立即检查**并返回 bool，不等待 | 制卡/删卡类操作（事务写） | [repository.go#L1216-L1217](file:///d:/fz/0601/solo-dogfeeding/code/294-siyuan/kernel/model/repository.go#L1216-L1217) |
+---
 
-同步状态变量定义：
+## 二、制卡代码执行时序详解
+
+### 2.1 `doAddFlashcards` 完整执行路径
+
+代码位置：[flashcard.go#L857-L949](file:///d:/fz/0601/solo-dogfeeding/code/294-siyuan/kernel/model/flashcard.go#L857-L949)
+
+```
+doAddFlashcards 执行时序：
+┌─ ① deckLock.Lock()  ────────────────────────────── 获取全局互斥锁
+├─ ② isSyncingStorages()  ───────────────────────── 同步中直接返回错误
+│     └─ 返回 &TxErr{code: TxErrCodeDataIsSyncing}
+├─ ③ 查找/创建卡包  ────────────────────────────────
+│     ├─ Decks[deckID] 存在 → 直接使用
+│     └─ 不存在 → createDeck0() → 内部 deck.Save()
+├─ ④ 遍历 blockIDs，逐个设置块属性  ────────────────
+│     ├─ loadTree(rootID)  → 加载文档树到内存
+│     ├─ node.SetIALAttr("custom-riff-decks", val)  → 修改节点属性
+│     ├─ tx.writeTree(tree)  → 标记为待写入（仍在内存 tx.trees）
+│     ├─ cache.PutBlockIAL(blockID, ...)  →  ⚠️ 立即更新内存缓存
+│     └─ pushBlockAttrs(oldAttrs, node)  →  ⚠️ 推送属性变更（搜索索引等）
+├─ ⑤ 遍历 blockIDs，逐个 AddCard  ────────────────
+│     ├─ 去重检查：deck.GetCardsByBlockID(blockID)
+│     └─ deck.AddCard(ast.NewNodeID(), blockID)  → 仅内存修改
+├─ ⑥ deck.Save()  ─────────────────────────────── 写入 .deck 文件
+│     └─ ❌ 失败：logging.LogErrorf(...) → return （返回 nil，不报错！）
+└─ ⑦ return nil  ──────────────────────────────── 正常返回
+```
+
+### 2.2 关键代码：返回值分析
+
+**`deck.Save()` 失败时的处理** [flashcard.go#L944-L947](file:///d:/fz/0601/solo-dogfeeding/code/294-siyuan/kernel/model/flashcard.go#L944-L947)：
 ```go
-var syncingStorages = atomic.Bool{}  // L1208
-var syncingFiles = sync.Map{}        // L1207
-var isBootSyncing = atomic.Bool{}    // 启动同步标记
-
-func waitForSyncingStorages() {
-    for isSyncingStorages() {
-        time.Sleep(time.Second)  // 每秒轮询
-    }
-}
-
-func isSyncingStorages() bool {
-    return syncingStorages.Load() || isBootSyncing.Load()
+if err := deck.Save(); err != nil {
+    logging.LogErrorf("save deck [%s] failed: %s", deckID, err)
+    return   // 返回 nil，不返回 TxErr
 }
 ```
 
-### 1.2 触发顺序的实际分布
-
-**复习类操作 - 使用 `waitForSyncingStorages()`（阻塞等待）**：
-
-| 操作 | 调用位置 | 设计意图 |
-|------|----------|----------|
-| `GetFlashcardsByBlockIDs` | [flashcard.go#L46](file:///d:/fz/0601/solo-dogfeeding/code/294-siyuan/kernel/model/flashcard.go#L46) | 确保读到最新数据 |
-| `SetFlashcardsDueTime` | [flashcard.go#L87](file:///d:/fz/0601/solo-dogfeeding/code/294-siyuan/kernel/model/flashcard.go#L87) | 批量设置到期时间 |
-| `ReviewFlashcard` | [flashcard.go#L471](file:///d:/fz/0601/solo-dogfeeding/code/294-siyuan/kernel/model/flashcard.go#L471) | 评分持久化 |
-| `SkipReviewFlashcard` | [flashcard.go#L515](file:///d:/fz/0601/solo-dogfeeding/code/294-siyuan/kernel/model/flashcard.go#L515) | 跳过标记 |
-| `GetNotebookDueFlashcards` | [flashcard.go#L560](file:///d:/fz/0601/solo-dogfeeding/code/294-siyuan/kernel/model/flashcard.go#L560) | 笔记本级获取 |
-| `GetTreeDueFlashcards` | [flashcard.go#L612](file:///d:/fz/0601/solo-dogfeeding/code/294-siyuan/kernel/model/flashcard.go#L612) | 文档级获取 |
-| `GetDueFlashcards` | [flashcard.go#L692](file:///d:/fz/0601/solo-dogfeeding/code/294-siyuan/kernel/model/flashcard.go#L692) | 全局/卡包级获取 |
-
-**制卡/删卡类操作 - 使用 `isSyncingStorages()`（立即失败）**：
-
-| 操作 | 调用位置 | 设计意图 |
-|------|----------|----------|
-| `doAddFlashcards` | [flashcard.go#L861](file:///d:/fz/0601/solo-dogfeeding/code/294-siyuan/kernel/model/flashcard.go#L861) | 同步中直接返回 `TxErrCodeDataIsSyncing` |
-| `doRemoveFlashcards` | [flashcard.go#L751](file:///d:/fz/0601/solo-dogfeeding/code/294-siyuan/kernel/model/flashcard.go#L751) | 同上 |
-
-### 1.3 触发顺序问题分析
-
-#### ⚠️ 问题 1：同步检测时机在 deckLock 之后
-
-**`doAddFlashcards` 执行顺序** [L857-L864](file:///d:/fz/0601/solo-dogfeeding/code/294-siyuan/kernel/model/flashcard.go#L857-L864)：
+**函数签名**：
 ```go
-func (tx *Transaction) doAddFlashcards(operation *Operation) (ret *TxErr) {
-    deckLock.Lock()           // ① 先获取全局互斥锁
-    defer deckLock.Unlock()
+func (tx *Transaction) doAddFlashcards(operation *Operation) (ret *TxErr)
+```
 
-    if isSyncingStorages() {  // ② 后检查同步状态
-        ret = &TxErr{code: TxErrCodeDataIsSyncing}
+**推论**：`deck.Save()` 失败时，`ret` 保持 nil，函数正常返回。
+
+### 2.3 事务层的处理逻辑
+
+代码位置：[transaction.go#L183-L341](file:///d:/fz/0601/solo-dogfeeding/code/294-siyuan/kernel/model/transaction.go#L183-L341)
+
+```go
+for _, op := range tx.DoOperations {
+    switch op.Action {
+    case "addFlashcards":
+        ret = tx.doAddFlashcards(op)  // 返回 nil
+    // ... 其他操作
+    }
+
+    if nil != ret {  // ret 为 nil，不触发 rollback
+        tx.rollback()
         return
     }
-    // ... 后续操作
+}
+// 循环全部通过后
+if cr := tx.commit(); nil != cr {  // 执行 commit
+    ...
 }
 ```
 
-**风险**：
-- 同步中，所有调用 `doAddFlashcards` 的协程都会先阻塞在 `deckLock.Lock()` 上
-- 锁持有期间发现同步中 → 立即释放锁 → 返回错误
-- 但此时**事务已经开始**（`tx.begin()` 在事务进入时调用），返回错误会触发 `tx.rollback()`
-
-#### ⚠️ 问题 2：复习操作等待可能导致长时阻塞
-
-**`ReviewFlashcard` 执行顺序** [L467-L472](file:///d:/fz/0601/solo-dogfeeding/code/294-siyuan/kernel/model/flashcard.go#L467-L472)：
-```go
-func ReviewFlashcard(...) (err error) {
-    deckLock.Lock()             // ① 先获取锁
-    defer deckLock.Unlock()
-
-    waitForSyncingStorages()    // ② 后循环等待（可能等待几秒~几分钟）
-    // ... 同步完成后才继续
-}
-```
-
-**风险**：
-- `deckLock` 被一个复习操作持有并等待同步时，**所有其他闪卡操作都会被阻塞**
-- 同步时间较长时，用户可能感受到明显卡顿
-- 但这是设计使然，目的是确保评分不会写入正在被同步覆盖的文件
+**结论**：`deck.Save()` 失败 → 返回 nil → 不触发 rollback → 继续 commit → **块属性写入磁盘，但卡包未写入**。
 
 ---
 
-## 二、半成品缓存风险澄清
+## 三、三种失败场景的详细分析
 
-### 2.1 `cache.PutBlockIAL` 的调用时序
+### 3.1 场景 S1：卡包保存失败（deck.Save error）
 
-**`doAddFlashcards` 中块属性写入时序** [L911-L926](file:///d:/fz/0601/solo-dogfeeding/code/294-siyuan/kernel/model/flashcard.go#L911-L926)：
+**触发条件**：磁盘满、权限不足、文件锁定、I/O 错误等导致 `deck.Save()` 返回 error。
 
-```
-① oldAttrs := parse.IAL2Map(node.KramdownIAL)
-   ↓ 保存原始属性（用于 pushBlockAttrs）
+**执行轨迹**：
+1. ✅ `cache.PutBlockIAL()` → 缓存更新
+2. ✅ `pushBlockAttrs()` → 搜索索引推送
+3. ✅ `deck.AddCard()` → 卡包内存修改
+4. ❌ `deck.Save()` → 卡包磁盘写入失败
+5. ✅ `doAddFlashcards` 返回 nil → 不触发 rollback
+6. ✅ `tx.commit()` → 块属性写入磁盘
 
-② node.SetIALAttr(NodeAttrRiffDecks, val)
-   ↓ 修改内存中的节点属性（仅在 tx.trees 中）
+**最终状态**：
 
-③ tx.writeTree(tree)
-   ↓ 将修改后的 tree 标记为待写入（仍在内存）
+| 数据层 | 状态 | 说明 |
+|--------|------|------|
+| 块属性缓存 | ✅ 已更新 | cache.PutBlockIAL 先于 deck.Save 执行 |
+| 块属性磁盘 | ✅ 已写入 | commit 在 deck.Save 之后执行，且不受 Save 失败影响 |
+| 卡包内存 | ✅ 已修改 | AddCard 已执行 |
+| 卡包磁盘 | ❌ 未写入 | Save 失败 |
+| 搜索索引 | ✅ 已推送 | pushBlockAttrs 先执行 |
 
-④ cache.PutBlockIAL(blockID, parse.IAL2Map(node.KramdownIAL))
-   ↓ ⚠️ 立即更新内存缓存！
+**后果**：
+- 块在编辑器中显示闪卡标记
+- 块的 `custom-riff-decks` 属性在磁盘上存在
+- 但复习时找不到该卡片
+- 重启后依然不一致（磁盘级）
+- 只能通过"先移除再重新制卡"手动修复
 
-⑤ pushBlockAttrs(oldAttrs, node)
-   ↓ 推入属性同步队列（用于搜索索引等）
-```
-
-**关键点**：步骤④的 `cache.PutBlockIAL()` 在**事务 commit 之前**就更新了内存缓存。
-
-### 2.2 `cache.PutBlockIAL` 实现
-
-[cache/ial.go#L60-L63](file:///d:/fz/0601/solo-dogfeeding/code/294-siyuan/kernel/cache/ial.go#L60-L63)：
-```go
-func PutBlockIAL(id string, ial map[string]string) {
-    blockIALCache.Set(id, ial, 128)  // 写入 ristretto 缓存
-}
-```
-
-### 2.3 半成品缓存的实际风险矩阵
-
-| 场景 | 触发条件 | 缓存状态 | 磁盘状态 | 一致性 | 自愈方式 |
-|------|----------|----------|----------|--------|----------|
-| **C1: 事务正常 commit** | 流程完整执行 | ✅ 已更新 | ✅ 已写入 | 一致 | - |
-| **C2: isSyncingStorages() 检测失败** | 同步中，L861 返回错误 | ❌ 未更新 | ❌ 未写入 | 一致 | - |
-| **C3: 制卡中途某块 loadTree 失败** | 多块制卡时某块损坏，L901 `nil == tree`，`continue` | ❌ 该块未更新 | ❌ 该块未写入 | 部分块跳过，但一致 | 该块未制卡，下次可重试 |
-| **C4: deck.Save() 失败** | L944 磁盘写入错误（权限/空间） | ✅ 缓存已更新 | ❌ 卡包未写入 | **不一致** | 块显示制卡标记，但复习找不到卡片 |
-| **C5: 事务后续 op 失败触发 rollback** | 同一事务中后续操作失败，调用 `tx.rollback()` | ✅ 缓存已更新 | ❌ 文档树未写入 | **严重不一致** | 块属性缓存有标记，但磁盘文档无属性，卡包可能已写入 |
-| **C6: 进程崩溃在 commit 之前** | L924 之后、`tx.commit()` 之前崩溃 | ✅ 缓存已更新（重启后丢失） | ❌ 均未写入 | 重启后一致 | 缓存是内存的，进程重启自动恢复 |
-
-### 2.4 风险发生 vs 不发生的明确结论
-
-#### ✅ 不会发生的风险
-
-| ID | 之前假设 | 实际不会发生的原因 |
-|----|----------|-------------------|
-| ❌ R1_old | "块属性写入成功但卡包 Save 失败导致双向不一致" | 块属性**没有**在 L924 写入磁盘，只是更新了缓存。磁盘上块属性和卡包都未写入。不一致只存在于缓存层。 |
-| ❌ R4_old | "同步中断导致缓存不一致且无法自愈" | 缓存是内存态，重启自动清零。运行期间的不一致仅影响显示，下次读取块时会从磁盘重新加载。 |
-| ❌ "cache.PutBlockIAL 后崩溃导致数据丢失" | 缓存是内存的，崩溃即失。真正的数据一致性取决于磁盘写入，而非缓存。 |
-
-#### ⚠️ 确实可能发生的风险
-
-| ID | 风险 | 触发路径 | 实际影响 |
-|----|------|----------|----------|
-| **C4** | 缓存显示有标记，但卡包磁盘写入失败 | doAddFlashcards L924 更新缓存 → L944 deck.Save() 失败 | 块在编辑器中显示制卡标记（从缓存读），但复习时找不到卡片（从卡包读） |
-| **C5** | 事务 rollback 不回滚缓存 + 不回滚卡包 | 同一事务中 addFlashcards 成功 → 后续 op 失败 → rollback | ① 缓存有标记 ② 卡包已 Save ③ 但文档树被 rollback 丢弃 → **三重不一致** |
-| **C7** | `pushBlockAttrs` 与磁盘写入不同步 | L925 pushBlockAttrs 在 commit 前就推送属性变更 | 搜索索引可能先于磁盘写入被更新，短时间内搜索结果与磁盘不一致 |
+**发生概率**：低（依赖磁盘异常）
+**严重度**：中
 
 ---
 
-## 三、复习回合缓存配额 vs FSRS 间隔重复到期时间
+### 3.2 场景 S2：后续操作失败 → rollback
 
-这是两个**完全独立、本质不同**的概念，之前的分析没有明确区分。
+**触发条件**：同一事务中，`addFlashcards` 之后的其他操作（如 update/delete/insert 等）执行失败，触发 `tx.rollback()`。
 
-### 3.1 核心区别对照表
+**执行轨迹**：
+1. ✅ `doAddFlashcards` 全部执行成功，返回 nil
+   - 缓存已更新
+   - pushBlockAttrs 已推送
+   - deck.AddCard 已执行
+   - deck.Save 已成功写入磁盘
+2. ❌ 后续 op 执行失败 → `ret != nil`
+3. ❌ `tx.rollback()` 被调用
 
-| 维度 | 复习回合缓存配额 | FSRS 间隔重复到期时间 |
-|------|----------------|----------------------|
-| **本质** | 内存计数器，控制单回合卡片吞吐量 | 基于算法的绝对时间点，决定卡片何时进入复习队列 |
-| **存储位置** | `reviewCardCache`（全局 Map，内存） | `fsrs.Card.Due`（持久化到 .deck 文件） |
-| **生命周期** | 回合开始（reviewedCardIDs 为空）时清零；全部复习完成或关闭窗口时清零 | 卡片生命周期内持续存在，每次复习后更新 |
-| **计算依据** | 统计 `reviewCardCache` 中 New 状态和非 New 状态的卡片数量 | FSRS 算法：根据 Stability、Difficulty、Rating、RequestRetention 计算 |
-| **影响范围** | 仅影响当前批次返回多少张卡片 | 影响卡片是否出现在 `deck.Dues()` 结果中 |
-| **用户可见性** | 间接可见（进度条 "已复习/上限"） | 可见（"5 分钟后"、"3 天后" 等提示） |
-| **持久化** | 否，重启即失 | 是，写入 `{deckID}.deck` JSON 文件 |
-| **跨回合延续** | 否，每个回合独立统计 | 是，到期时间是绝对的，与何时打开复习无关 |
-
-### 3.2 FSRS 到期时间计算原理
-
-**调用链**：
-```
-deck.Review(cardID, rating)
-  ↓ riff 库内部
-  fsrs.Repeat(card, now)
-    ↓
-  for rating in [Again, Hard, Good, Easy]:
-    计算 SchedulingCards[rating].card.Due
-    ↓
-  card.Due = SchedulingCards[actualRating].card.Due
-```
-
-**FSRS 核心公式**（`go-fsrs/v3` 内部实现）：
-```
-间隔计算:
-  interval = stability / difficulty * f(rating)
-  due = now + interval
-
-稳定性更新 (Stability):
-  S' = S * e^(w * (R_target - R)) * decay_factor
-
-难度更新 (Difficulty):
-  D' = D + w * (rating_mean - 3) * decay_factor
-```
-
-到期时间是**绝对时间点**，一旦计算并持久化，不受后续复习行为影响。
-
-### 3.3 回合缓存配额统计原理
-
-**`getDeckDueCards` 配额统计** [L1126-L1134](file:///d:/fz/0601/solo-dogfeeding/code/294-siyuan/kernel/model/flashcard.go#L1126-L1134)：
+**rollback 的实际行为** [transaction.go#L1897-L1902](file:///d:/fz/0601/solo-dogfeeding/code/294-siyuan/kernel/model/transaction.go#L1897-L1902)：
 ```go
-newCount := 0
-reviewCount := 0
-for _, reviewedCard := range reviewCardCache {
-    if riff.New == reviewedCard.GetState() {
-        newCount++       // 缓存中状态为 New 的卡 → 计入新卡配额
-    } else {
-        reviewCount++    // 缓存中状态非 New 的卡 → 计入复习卡配额
+func (tx *Transaction) rollback() {
+    tx.trees, tx.nodes = nil, nil   // 仅丢弃文档树变更
+    tx.state.Store(3)
+    tx.m.Unlock()
+    return
+}
+```
+
+**rollback 不回滚的内容**：
+- ❌ 不回滚 `cache.PutBlockIAL()`（缓存已更新）
+- ❌ 不回滚 `pushBlockAttrs()`（搜索索引已推送）
+- ❌ 不回滚 `deck.AddCard()` + `deck.Save()`（卡包已落盘）
+
+**最终状态**：
+
+| 数据层 | 状态 | 说明 |
+|--------|------|------|
+| 块属性缓存 | ✅ 已更新 | rollback 不清理缓存 |
+| 块属性磁盘 | ❌ 未写入 | tx.trees 被丢弃，未 commit |
+| 卡包内存 | ✅ 已修改 | rollback 不影响卡包 |
+| 卡包磁盘 | ✅ 已写入 | deck.Save 在 rollback 之前已成功 |
+| 搜索索引 | ✅ 已推送 | rollback 不撤回推送 |
+
+**后果**：
+- 三重不一致：缓存 ✅ / 块磁盘 ❌ / 卡包磁盘 ✅
+- 编辑器中可能显示闪卡标记（从缓存读），但刷新页面后消失（从磁盘重新加载）
+- 卡包中有卡片，但块没有属性，无法通过块 UI 管理
+- 复习时卡片会出现，但点击"定位"可能找不到对应块
+
+**发生概率**：极低（需要 addFlashcards + 后续操作失败同时发生）
+**严重度**：高
+
+---
+
+### 3.3 场景 S3：tx.commit() 失败
+
+**触发条件**：`tx.commit()` 中 `writeTreeUpsertQueue()` 失败（如磁盘满、文件损坏）。
+
+**执行轨迹**：
+1. ✅ `doAddFlashcards` 全部成功
+2. ✅ 其他 op 全部成功
+3. ❌ `tx.commit()` 执行到某 tree 的 `writeTreeUpsertQueue()` 失败
+4. ❌ commit 提前返回 error
+
+**commit 的行为** [transaction.go#L1865-L1894](file:///d:/fz/0601/solo-dogfeeding/code/294-siyuan/kernel/model/transaction.go#L1865-L1894)：
+```go
+func (tx *Transaction) commit() (err error) {
+    for _, tree := range tx.trees {
+        if err = writeTreeUpsertQueue(tree); err != nil {
+            return   // 中途失败，直接返回
+        }
+        // ... 其他处理
     }
+    // ...
 }
 ```
 
-**⚠️ 关键观察**：
-- 统计的是**缓存中卡片的当前状态**，而非卡片的原始状态
-- 新卡复习后状态从 New → Learning，因此下次配额统计时 `newCount` 可能减少
-- 这意味着配额统计是**动态的**，不是简单的"已复习 N 张"
+**最终状态**：
 
-### 3.4 两者的协作关系
+| 数据层 | 状态 | 说明 |
+|--------|------|------|
+| 块属性缓存 | ✅ 已更新 | commit 前已更新 |
+| 块属性磁盘 | ⚠️ 部分写入 | 失败点之前的 tree 已写入，之后的未写入 |
+| 卡包内存 | ✅ 已修改 | commit 前已修改 |
+| 卡包磁盘 | ✅ 已写入 | deck.Save 在 commit 之前 |
+| 搜索索引 | ✅ 已推送 | pushBlockAttrs 先执行 |
 
-```
-┌─────────────────────────────────────────────────────────┐
-│                    获取到期卡片流程                        │
-├─────────────────────────────────────────────────────────┤
-│  ① deck.Dues()                                           │
-│     ↓ FSRS 层                                            │
-│     筛选 due ≤ now 的所有卡片 → dues 列表                 │
-│                                                          │
-│  ② 遍历 dues，配额过滤                                    │
-│     ↓ 回合层                                             │
-│     newCount = reviewCardCache 中 New 状态卡数             │
-│     reviewCount = reviewCardCache 中非 New 状态卡数        │
-│     newCount ≥ NewCardLimit → 跳过后续 New 卡             │
-│     reviewCount ≥ ReviewCardLimit → 跳过后续复习卡         │
-│                                                          │
-│  ③ 返回最终卡片列表 → 前端                                │
-└─────────────────────────────────────────────────────────┘
-```
+**后果**：
+- 部分块的属性已写入，部分未写入
+- 卡包中所有卡片都已写入
+- 部分双向关联断裂
 
-**影响示例**：
-- 配额 = 20 新卡/天，FSRS 有 50 张新卡 due
-- 回合 A 开始：`newCount = 0` → 返回 20 张
-- 用户复习 15 张后关闭窗口 → `reviewCardCache` 被丢弃
-- 回合 B 重新打开：`newCount = 0` → **再返回 20 张**（不是 5 张）
-- 结论：配额是**每回合**的，不是**每天**的
+**发生概率**：极低
+**严重度**：中
+
+---
+
+### 3.4 场景 S0：全部成功（对照）
+
+**执行轨迹**：
+1. ✅ `cache.PutBlockIAL()` → 缓存更新
+2. ✅ `pushBlockAttrs()` → 搜索索引推送
+3. ✅ `deck.AddCard()` → 卡包内存修改
+4. ✅ `deck.Save()` → 卡包磁盘写入
+5. ✅ `doAddFlashcards` 返回 nil
+6. ✅ 其他 op 全部成功
+7. ✅ `tx.commit()` → 块属性磁盘写入
+
+**最终状态**：
+
+| 数据层 | 状态 |
+|--------|------|
+| 块属性缓存 | ✅ 一致 |
+| 块属性磁盘 | ✅ 一致 |
+| 卡包内存 | ✅ 一致 |
+| 卡包磁盘 | ✅ 一致 |
 
 ---
 
 ## 四、一致性风险的明确判定
 
-### 4.1 制卡操作的执行步骤与风险点
+### 4.1 会发生的一致性风险
 
-**`doAddFlashcards` 完整时序及失败后果**：
+| ID | 风险场景 | 对应场景 | 发生可能性 | 严重度 | 触发条件 |
+|----|----------|----------|-----------|--------|----------|
+| **R1** | 块属性磁盘已写入，但卡包磁盘未写入 | S1 | ✅ 确认存在 | 中 | `deck.Save()` 失败 |
+| **R2** | 事务 rollback 三重不一致 | S2 | ✅ 确认存在 | 高 | addFlashcards 成功 + 后续 op 失败 |
+| **R3** | commit 部分失败导致部分不一致 | S3 | ✅ 确认存在 | 中 | commit 中途磁盘错误 |
+| **R4** | pushBlockAttrs 与磁盘写入时序差 | 所有场景 | ✅ 确认存在 | 低 | commit 前推送属性，搜索索引短暂超前 |
+| **R5** | 已删除块的卡片残留卡包 | 长期运行 | ✅ 确认存在 | 低 | 块删除后未同步清理卡包 |
+| **R6** | 多端同步版本冲突 | 多端使用 | ✅ 确认存在 | 中 | 两端同时修改同一块/卡包 |
 
-| 步骤 | 操作 | 失败点 | 内存缓存状态 | 文档树状态 | 卡包状态 | 一致性判定 |
-|------|------|--------|-------------|-----------|----------|-----------|
-| 1 | `deckLock.Lock()` | 阻塞等待 | - | - | - | - |
-| 2 | `isSyncingStorages()` | 同步中 → 返回错误 | ❌ 未变 | ❌ 未变 | ❌ 未变 | ✅ 一致 |
-| 3 | 查找/创建卡包 | createDeck0 失败 → 后续 deck 为 nil | ❌ 未变 | ❌ 未变 | ❌ 未变 | ✅ 一致 |
-| 4 | 遍历 blockIDs 处理属性 | 某块 loadTree 失败 → `continue` | ✅ 成功块已更新 | ⚠️ 待 commit | ❌ 未变 | 待观察 |
-| 5 | 遍历 blockIDs 添加卡片 | deck 为 nil → return | ✅ 缓存已更新 | ⚠️ 待 commit | ❌ 未变 | ❌ 不一致（C4 变种） |
-| 6 | `deck.Save()` | 磁盘错误 → return | ✅ 缓存已更新 | ⚠️ 待 commit | ❌ 未写入 | ❌ 不一致（C4） |
-| 7 | 函数正常返回 | - | ✅ 缓存已更新 | ⚠️ 待 commit | ✅ 已写入 | ⚠️ 文档树仍待 commit |
-| 8 | 事务后续操作 | 失败 → `tx.rollback()` | ✅ 缓存已更新 | ❌ 被丢弃 | ✅ 已写入 | ❌ 严重不一致（C5） |
-| 9 | `tx.commit()` | - | ✅ 缓存已更新 | ✅ 已写入 | ✅ 已写入 | ✅ 一致 |
+### 4.2 不会发生的一致性风险
 
-### 4.2 明确结论：哪些会发生，哪些不会
+| ID | 常见误解 | 不会发生的原因 |
+|----|----------|----------------|
+| ❌ "块属性缓存未更新但卡包已写入" | - | `cache.PutBlockIAL()`（L924）在 `deck.Save()`（L944）之前调用，时序上不可能 |
+| ❌ "卡包写入失败会触发事务回滚，块属性不会落盘" | - | `deck.Save()` 失败不返回错误，事务不会回滚，块属性依然会 commit |
+| ❌ "rollback 会回滚卡包操作" | - | `rollback()` 仅清空 `tx.trees` 和 `tx.nodes`，不涉及卡包 |
+| ❌ "制卡操作同步中会等待同步完成" | - | 制卡使用 `isSyncingStorages()`（立即失败），不是 `waitForSyncingStorages()`（等待） |
+| ❌ "每日新卡配额按自然日重置" | - | 配额基于 `reviewCardCache`，回合结束/窗口关闭即重置，不是日历天 |
+| ❌ "删卡的 deck.Save 失败会返回错误" | - | `removeFlashcardsByBlockIDs` 返回 void，Save 失败仅记日志 |
 
-#### ✅ 可能发生的一致性问题
+### 4.3 风险发生路径图
 
-| ID | 风险场景 | 发生条件 | 概率 | 影响 |
-|----|----------|----------|------|------|
-| **C4** | 缓存显示制卡标记，但卡包未写入 | `deck.Save()` 磁盘错误（权限、空间满、文件锁冲突） | 低 | 块显示闪卡图标，但复习时不出现 |
-| **C5** | 事务 rollback 三重不一致 | 同一事务包含 addFlashcards 和后续操作，后续操作失败 | 极低 | ① 缓存有标记 ② 卡包有卡片 ③ 文档无属性 |
-| **C7** | 搜索索引与磁盘短暂不一致 | `pushBlockAttrs` 在 commit 前推送 | 中（每次制卡都发生） | 搜索可能短暂命中"已制卡"，但实际文档还未写入磁盘 |
-| **C8** | 块存在性校验滞后 | 块已删除，但卡包中卡片未移除 | 中 | `ExistBlockTrees` 每次调度时过滤，但卡包中残留无效卡片 |
-| **C9** | 多端同步版本冲突 | A 端制卡，B 端同时修改同一块 → 同步覆盖 | 中 | 可能出现块属性丢失或卡包卡片丢失 |
-
-#### ❌ 不会发生的一致性问题
-
-| ID | 之前担心的场景 | 不会发生的原因 |
-|----|--------------|----------------|
-| ❌ "块属性写入磁盘但卡包未写入" | 块属性写入磁盘发生在 `tx.commit()`（步骤 9），晚于 `deck.Save()`（步骤 6）。如果 deck.Save() 失败，事务会返回错误，不会走到 commit。**磁盘上**的块属性和卡包状态始终一致。不一致仅发生在缓存层。 |
-| ❌ "卡包写入但块属性缓存未更新" | `cache.PutBlockIAL()` 在 `deck.Save()` 之前调用（步骤 4 vs 步骤 6），只要执行到步骤 6，缓存必然已更新。 |
-| ❌ "复习评分后卡包未持久化" | `ReviewFlashcard` 中 `deck.Save()` 是同步调用，失败会返回 error 给前端，用户会看到错误提示。 |
-| ❌ "翻页后配额统计错误" | 配额从 `reviewCardCache` 统计，翻页不清空缓存，配额连续累加。只要窗口不关闭，配额不会"重置"。 |
-
-### 4.3 现有防御机制盘点
-
-| 防御机制 | 位置 | 防御目标 | 局限性 |
-|----------|------|----------|--------|
-| `deckLock` 全局互斥 | 所有闪卡操作入口 | 防止卡包并发写入 | 无法防止与事务回滚的时序问题 |
-| `ExistBlockTrees` 校验 | `getDeckDueCards` L1111 | 过滤已删除块的卡片 | 只在调度时过滤，不主动清理卡包 |
-| `GetCardsByBlockID` 去重 | `doAddFlashcards` L935 | 防止同一块重复制卡 | 仅检查卡包内，不检查块属性 |
-| `tx.rollback()` | 事务失败时 | 回滚文档树变更 | **不回滚卡包操作和缓存**（关键缺陷） |
-| `isSyncingStorages()` | 制卡/删卡前 | 同步中拒绝写入 | 阻塞其他等待锁的操作 |
-| `waitForSyncingStorages()` | 复习操作前 | 确保同步完成后再评分 | 可能长时阻塞 |
+```
+                        开始制卡
+                           │
+                           ▼
+                ┌──────────────────────┐
+                │  isSyncingStorages?  │── true ──→ 返回错误（一致）
+                └──────────────────────┘
+                           │ false
+                           ▼
+                ┌──────────────────────┐
+                │  cache.PutBlockIAL   │── ✅ 缓存更新
+                └──────────────────────┘
+                           │
+                           ▼
+                ┌──────────────────────┐
+                │   pushBlockAttrs     │── ✅ 搜索推送
+                └──────────────────────┘
+                           │
+                           ▼
+                ┌──────────────────────┐
+                │   deck.AddCard       │── ✅ 内存修改
+                └──────────────────────┘
+                           │
+                           ▼
+                ┌──────────────────────┐
+                │     deck.Save        │
+                └──────────────────────┘
+                           │
+                ┌──────────┴──────────┐
+                │ 成功                │ 失败
+                ▼                     ▼
+         后续 op 循环          返回 nil（不报错）───→ R1：磁盘级不一致
+                │
+      ┌─────────┴──────────┐
+      │ 全部成功            │ 某个失败
+      ▼                     ▼
+   tx.commit           tx.rollback ─────→ R2：三重不一致
+      │
+      ├─ 成功 → S0：完全一致
+      └─ 失败 → R3：部分不一致
+```
 
 ---
 
-## 五、用户操作反馈的边界场景澄清
+## 五、复习回合缓存配额 vs 间隔重复到期时间
 
-### 5.1 已确认的边界行为
+这是两个**完全独立、本质不同**的概念，必须严格区分。
 
-| 场景 | 实际行为 | 设计预期 |
-|------|----------|----------|
-| 关闭窗口后配额重置 | ✅ 重置。`reviewCardCache` 是内存变量，新窗口打开时 `reviewedCardIDs` 为空 → 清空缓存 → 配额从 0 开始 | 预期内（"每日"是产品描述，技术上是"每回合"） |
-| 全部完成后无法撤销 | ✅ 无法撤销。`ReviewFlashcard` L502-L507：`unreviewedCount == 0` 时清空缓存 | 设计边界 |
-| 跳过操作重启后失效 | ✅ 失效。`SkipReviewFlashcard` 仅写内存 `skipCardCache`，不调用 `deck.Save()` | 设计使然，跳过是临时行为 |
-| 切换筛选器丢失撤销 | ✅ 丢失。切换筛选器调用 `fetchNewRound()`，不带 `reviewedCards` → 后端清空缓存 | 设计边界 |
-| 刷新丢失当前批次 | ✅ 丢失。前端不持久化 `options.cardsData` 和 `index`，刷新后重新拉取 | 预期内 |
+### 5.1 核心区别对照表
 
-### 5.2 进度显示的不一致边界
+| 维度 | 复习回合缓存配额 | FSRS 间隔重复到期时间 |
+|------|----------------|----------------------|
+| **本质** | 内存计数器，控制单回合卡片吞吐量 | 基于算法的绝对时间点，决定卡片何时进入复习队列 |
+| **数据来源** | `reviewCardCache`（全局 Map） | `fsrs.Card.Due` 字段 |
+| **存储位置** | 内存 | 持久化到 `{deckID}.deck` JSON 文件 |
+| **生命周期** | 回合开始（reviewedCardIDs 为空）时清零；全部复习完成或关闭窗口时清零 | 卡片生命周期内持续存在 |
+| **计算依据** | 统计 reviewCardCache 中卡片的初始状态（New / 非 New） | FSRS 算法：Stability、Difficulty、Rating、RequestRetention |
+| **影响范围** | 单次 API 返回多少张卡片 | 是否出现在 deck.Dues() 结果中 |
+| **用户感知** | 间接（进度条 "已复习/上限"） | 直接（"3 天后复习" 提示） |
+| **持久化** | 否，重启即失 | 是，写入磁盘 |
+| **跨回合延续** | 否，每个回合独立统计 | 是，绝对时间，与何时打开无关 |
+| **"每日"含义** | 实为"每回合"，关闭窗口即重置 | 真正的时间间隔，与"日"无关（可以是分钟/小时/天/月） |
 
-**前端进度统计** [genCardCount L30-L52](file:///d:/fz/0601/solo-dogfeeding/code/294-siyuan/app/src/card/openCard.ts#L30-L52)：
-```typescript
-cardsData.cards.forEach((item, index) => {
-    if (index > allIndex) return
-    if (item.state === 0) newIndex++  // 仅统计当前批次
-    else oldIndex++
-})
+### 5.2 FSRS 到期时间计算
+
+**调用链**：
+```
+用户评分
+  ↓
+ReviewFlashcard(deckID, cardID, rating)
+  ↓
+deck.Review(cardID, rating)  [riff 库]
+  ↓
+fsrs.Repeat(card, now)       [go-fsrs 库]
+  ↓
+计算 SchedulingCards → 选择对应 rating 的 Card
+  ↓
+card.Due = 计算出的下次到期时间
+card.Stability / card.Difficulty = 更新后的参数
+  ↓
+deck.Save()  →  持久化到 .deck 文件
 ```
 
-**后端配额统计**：
+**关键代码**：
+- 评分入口：[ReviewFlashcard#L491](file:///d:/fz/0601/solo-dogfeeding/code/294-siyuan/kernel/model/flashcard.go#L491)
+- 下次到期预览：[NextDues#L540](file:///d:/fz/0601/solo-dogfeeding/code/294-siyuan/kernel/model/flashcard.go#L540)
+- 到期筛选：[getDeckDueCards#L1097](file:///d:/fz/0601/solo-dogfeeding/code/294-siyuan/kernel/model/flashcard.go#L1097)
+
+**到期时间特性**：
+- 是**绝对时间点**（如 2026-06-18 14:30:00）
+- 计算后持久化，不受后续复习行为影响
+- 与"天"没有必然联系，可以是分钟、小时、天、月
+- 服务端时区计算，客户端显示时可能有时差
+
+### 5.3 回合缓存配额统计
+
+#### 5.3.1 reviewCardCache 的双重作用
+
+`reviewCardCache` 存储的是**首次评分前的状态快照**，同时服务于两个目的：
+1. **撤销恢复**：重评时恢复到初始状态
+2. **配额统计**：按初始状态统计已用配额
+
+代码位置：[flashcard.go#L488](file:///d:/fz/0601/solo-dogfeeding/code/294-siyuan/kernel/model/flashcard.go#L488)：
 ```go
+reviewCardCache[cardID] = card.Clone()  // 首次评分前克隆
+```
+
+#### 5.3.2 配额统计逻辑
+
+代码位置：[flashcard.go#L1126-L1134](file:///d:/fz/0601/solo-dogfeeding/code/294-siyuan/kernel/model/flashcard.go#L1126-L1134)：
+```go
+newCount := 0
+reviewCount := 0
 for _, reviewedCard := range reviewCardCache {
-    if riff.New == reviewedCard.GetState() { newCount++ }
-    else { reviewCount++ }  // 统计所有缓存中的卡（含翻页前的批次）
+    if riff.New == reviewedCard.GetState() {
+        newCount++       // 初始状态为 New → 计入新卡配额
+    } else {
+        reviewCount++    // 初始状态非 New → 计入复习卡配额
+    }
 }
 ```
 
-**不一致表现**：
-- 翻页后，前端显示 "0 / 20"（新批次从 0 开始）
-- 后端实际配额已消耗 15/20
-- 这是显示设计，不是 Bug。用户感知的"已复习"与系统内部的"配额消耗"是两个维度。
+#### 5.3.3 配额统计特性
+
+| 卡片初始状态 | 加入缓存时机 | 计入配额 |
+|-------------|-------------|----------|
+| New | 首次评分后 | newCount++ |
+| Learning | 首次评分后 | reviewCount++ |
+| Review | 首次评分后 | reviewCount++ |
+| Relearning | 首次评分后 | reviewCount++ |
+
+**关键点**：
+- 统计的是**初始状态**，不是当前状态
+- 一张新卡一旦被复习，始终计入 newCount，不会因为状态变为 Learning 而转移
+- 配额统计是**稳定的**，不会因为状态变化而波动
+
+#### 5.3.4 配额协作示例（新卡上限 20）
+
+| 时间点 | 操作 | newCount | 返回/补充新卡数 |
+|--------|------|----------|----------------|
+| T0 | 打开复习窗口（回合开始） | 0 | 20 张 |
+| T1 | 复习 15 张 | 15 | - |
+| T2 | 翻页 | 15 | 补充 5 张，批次共 25 张 |
+| T3 | 复习完 20 张 | 20 | 配额满，不再返回新卡 |
+| T4 | 关闭窗口 → 再打开 | 0 | 再返回 20 张（如果 due 足够） |
 
 ---
 
-## 六、修正后的风险评估汇总
+## 六、删卡操作的一致性分析
 
-### 6.1 数据一致性风险（修正版）
+### 6.1 `doRemoveFlashcards` 执行路径
 
-| ID | 风险 | 严重度 | 触发概率 | 影响范围 | 发生可能性 | 现有防御 |
-|----|------|--------|----------|----------|------------|----------|
-| **C4** | deck.Save() 失败导致缓存与卡包不一致 | 中 | 低 | 局部制卡不一致 | ✅ 可能 | 日志告警 |
-| **C5** | 事务 rollback 不回滚卡包和缓存 | **高** | 极低 | **全局不一致** | ✅ 可能 | 无直接防御 |
-| **C7** | pushBlockAttrs 与 commit 时序差导致搜索短暂不一致 | 低 | 中 | 搜索结果显示 | ✅ 可能 | 时间自愈（秒级） |
-| **C8** | 已删除块的卡片残留卡包 | 低 | 中 | 卡包膨胀、调度时过滤 | ✅ 可能 | ExistBlockTrees 运行时过滤 |
-| **C9** | 多端同步版本冲突 | 中 | 中 | 部分卡片重复/丢失 | ✅ 可能 | 时间戳先到先胜 |
-| ❌ R1_old | 块属性磁盘写入成功但卡包 Save 失败 | - | - | - | ❌ 不会 | 事务时序保证磁盘写入一致 |
-| ❌ R4_old | 同步中断导致缓存不一致无法自愈 | - | - | - | ❌ 不会 | 内存缓存重启自愈 |
+代码位置：[flashcard.go#L747-L771](file:///d:/fz/0601/solo-dogfeeding/code/294-siyuan/kernel/model/flashcard.go#L747-L771)
 
-### 6.2 同步检测风险
+```
+doRemoveFlashcards 执行时序：
+┌─ ① deckLock.Lock()
+├─ ② isSyncingStorages() → 同步中返回错误
+├─ ③ tx.removeBlocksDeckAttr(blockIDs, deckID)  ── 移除块属性
+│     ├─ 遍历 blockIDs，逐个 loadTree
+│     ├─ node.RemoveIALAttr / SetIALAttr
+│     ├─ tx.writeTree(tree)
+│     ├─ cache.PutBlockIAL(blockID, ...)  ← 更新缓存
+│     └─ pushBlockAttrs(...)
+├─ ④ removeFlashcardsByBlockIDs(blockIDs, deck)  ── 移除卡包卡片
+│     ├─ deck.GetCardsByBlockIDs(blockIDs)
+│     ├─ 逐个 deck.RemoveCard(card.ID())
+│     └─ deck.Save()  ← 失败只记日志，不返回错误
+└─ ⑤ return nil
+```
 
-| ID | 风险 | 严重度 | 触发概率 | 说明 |
-|----|------|--------|----------|------|
-| **S1** | 复习操作持有 deckLock 等待同步 | 中 | 中（同步频繁时） | 所有闪卡操作被阻塞 |
-| **S2** | 制卡操作同步中直接失败 | 低 | 中 | 用户体验不佳，需要手动重试 |
+### 6.2 `removeFlashcardsByBlockIDs` 的返回值
 
-### 6.3 时间边界风险
+代码位置：[flashcard.go#L837-L855](file:///d:/fz/0601/solo-dogfeeding/code/294-siyuan/kernel/model/flashcard.go#L837-L855)：
+```go
+func removeFlashcardsByBlockIDs(blockIDs []string, deck *riff.Deck) {
+    // ...
+    err := deck.Save()
+    if err != nil {
+        logging.LogErrorf("save deck [%s] failed: %s", deck.ID, err)
+        // 不返回错误，函数返回 void
+    }
+}
+```
 
-| ID | 风险 | 严重度 | 触发概率 | 说明 |
-|----|------|--------|----------|------|
-| **T1** | 配额不按日历天重置 | 低 | 高（每次关闭窗口都发生） | "每日20新卡"实为"每回合20新卡" |
-| **T2** | 跨时区 due 计算偏差 | 低 | 中（跨时区用户） | 服务器时区与客户端不同导致同一天到期数量不同 |
-| **T3** | 长时复习跨天不刷新 | 低 | 低（持续复习 >24h） | 打开窗口时的 due 列表不随时间更新 |
-| **T4** | 文档级配额仅文档入口生效 | 低 | 中（设置了文档级配额的用户） | Alt+0 全局入口忽略文档配置 |
+**结论**：删卡操作的 `deck.Save()` 失败同样**不返回错误**，事务继续 commit。
+
+### 6.3 删卡的失败场景
+
+| 失败场景 | 块属性 | 卡包磁盘 | 一致性 |
+|----------|--------|----------|--------|
+| deck.Save() 失败 | ✅ 已移除（commit 后） | ❌ 卡片还在 | **反向不一致**：块无属性，但卡包有卡片 |
+| 后续操作失败 → rollback | ❌ 未移除（rollback） | ✅ 已移除 | **反向不一致**：块有属性，但卡包无卡片 |
+| commit 失败 | ⚠️ 部分移除 | ✅ 已移除 | 部分不一致 |
+
+**反向不一致的后果**：
+- 块不显示闪卡标记，但复习时卡片会出现
+- 用户困惑："我明明移除了，怎么还在复习列表里？"
 
 ---
 
-## 七、后续验证要点（修正版）
+## 七、同步状态检测的两种策略
 
-### 7.1 一致性验证（核心）
+### 7.1 策略对照表
 
-| 编号 | 验证项 | 测试方法 | 预期结果 | 实际风险 |
+| 策略 | 函数 | 行为 | 适用操作 | 设计意图 |
+|------|------|------|----------|----------|
+| 阻塞等待 | `waitForSyncingStorages()` | 每秒轮询，直到同步完成 | 复习类操作（7 个） | 确保评分写入时文件不被同步覆盖 |
+| 立即失败 | `isSyncingStorages()` | 立即返回 bool，不等待 | 制卡/删卡类操作（2 个） | 同步中避免写入冲突，直接提示用户 |
+
+### 7.2 触发顺序问题
+
+两种策略都有同样的触发顺序问题：**先获取 deckLock，再检查同步状态**。
+
+**`doAddFlashcards`** [L858-L864](file:///d:/fz/0601/solo-dogfeeding/code/294-siyuan/kernel/model/flashcard.go#L858-L864)：
+```go
+func (tx *Transaction) doAddFlashcards(operation *Operation) (ret *TxErr) {
+    deckLock.Lock()           // ① 先获取锁
+    defer deckLock.Unlock()
+    if isSyncingStorages() {  // ② 后检查同步
+        ret = &TxErr{code: TxErrCodeDataIsSyncing}
+        return
+    }
+```
+
+**`ReviewFlashcard`** [L468-L472](file:///d:/fz/0601/solo-dogfeeding/code/294-siyuan/kernel/model/flashcard.go#L468-L472)：
+```go
+func ReviewFlashcard(...) (err error) {
+    deckLock.Lock()             // ① 先获取锁
+    defer deckLock.Unlock()
+    waitForSyncingStorages()    // ② 后等待同步
+```
+
+**风险**：
+- 同步期间，所有闪卡操作都先阻塞在 `deckLock.Lock()` 上
+- 锁持有期间才发现同步中 → 等待/失败
+- 同步时间长时，可能形成操作队列堆积
+
+---
+
+## 八、风险评估汇总
+
+### 8.1 数据一致性风险
+
+| ID | 风险 | 严重度 | 发生概率 | 影响范围 | 确认状态 |
+|----|------|--------|----------|----------|----------|
+| **R1** | deck.Save() 失败导致磁盘级不一致 | 中 | 低 | 块显示标记但复习找不到 | ✅ 确认存在 |
+| **R2** | 事务 rollback 三重不一致 | **高** | 极低 | 缓存/块磁盘/卡包三方不一致 | ✅ 确认存在 |
+| **R3** | commit 部分失败 | 中 | 极低 | 部分块关联断裂 | ✅ 确认存在 |
+| **R4** | pushBlockAttrs 时序差（搜索短暂超前） | 低 | 高 | 搜索结果短暂不一致 | ✅ 确认存在 |
+| **R5** | 已删除块卡片残留 | 低 | 中 | 卡包膨胀 | ✅ 确认存在 |
+| **R6** | 多端同步版本冲突 | 中 | 中 | 卡片重复/丢失 | ✅ 确认存在 |
+
+### 8.2 设计风险
+
+| ID | 风险 | 严重度 | 说明 |
+|----|------|--------|------|
+| **D1** | deck.Save() 失败静默处理 | 中 | 仅记录日志，不返回错误，上层无感知 |
+| **D2** | 闪卡操作不在事务原子性范围内 | 高 | rollback 不回滚卡包操作，破坏事务原子性 |
+| **D3** | 缓存更新早于磁盘写入 | 低 | 写穿式缓存正常设计，但失败时不一致 |
+
+### 8.3 时间边界风险
+
+| ID | 风险 | 严重度 | 说明 |
+|----|------|--------|------|
+| **T1** | "每日配额"实为"每回合配额" | 低 | 关闭窗口即重置，与产品描述的"每日"有偏差 |
+| **T2** | 配额按初始状态统计 | 低 | 新卡复习后状态变化，但配额计数不变（设计如此，稳定性优先） |
+| **T3** | 跨时区 due 显示差异 | 低 | 服务端时区计算，客户端可能显示不同 |
+
+---
+
+## 九、后续验证要点
+
+### 9.1 一致性验证（核心）
+
+| 编号 | 验证项 | 测试方法 | 预期结果 | 验证目标 |
 |------|--------|----------|----------|----------|
-| V1 | C5 场景复现 | 构造事务：addFlashcards + 后续注入失败操作 | 检查：① 块缓存属性 ② 块磁盘属性 ③ 卡包数据 | 预期三者不一致（C5 真实存在） |
-| V2 | C4 场景复现 | 模拟 deck.Save() 失败（临时移除写入权限） | 检查：① 块缓存是否有标记 ② 块磁盘是否有属性 ③ 卡包是否有卡片 | 预期①有 ②无 ③无（磁盘层一致，缓存层不一致） |
-| V3 | ❌ R1_old 证伪 | 同上场景 | 块磁盘属性**不应**存在（证明 R1_old 不会发生） | 验证事务时序正确性 |
-| V4 | C7 场景观测 | 单步调试：在 L924 和 commit 之间断点 | 搜索"custom-riff-decks"是否命中该块 | 预期短暂命中（证明 C7 存在） |
-| V5 | C8 场景复现 | 制卡 → 删除块 → 重启 → 检查卡包文件 | 卡包中应有残留卡片，但调度时不返回 | 验证 ExistBlockTrees 过滤有效 |
+| V1 | R1 复现：deck.Save 失败 | 临时移除 riff 目录写入权限 → 制卡 | ① 块属性磁盘已写入 ② 卡包文件未更新 ③ 编辑器显示制卡标记 | 证明磁盘级不一致真实存在 |
+| V2 | R2 复现：rollback 不回滚卡包 | 构造复合事务：addFlashcards + 注入失败的 update op | ① 卡包有卡片 ② 块无属性 ③ 缓存有标记 | 证明三重不一致真实存在 |
+| V3 | D1 验证：Save 失败无错误返回 | 模拟 deck.Save 失败，检查 API 返回 | API 返回成功（或无错误），仅日志有记录 | 证明失败被静默处理 |
+| V4 | R5 验证：删除块后卡片残留 | 制卡 → 删除块 → 重启 → 检查 .deck 文件 | 卡包中仍有该 blockID 的卡片 | 证明 ExistBlockTrees 只过滤不清理 |
+| V5 | 删卡 R1 反向验证 | 模拟删卡时 deck.Save 失败 | 块属性已移除，但卡包中卡片仍在 | 证明反向不一致 |
 
-### 7.2 同步检测验证
-
-| 编号 | 验证项 | 测试方法 | 预期结果 |
-|------|--------|----------|----------|
-| V6 | 制卡同步中失败 | 启动同步 → 立即制卡 | 返回 `TxErrCodeDataIsSyncing` 错误 |
-| V7 | 复习同步中等待 | 启动同步 → 立即评分 | 操作阻塞直到同步完成，然后成功 |
-| V8 | 同步中 deckLock 阻塞链 | 启动同步 → 评分（持有锁等待）→ 同时制卡 | 制卡先阻塞在 deckLock，同步完成后评分执行完成，制卡再执行 |
-
-### 7.3 配额 vs 到期时间区分验证
+### 9.2 配额 vs 到期时间验证
 
 | 编号 | 验证项 | 测试方法 | 预期结果 |
 |------|--------|----------|----------|
-| V9 | 关闭窗口配额重置 | 复习 15 张新卡 → 关闭窗口 → 重新打开 | 再次返回 20 张（不是 5 张） |
-| V10 | 配额统计基于缓存状态 | 复习 10 张新卡（状态变为 Learning）→ 翻页 | newCount 从缓存统计，由于状态变化，newCount < 10 |
-| V11 | 到期时间与回合无关 | 复习一张卡评 Good → 关闭窗口 → 立即重启 → 查询该卡 due | due 时间不变（证明持久化与回合无关） |
-| V12 | 配额与 due 独立 | 50 张新卡 due → 设置配额 20 → 打开复习 → 关闭 → 再打开 | 两次各返回 20 张，due 列表始终有 50 张 |
+| V6 | 配额按初始状态统计 | 复习 10 张新卡（状态变 Learning）→ 翻页 | newCount 仍为 10，还能补充 10 张 |
+| V7 | 关闭窗口配额重置 | 复习 15 张新卡 → 关闭 → 重开 | 再次返回 20 张（不是 5 张） |
+| V8 | 到期时间持久化 | 复习一张卡评 Good → 记录 due 时间 → 重启 → 查询该卡 due | due 时间不变 |
+| V9 | 配额与到期时间独立 | 50 张新卡 due → 复习 20 张 → 关闭 → 重开 | 因配额重置，再次返回 20 张（证明配额回合级、due 持久化） |
 
-### 7.4 边界行为验证
+### 9.3 同步状态验证
 
 | 编号 | 验证项 | 测试方法 | 预期结果 |
 |------|--------|----------|----------|
-| V13 | 全部完成后撤销尝试 | 复习完最后一张 → 上一步 → 尝试评分 | 缓存已清空，撤销能力丢失（设计边界） |
-| V14 | 跳过重启失效 | 跳过 3 张 → 重启 → 打开复习 | 3 张重新出现在列表中 |
-| V15 | 切换筛选器丢失撤销 | 复习 5 张 → 切换筛选器 → 上一步 | 无法撤销（设计边界） |
-| V16 | 翻页后进度显示重置 | 复习 15 张 → 翻页 | 前端显示 0/20，但后端实际配额已消耗 15 |
+| V10 | 制卡同步中立即失败 | 启动同步 → 立即制卡 | 返回同步中错误，不等待 |
+| V11 | 复习同步中阻塞等待 | 启动同步 → 立即评分 | 操作阻塞直到同步完成，然后成功 |
+| V12 | deckLock 顺序问题 | 启动同步 → 评分（持有锁等待）→ 同时制卡 | 制卡先阻塞在 deckLock，同步完成后评分执行，制卡再执行 |
 
 ---
 
-## 八、关键代码索引（修正版）
+## 十、关键代码索引
 
-### 8.1 同步状态检测
+### 10.1 制卡核心
 
 | 函数 | 文件 | 行号 |
 |------|------|------|
-| `waitForSyncingStorages` (循环等待) | [repository.go](file:///d:/fz/0601/solo-dogfeeding/code/294-siyuan/kernel/model/repository.go#L1210-L1213) | L1210-L1213 |
-| `isSyncingStorages` (立即检查) | [repository.go](file:///d:/fz/0601/solo-dogfeeding/code/294-siyuan/kernel/model/repository.go#L1216-L1217) | L1216-L1217 |
-| `syncingStorages` 原子变量 | [repository.go](file:///d:/fz/0601/solo-dogfeeding/code/294-siyuan/kernel/model/repository.go#L1208) | L1208 |
-| 复习操作使用 waitFor | [flashcard.go](file:///d:/fz/0601/solo-dogfeeding/code/294-siyuan/kernel/model/flashcard.go#L471) | L471 |
-| 制卡操作使用 isSyncing | [flashcard.go](file:///d:/fz/0601/solo-dogfeeding/code/294-siyuan/kernel/model/flashcard.go#L861) | L861 |
+| `doAddFlashcards` | [flashcard.go](file:///d:/fz/0601/solo-dogfeeding/code/294-siyuan/kernel/model/flashcard.go#L857-L949) | L857-L949 |
+| `doRemoveFlashcards` | [flashcard.go](file:///d:/fz/0601/solo-dogfeeding/code/294-siyuan/kernel/model/flashcard.go#L747-L771) | L747-L771 |
+| `removeBlocksDeckAttr` | [flashcard.go](file:///d:/fz/0601/solo-dogfeeding/code/294-siyuan/kernel/model/flashcard.go#L773-L835) | L773-L835 |
+| `removeFlashcardsByBlockIDs` | [flashcard.go](file:///d:/fz/0601/solo-dogfeeding/code/294-siyuan/kernel/model/flashcard.go#L837-L855) | L837-L855 |
+| `deck.Save()` 失败静默处理 | [flashcard.go](file:///d:/fz/0601/solo-dogfeeding/code/294-siyuan/kernel/model/flashcard.go#L944-L947) | L944-L947 |
 
-### 8.2 半成品缓存时序
+### 10.2 事务与回滚
 
-| 操作 | 文件 | 行号 |
+| 函数 | 文件 | 行号 |
 |------|------|------|
-| `cache.PutBlockIAL` 缓存更新 | [flashcard.go](file:///d:/fz/0601/solo-dogfeeding/code/294-siyuan/kernel/model/flashcard.go#L924) | L924 |
-| `tx.writeTree` 标记待写入 | [flashcard.go](file:///d:/fz/0601/solo-dogfeeding/code/294-siyuan/kernel/model/flashcard.go#L922) | L922 |
-| `pushBlockAttrs` 推送属性 | [flashcard.go](file:///d:/fz/0601/solo-dogfeeding/code/294-siyuan/kernel/model/flashcard.go#L925) | L925 |
-| `deck.Save` 卡包持久化 | [flashcard.go](file:///d:/fz/0601/solo-dogfeeding/code/294-siyuan/kernel/model/flashcard.go#L944) | L944 |
-| `PutBlockIAL` 实现 | [cache/ial.go](file:///d:/fz/0601/solo-dogfeeding/code/294-siyuan/kernel/cache/ial.go#L60-L63) | L60-L63 |
+| `performTx`（事务主循环） | [transaction.go](file:///d:/fz/0601/solo-dogfeeding/code/294-siyuan/kernel/model/transaction.go#L148-L349) | L148-L349 |
+| `tx.commit()` | [transaction.go](file:///d:/fz/0601/solo-dogfeeding/code/294-siyuan/kernel/model/transaction.go#L1865-L1895) | L1865-L1895 |
+| `tx.rollback()` | [transaction.go](file:///d:/fz/0601/solo-dogfeeding/code/294-siyuan/kernel/model/transaction.go#L1897-L1902) | L1897-L1902 |
+| 事务操作分发（含闪卡） | [transaction.go](file:///d:/fz/0601/solo-dogfeeding/code/294-siyuan/kernel/model/transaction.go#L211-L214) | L211-L214 |
 
-### 8.3 配额与到期时间区分
+### 10.3 同步状态检测
+
+| 函数 | 文件 | 行号 |
+|------|------|------|
+| `waitForSyncingStorages` | [repository.go](file:///d:/fz/0601/solo-dogfeeding/code/294-siyuan/kernel/model/repository.go#L1210-L1213) | L1210-L1213 |
+| `isSyncingStorages` | [repository.go](file:///d:/fz/0601/solo-dogfeeding/code/294-siyuan/kernel/model/repository.go#L1216-L1217) | L1216-L1217 |
+| `syncingStorages` 变量 | [repository.go](file:///d:/fz/0601/solo-dogfeeding/code/294-siyuan/kernel/model/repository.go#L1208) | L1208 |
+
+### 10.4 配额与到期时间
 
 | 概念 | 代码位置 | 行号 |
 |------|----------|------|
-| FSRS Card.Due 字段访问 | [flashcard.go](file:///d:/fz/0601/solo-dogfeeding/code/294-siyuan/kernel/model/flashcard.go#L388-L389) | L388-L389 |
-| `deck.Dues()` 到期筛选 | [flashcard.go](file:///d:/fz/0601/solo-dogfeeding/code/294-siyuan/kernel/model/flashcard.go#L1097) | L1097 |
-| `reviewCardCache` 配额统计 | [flashcard.go](file:///d:/fz/0601/solo-dogfeeding/code/294-siyuan/kernel/model/flashcard.go#L1126-L1134) | L1126-L1134 |
-| `card.NextDues()` 预计算 | [flashcard.go](file:///d:/fz/0601/solo-dogfeeding/code/294-siyuan/kernel/model/flashcard.go#L540) | L540 |
-| `deck.Review()` 调用 | [flashcard.go](file:///d:/fz/0601/solo-dogfeeding/code/294-siyuan/kernel/model/flashcard.go#L491) | L491 |
+| 配额统计（reviewCardCache） | [flashcard.go](file:///d:/fz/0601/solo-dogfeeding/code/294-siyuan/kernel/model/flashcard.go#L1126-L1134) | L1126-L1134 |
+| 到期筛选（deck.Dues()） | [flashcard.go](file:///d:/fz/0601/solo-dogfeeding/code/294-siyuan/kernel/model/flashcard.go#L1097) | L1097 |
+| 评分入口（deck.Review()） | [flashcard.go](file:///d:/fz/0601/solo-dogfeeding/code/294-siyuan/kernel/model/flashcard.go#L491) | L491 |
+| 撤销缓存写入 | [flashcard.go](file:///d:/fz/0601/solo-dogfeeding/code/294-siyuan/kernel/model/flashcard.go#L488) | L488 |
+| `reviewCardCache` 声明 | [flashcard.go](file:///d:/fz/0601/solo-dogfeeding/code/294-siyuan/kernel/model/flashcard.go#L61-L62) | L61-L62 |
 
-### 8.4 事务边界
+### 10.5 缓存与推送
 
-| 函数 | 文件 | 行号 |
+| 操作 | 文件 | 行号 |
 |------|------|------|
-| `tx.rollback` 仅回滚文档树 | [transaction.go](file:///d:/fz/0601/solo-dogfeeding/code/294-siyuan/kernel/model/transaction.go#L1897-L1902) | L1897-L1902 |
-| `tx.commit` 写入文档树 | [transaction.go](file:///d:/fz/0601/solo-dogfeeding/code/294-siyuan/kernel/model/transaction.go#L1865-L1894) | L1865-L1894 |
-| `doAddFlashcards` 事务入口 | [flashcard.go](file:///d:/fz/0601/solo-dogfeeding/code/294-siyuan/kernel/model/flashcard.go#L857-L949) | L857-L949 |
-| 事务操作分发 | [transaction.go](file:///d:/fz/0601/solo-dogfeeding/code/294-siyuan/kernel/model/transaction.go#L211-L214) | L211-L214 |
-
-### 8.5 关键全局变量
-
-| 变量 | 类型 | 作用 | 生命周期 |
-|------|------|------|----------|
-| `reviewCardCache` | `map[string]riff.Card` | 撤销缓存 + 配额统计基数 | 回合开始/结束清空 |
-| `skipCardCache` | `map[string]riff.Card` | 跳过标记（内存） | 回合开始/结束清空 |
-| `Decks` | `map[string]*riff.Deck` | 已加载卡包（含 FSRS 卡片状态） | 进程生命周期，LoadFlashcards 填充 |
-| `deckLock` | `sync.Mutex` | 闪卡操作全局互斥 | 进程生命周期 |
-| `syncingStorages` | `atomic.Bool` | 存储同步状态标记 | 同步期间为 true |
+| `cache.PutBlockIAL` 调用 | [flashcard.go](file:///d:/fz/0601/solo-dogfeeding/code/294-siyuan/kernel/model/flashcard.go#L924) | L924 |
+| `pushBlockAttrs` 调用 | [flashcard.go](file:///d:/fz/0601/solo-dogfeeding/code/294-siyuan/kernel/model/flashcard.go#L925) | L925 |
+| `tx.writeTree` 调用 | [flashcard.go](file:///d:/fz/0601/solo-dogfeeding/code/294-siyuan/kernel/model/flashcard.go#L922) | L922 |
+| `PutBlockIAL` 实现 | [cache/ial.go](file:///d:/fz/0601/solo-dogfeeding/code/294-siyuan/kernel/cache/ial.go#L60-L63) | L60-L63 |
