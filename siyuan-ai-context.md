@@ -93,19 +93,55 @@ if ast.NodeDocument == node.Type {
 
 ### 2.3 上下文窗口管理
 
-[chatGPTContinueWrite()](kernel/model/ai.go) 中实现了滑动窗口机制：
+[chatGPTContinueWrite()](kernel/model/ai.go) L87-L89 中实现了滑动窗口机制：
 
 ```go
-// 滑动窗口裁剪 - L87-L89
 if Conf.AI.OpenAI.APIMaxContexts < len(contextMsgs) {
     contextMsgs = contextMsgs[len(contextMsgs)-Conf.AI.OpenAI.APIMaxContexts:]
 }
 ```
 
-**关键点**:
-- `APIMaxContexts` 默认为 7，可配置范围 [1, 64]
-- 仅裁剪历史消息，不影响当前输入消息
-- 历史消息以字符串数组存储，格式为 `[user_msg1, assistant_msg1, user_msg2, assistant_msg2, ...]`
+**裁剪粒度与规则**（按代码路径逐条梳理）：
+
+1. **裁剪单位**：整条消息（`contextMsgs` 数组的每个元素是一条完整消息字符串），不会在单条消息的文本内容中间截断。
+2. **裁剪方向**：从数组头部丢弃最旧的消息，保留尾部最新的 N 条消息（`APIMaxContexts` 条）。
+3. **计数口径**：`APIMaxContexts` 计数的是**历史消息条数**，而非对话轮数。
+4. **当前消息不参与裁剪**：`msg` 参数是当前用户输入，独立于 `contextMsgs` 数组传递，不会被裁剪。
+
+**历史消息的追加路径**：
+
+每次对话成功完成后，通过 L113 追加一对消息到全局缓存：
+```go
+retContextMsgs = append(retContextMsgs, msg, ret)
+// 即 [用户消息, 助手回复]，共 2 条
+```
+然后在 `chatGPT()` L67 中追加到 `cachedContextMsg`：
+```go
+cachedContextMsg = append(cachedContextMsg, retCtxMsgs...)
+```
+
+因此 `cachedContextMsg` 的存储格式为扁平字符串数组：
+```
+索引：  0          1            2          3            ...
+内容：[user_msg1, assistant1, user_msg2, assistant2, ...]
+长度：始终为偶数（每轮对话追加 2 条）
+```
+
+**裁剪后对话轮次的不对齐问题**：
+
+由于 `APIMaxContexts` 默认值为 7（奇数），而每轮对话追加 2 条消息，裁剪后必然出现"半轮"对话：
+
+| 历史消息总数 | 裁剪后保留条数 | 保留内容 | 轮次完整性 |
+|-------------|--------------|----------|-----------|
+| 8 条（4 轮） | 7 条 | 丢弃最早 1 条（user_msg1），从 assistant1 开始 | ❌ 从 assistant 开头 |
+| 10 条（5 轮） | 7 条 | 丢弃最早 3 条，从 user_msg2 开始 | ✅ 从 user 开头 |
+| 12 条（6 轮） | 7 条 | 丢弃最早 5 条，从 assistant3 开始 | ❌ 从 assistant 开头 |
+
+但由于**所有历史消息均被标记为 `role: "user"`**（见 util/openai.go L38-L41），这种轮次不对齐对模型行为的实际影响有限——模型看到的都是 user 角色的连续文本，不会因角色交替被破坏而产生困惑。
+
+**关键参数**:
+- `APIMaxContexts` 默认 7，可配置范围 [1, 64]
+- 同时复用为续写循环的最大次数（见 §5.4）
 
 ---
 
@@ -506,12 +542,12 @@ func chatGPTContinueWrite(msg string, contextMsgs []string, cloud bool) (ret str
 
 | 关切点 | 规则 | 说明 |
 |--------|------|------|
-| **续写循环的触发条件** | 内层返回 `stop=false` | 即 `FinishReason == "length"`，意味着输出被 MaxTokens 截断 |
-| **续写循环的上限** | `APIMaxContexts` 次 | 默认 7 次，该值同时用于上下文窗口裁剪和续写上限 |
-| **续写循环的中断条件** | `stop=true` 或 `chatErr != nil` | 正常结束或任何错误 |
-| **续写间上下文是否累积** | **否** | 每次内层调用传入的 `contextMsgs` 相同（外层不更新），续写结果仅追加到 `buf` |
-| **续写结果是否返回给 API** | **否** | 续写的中间片段不会作为新的 `assistant` 消息追加到 `contextMsgs`，仅在本地 buffer 拼接 |
-| **最终结果如何入库** | 拼接后的完整文本作为一个 `assistant` 消息 | `retContextMsgs = [msg, 拼接后的完整ret]`，追加到 `cachedContextMsg` |
+| **续写循环的触发条件** | 内层返回 `stop=false` | 即 `FinishReason == "length"`，意味着单次输出被 MaxTokens 截断，需要继续生成 |
+| **续写循环的上限** | `APIMaxContexts` 次 | 默认 7 次。注意：该值同时复用于上下文窗口裁剪，但两处语义完全不同——裁剪时是"历史消息条数上限"，续写时是"最大续写次数" |
+| **续写循环的中断条件** | `stop=true` 或 `chatErr != nil` | 正常结束（stop 理由非 length）或任何错误 |
+| **续写间上下文是否累积** | **否** | 每次内层调用传入的 `msg` 和 `contextMsgs` 完全相同（外层不更新），续写结果仅追加到本地 `buf` |
+| **续写结果是否返回给 API** | **否** | 续写的中间片段不会作为新的 `assistant` 消息追加到 `contextMsgs`，仅在本地 buffer 字符串拼接 |
+| **最终结果如何入库** | 拼接后的完整文本作为一条 `assistant` 消息 | `retContextMsgs = [msg, 拼接后的完整ret]`，即一对消息，追加到 `cachedContextMsg` 尾部 |
 
 ### 5.5 续写语义的关键细节
 
@@ -839,7 +875,7 @@ kernel 启动 → InitConf() [model/conf.go L123]
 |------|------|
 | 消息角色设计 | 所有历史消息均标记为 "user" 角色，不符合 ChatML 规范，可能影响模型理解对话结构 |
 | 无 System Prompt | 无法设置 AI 人格、输出格式等全局指令 |
-| 上下文粒度粗 | 以完整消息为单位滑动窗口，可能在消息中间截断 |
+| 上下文窗口计数口径 | `APIMaxContexts` 按消息条数计数而非对话轮数，与消息成对追加的模式不匹配，裁剪后可能出现对话轮次不对齐（从 assistant 消息开头）。但由于所有历史消息均标记为 user 角色，实际影响有限 |
 | 动作与模式耦合 | ChatGPTWithAction 传入 nil 上下文，导致自定义动作无法利用对话历史 |
 | APIMaxContexts 双重语义 | 同一个值既控制上下文窗口大小又控制续写循环上限，两者语义不同但共享上限 |
 | CloudGPT 代码预留 | 云端通道已实现但未启用，`cloud` 参数硬编码为 `false`，增加维护负担 |
