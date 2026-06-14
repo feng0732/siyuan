@@ -756,13 +756,30 @@ for _, keyValues := range destAv.KeyValues {
 #### 7.4.2 排序规则残留
 
 - **现象**：排序规则引用的字段还在，但字段类型变了
-- **判断：排序不会崩溃，但比较结果可能不符合预期。**
+- **判断：排序不会崩溃，类型不匹配的值在比较时返回 0（视为相等），最终按块创建时间回退排序。**
 
-  证据：`kernel/av/sort.go` L123 调用 `val1.Compare(val2, attrView)`，该方法（`kernel/av/value.go` L161 起）根据 `value.Type` 进入对应分支。类型切换后 `Type` 已变，`Compare` 会按新类型的逻辑比较旧子结构。例如：
-  - 从 `number` 切换为 `text`：`Compare` 进入 `KeyTypeText` 分支，访问 `value.Text.Content`，但 `Text` 为 nil → 返回 0（两值相等），效果等同于空值排序
-  - 从 `text` 切换为 `number`：`Compare` 进入 `KeyTypeNumber` 分支，访问 `value.Number`，`Number` 为 nil → 返回 0，等同于空值
+  证据：`kernel/av/sort.go` L123 调用 `val1.Compare(val2, attrView)`。`Compare` 方法定义在 `kernel/av/sort.go` L161-L479，结构如下：
 
-  **结论**：排序规则残留时，类型不匹配的值在比较时返回 0（视为相等），最终按块创建时间回退排序。不会崩溃，但排序结果可能不反映用户预期的顺序。
+  ```go
+  func (value *Value) Compare(other *Value, attrView *AttributeView) int {
+      switch value.Type {
+      case KeyTypeBlock:
+          if nil != value.Block && nil != other.Block { ... }
+      case KeyTypeText:
+          if nil != value.Text && nil != other.Text { ... }
+      case KeyTypeNumber:
+          if nil != value.Number && nil != other.Number { ... }
+      // ... 所有 17 种类型都有分支
+      }
+      return 0   // L478：默认返回 0
+  }
+  ```
+
+  每个类型分支的入口条件是**两个值的对应子结构都非 nil**。类型切换后：
+  - 从 `number` 切换为 `text`：`value.Type = text`，但 `value.Text` 仍为 nil → 不进入 `KeyTypeText` 分支的 if 块 → 落到 L478 `return 0`
+  - 从 `text` 切换为 `number`：`value.Type = number`，但 `value.Number` 仍为 nil → 同样落到 L478 `return 0`
+
+  返回 0 表示两值相等，触发 `sort.go` L124-L126 的 `sorted = false; continue`，继续下一级排序规则。若所有排序规则都返回 0，则最终按块创建时间回退排列。不会崩溃，但排序结果不反映用户预期的字段值顺序。
 
 #### 7.4.3 视图字段配置残留
 
@@ -798,28 +815,49 @@ if val := destVal.GetValByType(destKey.Type); nil == val || reflect.ValueOf(val)
 
 #### 7.4.5 看板/画廊封面字段失效
 
-- **现象**：`CoverFromAssetKeyID` 指向的字段类型从 `mAsset` 变为其他类型
-- **判断：静默降级为无封面，不会崩溃。**
+- **现象**：画廊或看板的 `CoverFrom = CoverFromAssetField`，且 `CoverFromAssetKeyID` 指向的字段类型从 `mAsset` 切换为其他类型
+- **判断：封面降级为空，不会崩溃，且不会显示旧资源数据。**
 
-  证据：`kernel/sql/av_kanban.go` L192-L207 和 `kernel/sql/av_gallery.go` L197-L211：
+  完整链路（以画廊为例，`kernel/sql/av_gallery.go` L196-L212，看板在 `kernel/sql/av_kanban.go` L191-L207）：
 
   ```go
   case av.CoverFromAssetField:
-      if "" == view.Kanban.CoverFromAssetKeyID {
-          break   // 无资源字段 ID → 不显示封面
+      if "" == view.Gallery.CoverFromAssetKeyID {
+          break                                 // L197-L198：无资源字段 ID → 无封面
       }
-      assetValue := attrView.GetValue(view.Kanban.CoverFromAssetKeyID, cardID)
+
+      assetValue := attrView.GetValue(view.Gallery.CoverFromAssetKeyID, cardID)
       if nil == assetValue || 1 > len(assetValue.MAsset) {
-          break   // 值为空或 MAsset 列表为空 → 不显示封面
+          break                                 // L201-L203：值为 nil 或 MAsset 为空 → 无封面
       }
-      // 遍历 MAsset 找图片...
+
+      for _, asset := range assetValue.MAsset {
+          if asset.Type == av.AssetTypeImage && util.IsPossiblyImage(asset.Content) {
+              galleryCard.CoverURL = asset.Content  // L207-L208：找到图片 → 设置封面
+              break
+          }
+      }
+      return
   ```
 
-  类型切换后，`GetValue` 返回的值的 `Type` 已变，但代码**不检查 Type**，直接访问 `MAsset` 字段。由于类型切换只修改 `Value.Type` 标记不清空旧子结构（见 7.2），存在两种情况：
-  1. **旧 `MAsset` 指针非 nil**：仍会尝试读取旧资源数据，可能显示过期封面
-  2. **旧 `MAsset` 为 nil**（新创建的值或曾被 GC 清理）：`1 > len(assetValue.MAsset)` → break，不显示封面
+  **降级为空的精确触发条件**（满足任一即不显示封面）：
 
-  **结论**：封面字段类型失效后，通常表现为不显示封面（静默降级），但在特定条件下可能短暂显示过期的旧资源数据。
+  | 条件 | 代码行 | 说明 |
+  |------|--------|------|
+  | `CoverFromAssetKeyID` 为空字符串 | L197-L198 | 未配置资源字段 |
+  | `attrView.GetValue()` 返回 nil | L201 | 该单元格从未被写入过任何值 |
+  | `len(assetValue.MAsset) < 1` | L202 | `MAsset` 切片为空或 nil |
+  | `MAsset` 中所有资源 `Type != AssetTypeImage` | L207 遍历无匹配 | 没有图片资源 |
+  | `MAsset` 中图片资源 `util.IsPossiblyImage(content) == false` | L207 | URL 不是合法图片路径 |
+
+  **为什么不会显示旧资源数据**：类型切换时（`kernel/model/attribute_view.go` L4672-L4677），`changeType` 触发后虽然只改 `Key.Type` 和 `Value.Type`、不清空子结构，但封面代码**不检查值的 Type 字段**，直接读 `assetValue.MAsset`。旧 `MAsset` 子结构理论上仍在内存中，但：
+
+  1. 若该单元格在资源字段类型下从未填过值 → `MAsset` 本就为 nil → L202 break
+  2. 若该单元格曾填过资源值 → `MAsset` 非 nil，理论上仍会被读到并显示旧封面 → 这是**唯一可能显示旧资源的场景**
+
+  **用户可见结果**：
+  - 绝大多数情况下卡片不显示封面（静默降级）
+  - 仅当该单元格在原资源字段类型下曾填过图片资源时，切换类型后可能短暂显示旧图片，直到用户编辑该单元格触发值清理
 
 ### 7.5 主键（block）类型的特殊性
 
@@ -868,8 +906,11 @@ if val := destVal.GetValByType(destKey.Type); nil == val || reflect.ValueOf(val)
 
 #### 8.2.4 模板渲染错误
 
-- 模板字段使用 Go template 语法渲染
-- 渲染失败时，模板内容直接显示原始模板字符串（降级显示）
+模板字段使用 Go template 语法，渲染入口在 `kernel/sql/av.go` L604-L650：
+
+1. **模板渲染失败**：`renderTemplateField` 返回 error 时（L636），构造错误信息但继续执行，失败单元格的 `Template.Content` 仍为空字符串（L645：`content` 为空）
+2. **错误上报**：渲染完成后，调用方（`kernel/sql/av_table.go` L128-L131、`av_kanban.go` L130-L133、`av_gallery.go` L135-L138）通过 `util.PushErrMsg` 推送错误消息，显示 30000ms（30 秒）
+3. **用户可见结果**：模板渲染失败的单元格显示为空，同时右上角弹出红色错误提示「数据库模板字段渲染失败：xxx」
 
 ### 8.3 排序异常
 
