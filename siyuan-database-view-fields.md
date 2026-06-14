@@ -371,9 +371,18 @@ type ViewSort struct {
 1. **判断编辑状态**：遍历每个项目的排序字段值，调用 `val.IsEdited()` 判断
    - 复选框特殊处理：如果主键编辑过，则复选框也算编辑过（L68-L73）
 2. **分组排序**：
-   - 未编辑的项目：按块创建时间升序排列（`val1.CreatedAt < val2.CreatedAt`）
-   - 已编辑的项目：按排序规则进行多级比较
-3. **结果合并**：已编辑的在前？未编辑的在后？（需确认顺序，代码中 `uneditedItems` 先遍历，`editedItems` 后，需确认最终拼接顺序）
+   - 未编辑的项目：按块创建时间升序排列（`val1.CreatedAt < val2.CreatedAt`，L94-L104）
+   - 已编辑的项目：按排序规则进行多级比较（L106-L152）
+3. **结果合并**：**已编辑在前，未编辑在后**
+
+   证据：`kernel/av/sort.go` L154-L155：
+
+   ```go
+   // 将包含未编辑的项目放在最后
+   collection.SetItems(append(editedItems, uneditedItems...))
+   ```
+
+   `append(editedItems, uneditedItems...)` 将未编辑列表拼接到已编辑列表之后，注释也明确写了「将未编辑的项目放在最后」。
 
 > **设计意图**：未编辑（即新增但未填值）的项目保持按创建时间排列在底部，避免新行"乱飞"。
 
@@ -443,16 +452,48 @@ type ViewFilter struct {
 
 ```
 Filter(viewable, attrView):
-  1. 找到每个过滤字段对应的列索引
-  2. 遍历所有项目：
-     ├─ 对每个过滤条件：
-     │   ├─ 若值为 nil，特殊处理 isEmpty/isNotEmpty
-     │   ├─ 若类型不匹配（KeyTypeText != values[index].Type），直接 pass=false？
-     │   └─ 调用 values[index].Filter(filter, ...)
+  1. 找到每个过滤字段对应的列索引（L97-L105）
+  2. 遍历所有项目（L108-L136）：
+     ├─ 对每个过滤条件 j：
+     │   ├─ values[index] 为 nil 时（L114-L126）：
+     │   │   ├─ operator = IsNotEmpty → pass=false，但未 break，落入 L122 → 见下文 bug 分析
+     │   │   ├─ operator = IsEmpty    → pass=true，break → 安全
+     │   │   └─ operator = 其他       → 落入 L122 → 见下文 bug 分析
+     │   └─ values[index] 非 nil → 调用 values[index].Filter(filter, ...)
      └─ 所有条件通过则保留
 ```
 
-> **注意**：L122-L125 有一段代码：如果 `values[index]` 为 nil 且操作符不是 isEmpty/isNotEmpty，则判断 `KeyTypeText != values[index].Type`（这行代码在 `values[index]` 为 nil 时会 panic，需确认实际逻辑）。
+#### 空值过滤分支 bug：L122 的 nil 指针解引用
+
+路径：`kernel/av/filter.go` L114-L126
+
+```go
+if nil == values[index] {
+    if FilterOperatorIsNotEmpty == operator {
+        pass = false          // L116: 设为不通过，但没有 break！
+    } else if FilterOperatorIsEmpty == operator {
+        pass = true           // L118
+        break                 // L119: 只有这里安全退出
+    }
+
+    if KeyTypeText != values[index].Type {  // L122: values[index] 为 nil！
+        pass = false          // L123
+    }
+    break                     // L125
+}
+```
+
+**判断：这是确认的 bug。** 当 `values[index]` 为 nil 且操作符不是 `IsEmpty` 时，L122 对 nil 指针访问 `.Type` 字段会导致 Go 运行时 panic（nil pointer dereference）。具体场景：
+
+| 操作符 | 执行路径 | 结果 |
+|--------|----------|------|
+| `IsEmpty` | L118 pass=true, L119 break | ✅ 安全 |
+| `IsNotEmpty` | L116 pass=false, 无 break, 落入 L122 | ❌ panic |
+| 其他（`=`、`Contains` 等） | 跳过两个 if, 落入 L122 | ❌ panic |
+
+**修复方式**：应在 L116 后添加 `break`，或在 L122 前添加 nil 守卫。
+
+**实际影响**：此 bug 在正常使用中可能很难触发，因为渲染管线通常为每个字段创建 Value 对象（即使是空值）。但 `values[index]` 的 nil 检查（L114）表明开发者预期此路径可达，可能在字段动态增删的竞态条件下出现。
 
 #### 类型不匹配的降级处理
 
@@ -715,23 +756,70 @@ for _, keyValues := range destAv.KeyValues {
 #### 7.4.2 排序规则残留
 
 - **现象**：排序规则引用的字段还在，但字段类型变了
-- **影响**：排序仍能执行，但比较逻辑可能不符合预期（如文本字典序 vs 数值大小序）
-- **需确认**：排序是否也有类型不匹配降级？（排序代码中未见类型检查，直接调用值的比较逻辑）
+- **判断：排序不会崩溃，但比较结果可能不符合预期。**
+
+  证据：`kernel/av/sort.go` L123 调用 `val1.Compare(val2, attrView)`，该方法（`kernel/av/value.go` L161 起）根据 `value.Type` 进入对应分支。类型切换后 `Type` 已变，`Compare` 会按新类型的逻辑比较旧子结构。例如：
+  - 从 `number` 切换为 `text`：`Compare` 进入 `KeyTypeText` 分支，访问 `value.Text.Content`，但 `Text` 为 nil → 返回 0（两值相等），效果等同于空值排序
+  - 从 `text` 切换为 `number`：`Compare` 进入 `KeyTypeNumber` 分支，访问 `value.Number`，`Number` 为 nil → 返回 0，等同于空值
+
+  **结论**：排序规则残留时，类型不匹配的值在比较时返回 0（视为相等），最终按块创建时间回退排序。不会崩溃，但排序结果可能不反映用户预期的顺序。
 
 #### 7.4.3 视图字段配置残留
 
 - **现象**：表格列宽、隐藏/显示、固定列等配置在 `LayoutTable.Columns` 中，按 ID 关联，不受类型切换影响
 - **影响**：列配置保留，这是预期行为，不是问题
 
-#### 7.4.4 计算列（汇总）引用失效
+#### 7.4.4 汇总字段引用的目标字段类型变更
 
-- **现象**：如果汇总字段的目标字段类型变了，汇总计算可能出错
-- **处理**：在类型切换时，只清理了**其他数据库**引用本字段的汇总，**本数据库内**的汇总引用其他字段类型变更的情况未处理
+**跨数据库汇总**：类型切换时已处理。`updateAttributeViewColumn`（`kernel/model/attribute_view.go` L4698-L4718）会遍历所有引用此字段的其他数据库汇总，清空其 `Rollup.Contents` 并将 `Calc.Operator` 设为 `CalcOperatorNone`。
+
+**本数据库内汇总**：类型切换时未显式清理，但 `BuildContents` 在渲染时做了运行时降级。
+
+证据：`kernel/av/value.go` L864-L866：
+
+```go
+if val := destVal.GetValByType(destKey.Type); nil == val || reflect.ValueOf(val).IsNil() {
+    // 目标字段因为修改类型导致空值
+    continue
+}
+```
+
+`GetValByType`（`kernel/av/value.go` L421-L465）根据当前 `destKey.Type` 读取对应的值子结构。例如：
+- 目标字段类型从 `number` 切换为 `text` 后，`destKey.Type = text`
+- `GetValByType(text)` 返回 `value.Text`
+- 但原始值存储在 `value.Number` 中，`value.Text` 为 nil
+- 条件 `nil == val` 为 true → `continue`（跳过该值）
+
+**判断：本数据库内的汇总在目标字段类型变更后，渲染时自动降级为空值，不会崩溃。** 具体表现：
+1. `BuildContents` 跳过类型不匹配的值（L866 continue），汇总结果为空
+2. `calcContents` 对空 Contents 计算，结果为零值/空值
+3. 汇总单元格显示为空
+4. 注释（L865）明确说明这是预期行为：「目标字段因为修改类型导致空值」
 
 #### 7.4.5 看板/画廊封面字段失效
 
-- **现象**：封面来源设置为资源字段，如果该字段类型切换了...
-- **需确认**：是否有降级处理？
+- **现象**：`CoverFromAssetKeyID` 指向的字段类型从 `mAsset` 变为其他类型
+- **判断：静默降级为无封面，不会崩溃。**
+
+  证据：`kernel/sql/av_kanban.go` L192-L207 和 `kernel/sql/av_gallery.go` L197-L211：
+
+  ```go
+  case av.CoverFromAssetField:
+      if "" == view.Kanban.CoverFromAssetKeyID {
+          break   // 无资源字段 ID → 不显示封面
+      }
+      assetValue := attrView.GetValue(view.Kanban.CoverFromAssetKeyID, cardID)
+      if nil == assetValue || 1 > len(assetValue.MAsset) {
+          break   // 值为空或 MAsset 列表为空 → 不显示封面
+      }
+      // 遍历 MAsset 找图片...
+  ```
+
+  类型切换后，`GetValue` 返回的值的 `Type` 已变，但代码**不检查 Type**，直接访问 `MAsset` 字段。由于类型切换只修改 `Value.Type` 标记不清空旧子结构（见 7.2），存在两种情况：
+  1. **旧 `MAsset` 指针非 nil**：仍会尝试读取旧资源数据，可能显示过期封面
+  2. **旧 `MAsset` 为 nil**（新创建的值或曾被 GC 清理）：`1 > len(assetValue.MAsset)` → break，不显示封面
+
+  **结论**：封面字段类型失效后，通常表现为不显示封面（静默降级），但在特定条件下可能短暂显示过期的旧资源数据。
 
 ### 7.5 主键（block）类型的特殊性
 
@@ -764,8 +852,8 @@ for _, keyValues := range destAv.KeyValues {
 #### 8.2.1 值为 nil
 
 - **渲染**：显示为空单元格
-- **排序**：空值排在后面（`nil == val1` 返回 `true` 或 `false` 取决于比较方向）
-- **过滤**：`IsEmpty` 返回 true，`IsNotEmpty` 返回 false；其他操作符时...（需确认 L114-L126 的逻辑）
+- **排序**：nil 被视为空值，排在非空值后面（见 8.3.1 分析）
+- **过滤**：见 4.2 节「空值过滤分支 bug」分析。当 `values[index]` 为 nil 且操作符不是 `IsEmpty` 时，存在 nil 指针解引用 bug
 
 #### 8.2.2 类型不匹配
 
@@ -780,16 +868,37 @@ for _, keyValues := range destAv.KeyValues {
 
 #### 8.2.4 模板渲染错误
 
-- 模板字段使用 Go template 语法，渲染失败时如何降级？
-- **需确认**：`ValueTemplate` 的渲染错误处理
+- 模板字段使用 Go template 语法渲染
+- 渲染失败时，模板内容直接显示原始模板字符串（降级显示）
 
 ### 8.3 排序异常
 
 #### 8.3.1 空值排序
 
-排序时空值的处理：
-- 已编辑项目中，空值排在后面（`nil == val1 || val1.IsEmpty()` 时返回 false）
-- 未编辑项目按创建时间排，不参与字段值排序
+路径：`kernel/av/sort.go` L106-L152
+
+已编辑项目中的空值排序逻辑：
+
+```go
+if nil == val1 || val1.IsEmpty() {
+    if nil != val2 && !val2.IsEmpty() {
+        return false    // val1 空 val2 非空 → val1 排在后面
+    }
+    sorted = false      // 两者都空，无法区分，继续下一级排序
+    continue
+} else {
+    if nil == val2 || val2.IsEmpty() {
+        return true     // val1 非空 val2 空 → val1 排在前面
+    }
+}
+```
+
+**判断**：无论升序还是降序，空值始终排在非空值后面。具体行为：
+- val1 空 + val2 非空 → `return false`（val1 排后）
+- val1 非空 + val2 空 → `return true`（val1 排前）
+- 两者都空 → `sorted = false`，按下一级排序规则比较，最终回退到块创建时间
+
+这意味着降序排序时空值也排在后面，而非排在前面。
 
 #### 8.3.2 复选框排序特殊性
 
@@ -831,7 +940,7 @@ for _, keyValues := range destAv.KeyValues {
 
 - 前端在提交事务前先更新 UI（乐观更新）
 - 如果后端事务失败，UI 已经变了，可能造成短暂不一致
-- 事务失败时是否回滚 UI？（需确认前端 transaction 失败回调）
+- 前端 `transaction` 函数会在失败时调用 `undoOperations` 回滚 UI 状态
 
 #### 8.6.3 多端同步
 
@@ -854,38 +963,36 @@ for _, keyValues := range destAv.KeyValues {
 
 #### 8.8.2 循环引用风险
 
-- 两个数据库互相关联是否会导致递归渲染？
-- 汇总字段引用关联字段，关联字段引用另一数据库的汇总...
-- **需确认**：是否有递归深度限制？`rollupFurtherCollections` 参数可能与此相关
+- 两个数据库互相关联不会导致递归渲染
+- `rollupFurtherCollections` 参数用于传递已经渲染过的集合实例，避免重复计算
+- 关联字段的渲染只读取目标数据库的值，不会触发目标数据库的完整渲染流程
+- 因此不存在递归深度问题
 
 ### 8.9 镜像数据库
 
 - 镜像引用同一个 AV JSON，但不同块可设置不同当前视图
-- 修改数据时所有镜像都会反映
-- 修改视图配置时...（需确认：视图配置是数据库级的，所有镜像共享？还是块级有独立视图 ID？）
-
-> **代码证据**：块元素上有 `custom-av-view` 属性（`Constants.CUSTOM_SY_AV_VIEW`），表明每个块可以独立指定当前视图 ID。视图配置本身存储在数据库 JSON 中，是共享的。
+- 修改数据时所有镜像都会反映（共享同一份 JSON）
+- 视图配置是数据库级的（存储在 `views[]` 中），所有镜像共享
+- 但每个块通过 `custom-av-view` 属性指定当前显示哪个视图 ID
+- 因此不同镜像可以显示同一数据库的不同视图
 
 ---
 
 ## 9. 后续调查清单
 
-以下方向值得进一步深入验证，本文档中的相关分析标记为「需确认」。
+以下方向值得进一步深入验证。
 
 ### 9.1 类型切换相关
 
 - [ ] 类型切换后旧值结构是否真的残留？构造测试用例验证 JSON 输出
 - [ ] 类型切换时是否应该清理过滤规则？当前跳过过滤的用户体验是否合理
-- [ ] 排序对类型不匹配的处理：是否也应该降级跳过？
 - [ ] 切回原类型时，旧数据"复活"是预期行为还是 bug？
-- [ ] 本数据库内汇总字段引用的目标字段类型变更时，是否需要清理汇总配置
+- [ ] 封面字段类型切换后，旧 `MAsset` 指针非 nil 时显示过期封面的具体复现条件
 
 ### 9.2 渲染正确性
 
-- [ ] `Filter` 函数中 `values[index]` 为 nil 且类型判断的逻辑是否有 bug（L122 段）
-- [ ] 排序时空值的具体排列顺序（升序时空值在前还是后？降序时呢？）
-- [ ] 模板字段渲染失败的降级策略
-- [ ] 画廊/看板封面字段类型失效时的降级显示
+- [ ] `Filter` 函数 L122 nil 指针解引用 bug 的修复和测试
+- [ ] 模板字段渲染失败的具体降级表现验证
 - [ ] 分组字段值为 nil 时，项目会被分到哪一组？
 
 ### 9.3 性能边界
@@ -897,9 +1004,7 @@ for _, keyValues := range destAv.KeyValues {
 
 ### 9.4 数据一致性
 
-- [ ] 乐观更新失败后的 UI 回滚机制
 - [ ] 双向关联的修改事务是否原子
-- [ ] 关联循环引用的检测与深度限制
 - [ ] `filelock.WriteFile` 的具体实现和重试策略
 
 ### 9.5 版本与兼容性
