@@ -235,9 +235,9 @@ export const normalizeStoragePath = (storageName: string): string | null => {
 - **分支 A（保留斜线）**：当解析后还有路径段时，用 `/` 连接，路径中的斜线被完整保留
 - **分支 B（去斜线）**：当所有段都被 `..` 或忽略后 `resolved` 为空时，返回**原始输入去掉所有 `\` 和 `/`** 的结果（不是保留原字符，而是完全删除斜线）
 
-**25 个输入场景的真实执行结果**（通过 Node.js 运行代码验证）：
+**31 个输入场景的真实执行结果**（通过 Node.js 运行代码 + 对照 `/data/storage/petal/${name}/${normalizeStoragePath(storageName)}` 模板插值验证）：
 
-| 输入 | 输出 | 拼接完整路径 | 是否逃逸 |
+| storageName 输入 | normalize 输出 | 拼接完整路径 | 是否逃逸 |
 |---|---|---|---|
 | `"../../../etc/passwd"` | `"etc/passwd"` | `/data/storage/petal/<name>/etc/passwd` | ❌ |
 | `"../config/siyuan.json"` | `"config/siyuan.json"` | `/data/storage/petal/<name>/config/siyuan.json` | ❌ |
@@ -249,21 +249,45 @@ export const normalizeStoragePath = (storageName: string): string | null => {
 | `"./data/./file.json"` | `"data/file.json"` | `/data/storage/petal/<name>/data/file.json` | ❌ |
 | `"data//file.txt"` | `"data/file.txt"` | `/data/storage/petal/<name>/data/file.txt` | ❌ |
 | `"data/.hidden/config"` | `"data/.hidden/config"` | `/data/storage/petal/<name>/data/.hidden/config` | ❌ |
+| `"data/.hidden/../file"` | `"data/file"` | `/data/storage/petal/<name>/data/file` | ❌ |
 | `"\\..\\win\\path"` | `"win/path"` | `/data/storage/petal/<name>/win/path` | ❌ |
 | `"data\\windows\\path"` | `"data/windows/path"` | `/data/storage/petal/<name>/data/windows/path` | ❌ |
 | `"config/siyuan.json"` | `"config/siyuan.json"` | `/data/storage/petal/<name>/config/siyuan.json` | ❌ |
-| `"."` | `"."` | `/data/storage/petal/<name>.` | ❌ |
+| `"a/"` | `"a"` | `/data/storage/petal/<name>/a` | ❌ |
+| `"/a/"` | `"a"` | `/data/storage/petal/<name>/a` | ❌ |
+| `"//a//"` | `"a"` | `/data/storage/petal/<name>/a` | ❌ |
+| `"a/b/c/../../d"` | `"a/d"` | `/data/storage/petal/<name>/a/d` | ❌ |
+| `"data/file//name.txt"` | `"data/file/name.txt"` | `/data/storage/petal/<name>/data/file/name.txt` | ❌ |
 | `"..."` | `"..."` | `/data/storage/petal/<name>/...` | ❌ |
 | `".config"` | `".config"` | `/data/storage/petal/<name>/.config` | ❌ |
+| `"."` | `"."` | `/data/storage/petal/<name>/.` | ❌ |
+| `"./"` | `"."` | `/data/storage/petal/<name>/.` | ❌ |
+| `"/."` | `"."` | `/data/storage/petal/<name>/.` | ❌ |
+| `"./././"` | `"..."` | `/data/storage/petal/<name>/...` | ❌ |
+| `"/././."` | `"..."` | `/data/storage/petal/<name>/...` | ❌ |
 | `""` | `""` | `/data/storage/petal/<name>/` | ❌ |
 | `"/"` | `""` | `/data/storage/petal/<name>/` | ❌ |
 | `"//"` | `""` | `/data/storage/petal/<name>/` | ❌ |
+| `"///"` | `""` | `/data/storage/petal/<name>/` | ❌ |
+| `"\\\\"` | `""` | `/data/storage/petal/<name>/` | ❌ |
 | `"../.."` | `"...."` | `/data/storage/petal/<name>/....` | ❌ |
 | `"../../.."` | `"......"` | `/data/storage/petal/<name>/......` | ❌ |
 | `"data/../"` | `"data.."` | `/data/storage/petal/<name>/data..` | ❌ |
+| `"/data/../"` | `"data.."` | `/data/storage/petal/<name>/data..` | ❌ |
 | **`".."`** | **`".."`** | **`/data/storage/petal/<name>/..`** | ✅ 上逃逸一级 |
 | **`"/../"`** | **`".."`** | **`/data/storage/petal/<name>/..`** | ✅ 上逃逸一级 |
 | **`"//..//"`** | **`".."`** | **`/data/storage/petal/<name>/..`** | ✅ 上逃逸一级 |
+
+**关键边界场景分类说明**：
+
+| 场景 | 典型输入 | 分支 | 说明 |
+|---|---|---|---|
+| **空路径类** | `""`、`"/"`、`"//"`、`"///"`、`"\\\\"` | B → 空串 | 拼接后多一个尾斜线 `<name>/` |
+| **当前目录类** | `"."`、`"./"`、`"/."` | B → `"."` | 拼接后 `<name>/.`（指向插件目录自身） |
+| **多级点类** | `"./././"`、`"/././."`、`"..."`、`".config"` | B 或 A | 作为文件名处理，不影响目录层级 |
+| **尾斜线类** | `"a/"`、`"/a/"`、`"//a//"` | A | 尾斜线被 split 吃掉，路径无尾斜 |
+| **逃逸类** | `".."`、`"/../"`、`"//..//"` | B → `".."` | 唯一可逃逸一级的输入 |
+| **多级 `..` 类** | `"../.."`、`"../../.."`、`"data/../"` | B | 斜线被完全删除，作为文件名处理，**不会**多级逃逸 |
 
 **安全分析**：
 
