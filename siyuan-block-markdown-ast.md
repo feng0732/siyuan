@@ -67,7 +67,7 @@ Lute 解析器按以下优先级识别块边界（从高到低）：
 
 2. 行首标记识别（行首 0-3 空格后的特殊字符）
    ├── # + 空格          → 标题块 (NodeHeading)
-   ├── ``` / ~~~         → 代码块开始 (NodeCodeBlock)
+   ├── 三反引号 / ~~~    → 代码块开始 (NodeCodeBlock)
    ├── > + 空格          → 引用块 (NodeBlockquote)
    ├── -/*/+ + 空格      → 无序列表项 (NodeListItem, subtype=u)
    ├── 数字 + . + 空格   → 有序列表项 (NodeListItem, subtype=o)
@@ -280,19 +280,22 @@ if nil != srcEmptyList {
 #### 2.2.4 代码块 (CodeBlock → `ast.NodeCodeBlock`)
 
 **Markdown 语法**:
-```markdown
-```go
-package main
 
-func main() {
-    fmt.Println("Hello SiYuan")
-}
-``` {#code-block-id .custom-class}
-```
+使用三反引号 + 语言标识开启围栏，内容原样保留，三反引号关闭围栏：
+
+    ```go
+    package main
+
+    func main() {
+        fmt.Println("Hello SiYuan")
+    }
+    ```
+
+围栏后可附加 IAL 属性，如 `{#code-block-id .custom-class}`。
 
 **拆分规则**:
 1. 围栏代码块（仅在 WYSIWYG 模式下支持）
-2. 行首 0-3 空格 + 连续 3+ 反引号 `` ` `` 或波浪号 `~`
+2. 行首 0-3 空格 + 连续 3 个及以上反引号或波浪号
 3. 开始围栏后可指定语言标识（`go` / `python` 等）
 4. 结束围栏必须与开始围栏字符相同，数量 ≥ 开始围栏
 5. 围栏后 IAL 提取为属性
@@ -303,10 +306,10 @@ func main() {
 &ast.Node{
     Type:              ast.NodeCodeBlock,
     ID:                "20250101120000-code12",
-    CodeBlockMarker:   []byte("```"),       // 开始围栏
-    CodeBlockOpenMarker: []byte("```"),     // 结束围栏
-    CodeBlockInfo:     []byte("go"),        // 语言标识
-    IsFencedCodeBlock: true,                // 是否围栏代码块
+    CodeBlockMarker:   []byte("三反引号"),    // 开始围栏标记
+    CodeBlockOpenMarker: []byte("三反引号"),  // 结束围栏标记
+    CodeBlockInfo:     []byte("go"),          // 语言标识
+    IsFencedCodeBlock: true,                  // 是否围栏代码块
     Tokens:            []byte("package main..."),  // 代码内容（未转义）
     KramdownIAL:       [][]string{
         {"id", "20250101120000-code12"},
@@ -463,7 +466,7 @@ if ast.NodeSuperBlock == node.Type {
 | 斜体 | `em` | `*text*` / `_text_` |
 | 删除线 | `strikethrough` | `~~text~~` |
 | 标记 | `mark` | `==text==` |
-| 行级代码 | `code` | `` `code` `` |
+| 行级代码 | `code` | 用单个反引号包裹 code |
 | 行级公式 | `inline-math` | `$E=mc^2$` |
 | 上标 | `sup` | `^text^` |
 | 下标 | `sub` | `~text~` |
