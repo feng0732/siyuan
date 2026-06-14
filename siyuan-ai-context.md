@@ -277,11 +277,17 @@ func ChatGPTWithAction(ids []string, action string) (ret string) {
 ### 3.5 敏感信息处理边界
 
 #### 敏感信息清单
+
 | 信息 | 存储位置 | 传输方式 |
 |------|----------|----------|
-| `apiKey` | [conf/ai.go](kernel/conf/ai.go) 配置文件，明文存储 | HTTPS 请求头 `Authorization: Bearer <key>` |
-| `UserToken` | 云端会话 Cookie | HTTPS Cookie |
-| 文档块内容 | 工作空间 `.sy` 文件 | HTTPS 请求体 |
+| `apiKey` | **运行时配置文件** `conf/conf.json`，明文存储 | HTTPS 请求头 `Authorization: Bearer <key>` |
+| `UserToken` | 内存中 `Conf.User.UserToken`（`UserData` 加密存储于 `conf/conf.json`） | HTTPS Cookie |
+| 文档块内容 | 工作空间 `.sy` 数据文件 | HTTPS 请求体 |
+
+> **重要区分**：
+> - **结构定义**：[conf/ai.go](kernel/conf/ai.go) 是 Go 源码文件，定义 `AI` 和 `OpenAI` 结构体的字段布局，不含任何用户配置值
+> - **运行时配置**：`conf/conf.json` 是实际的配置文件，JSON 格式，包含用户设置的真实 API Key 等值，路径为 `filepath.Join(util.ConfDir, "conf.json")`
+> - `util.ConfDir` 的值：桌面端为 `~/.siyuan/conf`，移动端为 `WorkspaceDir/conf`
 
 #### 边界分析
 
@@ -300,11 +306,44 @@ ginServer.Handle("POST", "/api/ai/chatGPTWithAction", model.CheckAuth, model.Che
 
 **风险点**:
 - [conf.go](kernel/model/conf.go) L567-L584 中，系统启动时会记录除 API Key 外的所有配置（包含代理地址、模型名等）
-- API Key 明文存储在配置文件中，无加密保护
+- API Key 明文存储在 `conf/conf.json` 运行时配置文件中，无加密保护
 
 ---
 
 ## 4. 设置保存与运行时读取的协作关系
+
+### 4.0 重要概念区分：结构定义 vs 运行时配置
+
+在分析之前，先明确两个容易混淆的概念：
+
+| 概念 | 类型 | 路径 | 内容 |
+|------|------|------|------|
+| **配置结构定义** | Go 源码 | `kernel/conf/ai.go` | 定义 `AI`、`OpenAI` 结构体的字段名称、类型、JSON tag，以及默认值和环境变量加载逻辑。不含任何用户真实配置值。 |
+| **运行时配置文件** | JSON 文件 | `filepath.Join(util.ConfDir, "conf.json")` | 实际存储用户设置的文件，包含真实的 API Key 等敏感数据。桌面端路径通常为 `~/.siyuan/conf/conf.json`，移动端为 `WorkspaceDir/conf/conf.json`。 |
+
+**`conf.json` 中 AI 配置的实际存储格式**（JSON 片段）：
+```json
+{
+  "ai": {
+    "openAI": {
+      "apiKey": "sk-xxxxxxxxxxxxxxxxxxxx",
+      "apiTimeout": 30,
+      "apiProxy": "socks5://127.0.0.1:1080",
+      "apiModel": "gpt-4-turbo",
+      "apiMaxTokens": 0,
+      "apiTemperature": 1.0,
+      "apiMaxContexts": 7,
+      "apiBaseURL": "https://api.openai.com/v1",
+      "apiUserAgent": "SiYuan/3.0.15",
+      "apiProvider": "OpenAI",
+      "apiVersion": ""
+    }
+  }
+}
+```
+字段名与 [conf/ai.go](kernel/conf/ai.go) 中结构体的 `json` tag 一一对应。
+
+---
 
 ### 4.1 配置全生命周期
 
@@ -844,7 +883,7 @@ kernel 启动 → InitConf() [model/conf.go L123]
 
 | 风险 | 等级 | 说明 | 代码位置 |
 |------|------|------|----------|
-| API Key 明文存储 | ⚠️ 中 | 配置文件中明文保存，无加密 | [conf/ai.go](kernel/conf/ai.go) L33 |
+| API Key 明文存储 | ⚠️ 中 | `conf/conf.json` 中明文保存，无加密。配置文件路径为 `filepath.Join(util.ConfDir, "conf.json")`，未做任何加密或权限控制 | [model/conf.go](kernel/model/conf.go) L878-L899 |
 | 全局上下文泄漏 | ⚠️ 高 | `cachedContextMsg` 全局单例，多用户环境下上下文交叉污染 | [model/ai.go](kernel/model/ai.go) L54 |
 | 文档内容外泄 | ⚠️ 高 | 用户文档内容直接发送给第三方 AI，无脱敏选项 | [getBlocksContent()](kernel/model/ai.go) |
 | 无速率限制 | ⚠️ 中 | API 端点无速率限制，可能导致意外高额费用 | [api/ai.go](kernel/api/ai.go) |
