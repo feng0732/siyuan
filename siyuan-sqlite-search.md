@@ -54,9 +54,26 @@ SiYuan（思源笔记）采用 **SQLite + FTS5 全文搜索引擎** 作为核心
 CREATE TABLE blocks (
   id, parent_id, root_id, hash, box, path, hpath,
   name, alias, memo, tag, content, fcontent, markdown,
-  length, subtype, ial, sort, created, updated
+  length, type, subtype, ial, sort, created, updated
 );
 ```
+
+共 21 个字段，其中 `type` 存储块类型的缩写（如 `d`=文档、`h`=标题、`p`=段落），`sort` 存储块类型排序码（由 `nSort()` 函数生成，见下表），`fcontent` 存储容器块的首叶子块内容（用于列表项搜索）。
+
+**`sort` 字段值（`nSort()` 函数）**：
+
+| sort 值 | 块类型 | type 缩写 |
+|---------|--------|----------|
+| 0 | Document 文档 | `d` |
+| 5 | Heading 标题 | `h` |
+| 10 | Paragraph / CodeBlock / MathBlock / Table / HTMLBlock | `p`/`c`/`m`/`t`/`html` |
+| 20 | List / ListItem / Blockquote / Callout | `l`/`i`/`b`/`callout` |
+| 30 | SuperBlock / AttributeView | `s`/`av` |
+| 100 | 其他未列出的块类型 | — |
+| 200 | Text / TextMark（非标签） | `text`/`textmark` |
+| 205 | TextMark 标签 | `textmark`(tag) |
+
+此排序码在所有 ORDER BY 子句中作为 CASE 之后的二级排序依据，确保同权重的块按类型优先级排列（文档 > 标题 > 段落 > 列表 > 超级块 > 其他）。
 
 **B-Tree 索引配置**：
 
@@ -79,22 +96,26 @@ CREATE TABLE blocks (
 ```sql
 -- 大小写敏感
 CREATE VIRTUAL TABLE blocks_fts USING fts5(
-  id UNINDEXED, parent_id UNINDEXED, ...,
-  name, alias, memo, tag, content, fcontent, ial, ...
+  id UNINDEXED, parent_id UNINDEXED, root_id UNINDEXED, hash UNINDEXED,
+  box UNINDEXED, path UNINDEXED, hpath UNINDEXED,
+  name, alias, memo, tag, content, fcontent,
+  markdown UNINDEXED, length UNINDEXED, type UNINDEXED, subtype UNINDEXED,
+  ial, sort UNINDEXED, created UNINDEXED, updated UNINDEXED,
   tokenize="siyuan"
 );
 
 -- 大小写不敏感（默认）
 CREATE VIRTUAL TABLE blocks_fts_case_insensitive USING fts5(
-  ...,
+  ...同上...,
   tokenize="siyuan case_insensitive"
 );
 ```
 
 **设计要点**：
 - 使用 SiYuan 自研的 `siyuan` tokenizer 分词器（支持中文切分）
-- 大量字段标记为 `UNINDEXED`（id/parent_id/root_id/hash/box/path 等 13 个字段），仅对检索相关列构建倒排索引，显著降低存储开销
-- 可索引列：`name`, `alias`, `memo`, `tag`, `content`, `fcontent`, `ial`（共 7 列）
+- **UNINDEXED 字段（13 个）**：`id, parent_id, root_id, hash, box, path, hpath, markdown, length, type, subtype, sort, created, updated` — 这些列仅存储于 FTS5 内容表中，不参与倒排索引构建
+- **可索引列（7 个）**：`name, alias, memo, tag, content, fcontent, ial` — 仅这 7 列构建倒排索引，参与 MATCH 查询和 snippet/highlight 高亮
+- FTS5 列按建表顺序编号（从 0 起），snippet 中引用的索引号对应：0=id, 1=parent_id, 2=root_id, 3=hash, 4=box, 5=path, 6=hpath, 7=name, 8=alias, 9=memo, 10=tag, 11=content, 12=fcontent, 13=markdown, 14=length, 15=type, 16=subtype, 17=ial, 18=sort, 19=created, 20=updated
 - 搜索时根据 `Conf.Search.CaseSensitive` 动态选择目标表
 
 **历史库与资源库 FTS5 表**：
@@ -299,19 +320,46 @@ if 2 > len(strings.Split(strings.TrimSpace(query), " ")) {
 SELECT
   id, parent_id, root_id, hash, box, path,
   snippet(blocks_fts_case_insensitive, 6, '__@mark__', '__mark@__', '...', 512) AS hpath,
-  snippet(..., 7, ...) AS name,   -- alias/memo/tag/content 共 7 列高亮
+  snippet(..., 7, ...) AS name,   -- 8=alias, 9=memo, 10=tag, 11=content
   fcontent, markdown, length, type, subtype, ial, sort, created, updated
 FROM blocks_fts_case_insensitive
 WHERE (blocks_fts_case_insensitive MATCH '{content name alias memo tag}:("关键词")')
-  AND type IN ('d','h','c','m','t','html','av','p')  -- TypeFilter()
+  AND type IN ('d','h','c','m','t','html','av','p')  -- TypeFilter()，默认开启的类型
   AND (box = 'box1' OR box = 'box2')                  -- 笔记本过滤
   AND (path LIKE 'path1%' OR path LIKE 'path2%')      -- 路径过滤
 ORDER BY CASE WHEN name='kw' THEN 10 ... END          -- 自定义排序
 LIMIT 32 OFFSET 0
 ```
 
+**`type` 字段缩写对照表**（由 `treenode.TypeAbbr()` 生成）：
+
+| AST 节点类型 | 缩写 | 默认开启搜索 |
+|-------------|------|------------|
+| NodeDocument | `d` | ✓ |
+| NodeHeading | `h` | ✓ |
+| NodeList | `l` | ✗ |
+| NodeListItem | `i` | ✗ |
+| NodeCodeBlock | `c` | ✓ |
+| NodeMathBlock | `m` | ✓ |
+| NodeTable | `t` | ✓ |
+| NodeBlockquote | `b` | ✗ |
+| NodeSuperBlock | `s` | ✗ |
+| NodeParagraph | `p` | ✓ |
+| NodeHTMLBlock | `html` | ✓ |
+| NodeBlockQueryEmbed | `query_embed` | ✗ |
+| NodeAttributeView | `av` | ✓ |
+| NodeIFrame | `iframe` | ✗ |
+| NodeWidget | `widget` | ✗ |
+| NodeAudio | `audio` | ✗ |
+| NodeVideo | `video` | ✗ |
+| NodeCallout | `callout` | ✗ |
+
+注意：引用搜索排序 CASE 中的 `type = 'd'`（文档块）、`type = 'h'`（标题块）、`type = 'i'`（列表项块）、`type != 'l'`（排除列表块）均使用此缩写体系。
+
 **`snippet()` 函数**：FTS5 内置，返回含高亮片段的文本，参数为：
-- 表名、列索引、左标记、右标记、省略符、每片段最大长度（512 字符）
+- 表名、列索引号、左标记、右标记、省略符、每片段最大token数
+- 普通搜索使用 snippet 长度 512（hpath/name/alias/memo/content）和 64（tag）
+- 引用搜索全部使用 snippet 长度 64
 
 ### 4.3 多关键词文档模式（LIKE + GROUP_CONCAT）
 
@@ -456,20 +504,20 @@ ORDER BY (docContent LIKE '%kw1%') + (docContent LIKE '%kw2%') DESC, MAX(updated
 
 ```sql
 ORDER BY CASE
-  WHEN name = '${keyword}'                        THEN 10
-  WHEN alias = '${keyword}'                       THEN 20
-  WHEN memo = '${keyword}'                        THEN 30
-  WHEN content = '${keyword}' AND type = 'd'      THEN 40
-  WHEN content LIKE '%${keyword}%' AND type = 'd' THEN 41
-  WHEN name LIKE '%${keyword}%'                   THEN 50
-  WHEN alias LIKE '%${keyword}%'                  THEN 60
-  WHEN content = '${keyword}' AND type = 'h'      THEN 70
-  WHEN content LIKE '%${keyword}%' AND type = 'h' THEN 71
-  WHEN fcontent = '${keyword}' AND type = 'i'     THEN 80
-  WHEN fcontent LIKE '%${keyword}%' AND type = 'i'THEN 81
-  WHEN memo LIKE '%${keyword}%'                   THEN 90
+  WHEN name = '${keyword}'                        THEN 10   -- 命名精确匹配
+  WHEN alias = '${keyword}'                       THEN 20   -- 别名精确匹配
+  WHEN memo = '${keyword}'                        THEN 30   -- 备注精确匹配
+  WHEN content = '${keyword}' AND type = 'd'      THEN 40   -- 文档块内容精确匹配（d=NodeDocument）
+  WHEN content LIKE '%${keyword}%' AND type = 'd' THEN 41   -- 文档块内容模糊匹配
+  WHEN name LIKE '%${keyword}%'                   THEN 50   -- 命名模糊匹配
+  WHEN alias LIKE '%${keyword}%'                  THEN 60   -- 别名模糊匹配
+  WHEN content = '${keyword}' AND type = 'h'      THEN 70   -- 标题块内容精确匹配（h=NodeHeading）
+  WHEN content LIKE '%${keyword}%' AND type = 'h' THEN 71   -- 标题块内容模糊匹配
+  WHEN fcontent = '${keyword}' AND type = 'i'     THEN 80   -- 列表项首块精确匹配（i=NodeListItem）
+  WHEN fcontent LIKE '%${keyword}%' AND type = 'i'THEN 81   -- 列表项首块模糊匹配
+  WHEN memo LIKE '%${keyword}%'                   THEN 90   -- 备注模糊匹配
   WHEN content LIKE '%${keyword}%'
-    AND type != 'i' AND type != 'l'               THEN 100
+    AND type != 'i' AND type != 'l'               THEN 100  -- 普通块内容模糊匹配（排除列表项和列表容器）
   ELSE 65535
 END ASC,
 sort ASC,
@@ -482,7 +530,7 @@ length ASC
 |---------|-------------------|---------|
 | CASE 层数 | 4 层 | 12 层 |
 | 涉及字段 | name, alias | name, alias, memo, content, fcontent |
-| 类型感知 | 无 | 有（d/h/i 类型分层） |
+| 类型感知 | 无 | 有（`d`=文档/`h`=标题/`i`=列表项 三层类型分层） |
 | 精确 vs 模糊 | name/alias 各一层 | 每字段精确+模糊两层 |
 | 三级排序 | sort → updated | sort → **length** |
 | 输出限制 | 分页 LIMIT+OFFSET | 单一 LIMIT（`Conf.Search.Limit`） |
@@ -547,7 +595,7 @@ length ASC
 | 普通-单关键词(FTS) | CASE 4层(name/alias) + sort + updated | `rank DESC` (BM25升序) | `rank` (BM25降序) | sort→updated |
 | 普通-多关键词(LIKE) | CASE 4层 + blockSort + sort + updated | 降级为CASE+blockSort ASC | 降级为CASE+blockSort DESC | blockSort→sort→updated |
 | 查询语法(FTS) | CASE 4层(query原文) + sort + updated | `rank DESC` | `rank` | sort→updated |
-| 引用搜索 | **CASE 12层**(含content/type/fcontent) + sort + length | N/A(固定CASE排序) | N/A | sort→length |
+| 引用搜索 | **CASE 12层**(含content/`d`/`h`/`i`类型/fcontent) + sort + length | N/A(固定CASE排序) | N/A | sort→length |
 | 正则(blocks表) | CASE 4层 + sort + updated | 降级为sort DESC,updated DESC | 降级为sort ASC,updated DESC | sort→updated |
 | SQL(自定义) | 用户SQL自带 | 用户SQL自带 | 用户SQL自带 | 由用户SQL决定 |
 
