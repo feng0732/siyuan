@@ -47,9 +47,9 @@ SiYuan 的块级 Markdown 解析体系采用 **三层解析 + 一层编排** 的
 | **AST Tree → Block DOM** | `RenderNodeBlockDOM()` | `ast.Node` → `ProtyleRenderer` → `HTML(Block DOM)` |
 
 **代码参考**:
-- Lute 引擎配置: [util/lute.go](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/util/lute.go)
-- Markdown 导入入口: [model/file.go#L1018-L1042](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/model/file.go#L1018-L1042)
-- 文档创建核心: [model/file.go#L1744-L1859](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/model/file.go#L1744-L1859)
+- Lute 引擎配置: [kernel/util/lute.go](kernel/util/lute.go)
+- Markdown 导入入口: [kernel/model/file.go#L1018-L1042](kernel/model/file.go#L1018-L1042)
+- 文档创建核心: [kernel/model/file.go#L1744-L1859](kernel/model/file.go#L1744-L1859)
 
 ---
 
@@ -101,7 +101,7 @@ Lute 解析器按以下优先级识别块边界（从高到低）：
 | 段落首空格 | 忽略 | **保留**（`SetParagraphBeginningSpace(true)`） |
 | 自动空格 | 中英文间插空格 | **禁用** |
 
-**代码参考**: [util/lute.go#L50-L88](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/util/lute.go#L50-L88)
+**代码参考**: [util/lute.go#L50-L88](kernel/util/lute.go#L50-L88)
 
 ---
 
@@ -142,9 +142,9 @@ Lute 解析器按以下优先级识别块边界（从高到低）：
 ```
 
 **应用层处理**:
-- 创建空文档时自动补空段落 → [treenode/tree.go#L77-L80](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/treenode/tree.go#L77-L80)
+- 创建空文档时自动补空段落 → [kernel/treenode/tree.go#L77-L80](kernel/treenode/tree.go#L77-L80)
 - 折叠标题下方子块移动 → `MoveFoldHeading()`
-- 标题层级变化触发展开/插入逻辑 → [model/transaction.go#L1514-L1556](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/model/transaction.go#L1514-L1556)
+- 标题层级变化触发展开/插入逻辑 → [kernel/model/transaction.go#L1514-L1556](kernel/model/transaction.go#L1514-L1556)
 
 ---
 
@@ -178,7 +178,7 @@ Lute 解析器按以下优先级识别块边界（从高到低）：
 }
 ```
 
-**应用层特殊处理** ([model/file.go#L1823-L1853](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/model/file.go#L1823-L1853)):
+**应用层特殊处理** ([kernel/model/file.go#L1823-L1853](kernel/model/file.go#L1823-L1853)):
 - 段落中仅包含 `.mp3` 链接 → 自动转换为 `NodeAudio` 块
 - 段落中仅包含 `.mp4` 链接 → 自动转换为 `NodeVideo` 块
 - 空文档自动补空段落 → `NewParagraph("")`
@@ -197,7 +197,7 @@ func NewParagraph(id string) (ret *ast.Node) {
 }
 ```
 
-**代码参考**: [treenode/tree.go#L116-L125](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/treenode/tree.go#L116-L125)
+**代码参考**: [kernel/treenode/tree.go#L116-L125](kernel/treenode/tree.go#L116-L125)
 
 ---
 
@@ -232,12 +232,12 @@ NodeList (l, subtype=u/o/t)
     └── 内容节点 (Paragraph / CodeBlock / 嵌套 List ...)
 ```
 
-**子类型缩写**: [treenode/node.go#L416-L427](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/treenode/node.go#L416-L427)
+**子类型缩写**: [kernel/treenode/node.go#L416-L427](kernel/treenode/node.go#L416-L427)
 - `u` = Unordered (无序)
 - `o` = Ordered (有序)
 - `t` = Task (任务)
 
-**应用层容器约束** ([model/transaction.go#L687-L703](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/model/transaction.go#L687-L703)):
+**应用层容器约束** ([kernel/model/transaction.go#L687-L703](kernel/model/transaction.go#L687-L703)):
 
 插入块到列表时的强制规则：
 ```go
@@ -273,7 +273,7 @@ if nil != srcEmptyList {
 }
 ```
 
-**代码参考**: [model/transaction.go#L869-L915](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/model/transaction.go#L869-L915)
+**代码参考**: [kernel/model/transaction.go#L869-L915](kernel/model/transaction.go#L869-L915)
 
 ---
 
@@ -393,7 +393,7 @@ func escapeNodeAttributeValues(node *ast.Node) (escaped bool) {
 }
 ```
 
-**代码参考**: [filesys/tree.go#L494-L507](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/filesys/tree.go#L494-L507)
+**代码参考**: [kernel/filesys/tree.go#L494-L507](kernel/filesys/tree.go#L494-L507)
 
 ---
 
@@ -422,7 +422,7 @@ func escapeNodeAttributeValues(node *ast.Node) (escaped bool) {
 4. 结束后 IAL 合并到超级块节点
 5. 内部块按标准块规则递归解析
 
-**应用层插入规则** ([model/transaction.go#L704-L710](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/model/transaction.go#L704-L710)):
+**应用层插入规则** ([kernel/model/transaction.go#L704-L710](kernel/model/transaction.go#L704-L710)):
 ```go
 if ast.NodeSuperBlock == node.Type {
     // 超级块插入需跳过布局标记节点
@@ -455,7 +455,7 @@ if ast.NodeSuperBlock == node.Type {
 | 音频块 | `audio` | `.mp3` 链接段落 | `Tokens: <audio> HTML` |
 | 文档根 (Document) | `d` | 整个 `.sy` 文件 | `Spec: "2"`, `Box`, `Path`, `HPath` |
 
-**完整类型映射表**: [treenode/node.go#L370-L398](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/treenode/node.go#L370-L398)
+**完整类型映射表**: [kernel/treenode/node.go#L370-L398](kernel/treenode/node.go#L370-L398)
 
 ---
 
@@ -533,13 +533,13 @@ if ast.NodeParagraph == n.Type {
 }
 ```
 
-**代码参考**: [model/file.go#L1823-L1853](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/model/file.go#L1823-L1853)
+**代码参考**: [kernel/model/file.go#L1823-L1853](kernel/model/file.go#L1823-L1853)
 
 ---
 
 #### 3.2.2 业务校验 (Business Validation)
 
-**文档级校验** ([model/file.go#L1744-L1804](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/model/file.go#L1744-L1804)):
+**文档级校验** ([kernel/model/file.go#L1744-L1804](kernel/model/file.go#L1744-L1804)):
 
 | 校验项 | 规则 | 失败处理 |
 |-------|------|---------|
@@ -551,7 +551,7 @@ if ast.NodeParagraph == n.Type {
 | 文件存在 | 目标 `.sy` 不能已存在 | 返回语言 (1) |
 | 标题规范化 | 移除 `/`、非法字符、ZWJ 保护 | 自动修正 |
 
-**事务级校验** ([model/transaction.go#doUpdate](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/model/transaction.go#L1410-L1594)):
+**事务级校验** ([kernel/model/transaction.go#doUpdate](kernel/model/transaction.go#L1410-L1594)):
 
 | 校验项 | 规则 | 失败处理 |
 |-------|------|---------|
@@ -591,7 +591,7 @@ tx.commit()          → 写 .sy 文件 / 写 SQLite / 写 FTS 索引 / 推送 W
 tx.state = 完成
 ```
 
-**代码参考**: [model/transaction.go#L148-L247](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/model/transaction.go#L148-L247)
+**代码参考**: [kernel/model/transaction.go#L148-L247](kernel/model/transaction.go#L148-L247)
 
 ---
 
@@ -678,7 +678,7 @@ Step 6: 事务提交
   └─ 建立排序索引
 ```
 
-**代码参考**: [model/file.go#L1018-L1042](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/model/file.go#L1018-L1042)
+**代码参考**: [kernel/model/file.go#L1018-L1042](kernel/model/file.go#L1018-L1042)
 
 ---
 
@@ -731,9 +731,9 @@ Step 8: 修复持久化（needFix = true 时）
 ```
 
 **代码参考**:
-- 加载入口: [filesys/tree.go#L398-L456](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/filesys/tree.go#L398-L456)
-- XSS 修复: [filesys/tree.go#L474-L508](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/filesys/tree.go#L474-L508)
-- 版本升级: [treenode/tree.go#L158-L192](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/treenode/tree.go#L158-L192)
+- 加载入口: [kernel/filesys/tree.go#L398-L456](kernel/filesys/tree.go#L398-L456)
+- XSS 修复: [kernel/filesys/tree.go#L474-L508](kernel/filesys/tree.go#L474-L508)
+- 版本升级: [kernel/treenode/tree.go#L158-L192](kernel/treenode/tree.go#L158-L192)
 
 ---
 
@@ -797,13 +797,13 @@ Step 9: 原子替换 + 元数据
   └─ 提交时统一写入（管道 1-2-3）
 ```
 
-**代码参考**: [model/transaction.go#L1410-L1594](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/model/transaction.go#L1410-L1594)
+**代码参考**: [kernel/model/transaction.go#L1410-L1594](kernel/model/transaction.go#L1410-L1594)
 
 ---
 
 ### 4.3 事务执行级别的异常分类处理
 
-**位置**: [model/transaction.go#L83-L125](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/model/transaction.go#L83-L125)
+**位置**: [kernel/model/transaction.go#L83-L125](kernel/model/transaction.go#L83-L125)
 
 ```go
 func flushTx(tx *Transaction) {
@@ -851,7 +851,7 @@ func flushTx(tx *Transaction) {
 }
 ```
 
-**Panic 恢复（内层）** ([model/transaction.go#L168-L178](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/model/transaction.go#L168-L178)):
+**Panic 恢复（内层）** ([kernel/model/transaction.go#L168-L178](kernel/model/transaction.go#L168-L178)):
 ```go
 defer func() {
     if e := recover(); nil != e {
@@ -923,7 +923,7 @@ indexTreeInFilesystem() 从文件系统恢复
 | `NodeText` | `ast.NodeText` | `text`（行级） |
 | `NodeTextMark` | `ast.NodeTextMark` | `textmark`（行级） |
 
-**代码参考**: [treenode/node.go#L370-L414](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/treenode/node.go#L370-L414)
+**代码参考**: [kernel/treenode/node.go#L370-L414](kernel/treenode/node.go#L370-L414)
 
 ### 5.2 双 Lute 引擎对比
 
@@ -940,26 +940,26 @@ indexTreeInFilesystem() 从文件系统恢复
 | `SetBlockRef` | **true** | - |
 | `SetSuperBlock` | **true** | - |
 
-**代码参考**: [util/lute.go#L50-L115](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/util/lute.go#L50-L115)
+**代码参考**: [util/lute.go#L50-L115](kernel/util/lute.go#L50-L115)
 
 ### 5.3 关键代码路径速查
 
 | 功能 | 文件 | 行号 |
 |-----|------|-----|
-| Lute 初始化 | [util/lute.go](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/util/lute.go) | L50-L115 |
-| Markdown → 文档 | [model/file.go](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/model/file.go) | L1018-L1042 |
-| 文档创建核心 | [model/file.go](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/model/file.go) | L1744-L1859 |
-| 块更新 doUpdate | [model/transaction.go](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/model/transaction.go) | L1410-L1594 |
-| 列表插入约束 | [model/transaction.go](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/model/transaction.go) | L687-L703 |
-| 超级块插入规则 | [model/transaction.go](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/model/transaction.go) | L704-L710 |
-| 事务执行错误分类 | [model/transaction.go](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/model/transaction.go) | L83-L125 |
-| 类型缩写映射 | [treenode/node.go](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/treenode/node.go) | L370-L414 |
-| 空段落创建 | [treenode/tree.go](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/treenode/tree.go) | L116-L125 |
-| 文件加载+修复 | [filesys/tree.go](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/filesys/tree.go) | L398-L456 |
-| XSS 属性修复 | [filesys/tree.go](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/filesys/tree.go) | L474-L508 |
-| 版本兼容性 | [treenode/tree.go](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/treenode/tree.go) | L139-L192 |
-| 前端事务队列 | [transaction.ts](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/app/src/protyle/wysiwyg/transaction.ts) | L64-L275 |
-| HTML→BlockDOM API | [api/lute.go](file:///d:/fz/0601/solo-dogfeeding/code/283-siyuan/kernel/api/lute.go) | L78-L202 |
+| Lute 初始化 | [kernel/util/lute.go](kernel/util/lute.go) | L50-L115 |
+| Markdown → 文档 | [kernel/model/file.go](kernel/model/file.go) | L1018-L1042 |
+| 文档创建核心 | [kernel/model/file.go](kernel/model/file.go) | L1744-L1859 |
+| 块更新 doUpdate | [kernel/model/transaction.go](kernel/model/transaction.go) | L1410-L1594 |
+| 列表插入约束 | [kernel/model/transaction.go](kernel/model/transaction.go) | L687-L703 |
+| 超级块插入规则 | [kernel/model/transaction.go](kernel/model/transaction.go) | L704-L710 |
+| 事务执行错误分类 | [kernel/model/transaction.go](kernel/model/transaction.go) | L83-L125 |
+| 类型缩写映射 | [kernel/treenode/node.go](kernel/treenode/node.go) | L370-L414 |
+| 空段落创建 | [kernel/treenode/tree.go](kernel/treenode/tree.go) | L116-L125 |
+| 文件加载+修复 | [kernel/filesys/tree.go](kernel/filesys/tree.go) | L398-L456 |
+| XSS 属性修复 | [kernel/filesys/tree.go](kernel/filesys/tree.go) | L474-L508 |
+| 版本兼容性 | [kernel/treenode/tree.go](kernel/treenode/tree.go) | L139-L192 |
+| 前端事务队列 | [app/src/protyle/wysiwyg/transaction.ts](app/src/protyle/wysiwyg/transaction.ts) | L64-L275 |
+| HTML→BlockDOM API | [kernel/api/lute.go](kernel/api/lute.go) | L78-L202 |
 
 ---
 
