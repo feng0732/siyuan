@@ -216,19 +216,80 @@ export const normalizeStoragePath = (storageName: string): string | null => {
         // 空字符串和 "." 被静默忽略
     }
     return resolved.length > 0
-        ? resolved.join("/")
-        : storageName.replace(/[\/\\]+/g, "");  // 全部被消除时回退：去斜线保原值
+        ? resolved.join("/")           // 分支 A：有路径段，保留斜线
+        : storageName.replace(/[\/\\]+/g, "");  // 分支 B：无路径段，去掉所有斜线
 };
 ```
 
+**核心执行流程分析**：
+
+| 步骤 | 操作 | 说明 |
+|---|---|---|
+| 1 | `replace(/\\/g, "/")` | Windows 反斜杠统一转为正斜杠 |
+| 2 | `split("/")` | 按正斜杠分割成数组，连续/前导/尾部斜线产生空字符串 |
+| 3 | 遍历 `parts` | 栈算法解析路径：<br>- `part === ".."` 且 `resolved.length > 0` → `pop`<br>- `part === ".."` 且 `resolved.length === 0` → 忽略（不报错）<br>- `part` 非空且 `!== "."` → `push`<br>- 空字符串或 `"."` → 静默忽略 |
+| 4 | 返回分支判断 | `resolved.length > 0` → `resolved.join("/")`<br>`resolved.length === 0` → `storageName.replace(/[\/\\]+/g, "")` |
+
+**关键分支说明**：
+
+- **分支 A（保留斜线）**：当解析后还有路径段时，用 `/` 连接，路径中的斜线被完整保留
+- **分支 B（去斜线）**：当所有段都被 `..` 或忽略后 `resolved` 为空时，返回**原始输入去掉所有 `\` 和 `/`** 的结果（不是保留原字符，而是完全删除斜线）
+
+**25 个输入场景的真实执行结果**（通过 Node.js 运行代码验证）：
+
+| 输入 | 输出 | 拼接完整路径 | 是否逃逸 |
+|---|---|---|---|
+| `"../../../etc/passwd"` | `"etc/passwd"` | `/data/storage/petal/<name>/etc/passwd` | ❌ |
+| `"../config/siyuan.json"` | `"config/siyuan.json"` | `/data/storage/petal/<name>/config/siyuan.json` | ❌ |
+| `"subdir/../file.txt"` | `"file.txt"` | `/data/storage/petal/<name>/file.txt` | ❌ |
+| `"a/b/c/../../d/e/f"` | `"a/d/e/f"` | `/data/storage/petal/<name>/a/d/e/f` | ❌ |
+| `"a/../b/../../c"` | `"c"` | `/data/storage/petal/<name>/c` | ❌ |
+| `"./data/file.json"` | `"data/file.json"` | `/data/storage/petal/<name>/data/file.json` | ❌ |
+| `"/../../etc/passwd"` | `"etc/passwd"` | `/data/storage/petal/<name>/etc/passwd` | ❌ |
+| `"./data/./file.json"` | `"data/file.json"` | `/data/storage/petal/<name>/data/file.json` | ❌ |
+| `"data//file.txt"` | `"data/file.txt"` | `/data/storage/petal/<name>/data/file.txt` | ❌ |
+| `"data/.hidden/config"` | `"data/.hidden/config"` | `/data/storage/petal/<name>/data/.hidden/config` | ❌ |
+| `"\\..\\win\\path"` | `"win/path"` | `/data/storage/petal/<name>/win/path` | ❌ |
+| `"data\\windows\\path"` | `"data/windows/path"` | `/data/storage/petal/<name>/data/windows/path` | ❌ |
+| `"config/siyuan.json"` | `"config/siyuan.json"` | `/data/storage/petal/<name>/config/siyuan.json` | ❌ |
+| `"."` | `"."` | `/data/storage/petal/<name>.` | ❌ |
+| `"..."` | `"..."` | `/data/storage/petal/<name>/...` | ❌ |
+| `".config"` | `".config"` | `/data/storage/petal/<name>/.config` | ❌ |
+| `""` | `""` | `/data/storage/petal/<name>/` | ❌ |
+| `"/"` | `""` | `/data/storage/petal/<name>/` | ❌ |
+| `"//"` | `""` | `/data/storage/petal/<name>/` | ❌ |
+| `"../.."` | `"...."` | `/data/storage/petal/<name>/....` | ❌ |
+| `"../../.."` | `"......"` | `/data/storage/petal/<name>/......` | ❌ |
+| `"data/../"` | `"data.."` | `/data/storage/petal/<name>/data..` | ❌ |
+| **`".."`** | **`".."`** | **`/data/storage/petal/<name>/..`** | ✅ 上逃逸一级 |
+| **`"/../"`** | **`".."`** | **`/data/storage/petal/<name>/..`** | ✅ 上逃逸一级 |
+| **`"//..//"`** | **`".."`** | **`/data/storage/petal/<name>/..`** | ✅ 上逃逸一级 |
+
 **安全分析**：
 
-1. **防穿越机制**：遇到 `..` 时执行 `resolved.pop()`，阻止目录层级回退。但注意：
-   - **`..` 过多时静默吃掉**：如果 `storageName` 为 `../../../etc/passwd`，所有 `..` 都会 pop 但 resolved 为空，最终返回 `etcpasswd`（去斜线后），不会逃出根目录
-   - **不抛异常**：穿越攻击路径被"压平"而非报错，调用方无法区分合法路径和攻击路径
-2. **路径分隔符统一**：`\` → `/`，确保 Windows 反斜杠也被正确处理
-3. **空路径回退**：当 resolved 为空时返回 `storageName.replace(/[\/\\]+/g, "")`，即去掉所有斜线后的原始输入。这种回退策略在极端情况下可能产生非预期结果（如输入 `".."` → resolved 为空 → 返回空字符串...但实际上 `resolved.pop()` 不会报错但也不 push，最终 resolved 为空 → 返回 `..` 去斜线后仍然是 `..`）
+1. **防穿越机制**：对 `".."` 做栈式处理，大多数穿越路径被有效压平，如 `"../../../etc/passwd"` → `"etc/passwd"`（**保留斜线**，不是之前误以为的 `"etcpasswd"`）
+2. **分支 B 回退策略的真正风险**：当 `resolved.length === 0` 时，执行 `storageName.replace(/[\/\\]+/g, "")`，将所有斜线（`/` 和 `\`）**完全删除**（不是保留原字符）。因此：
+   - `"../.."` → 去掉 `/` → `".." + ".."` = `"...."`（4 个点，不逃逸，作为文件名处理）
+   - `"../../.."` → 去掉 `/` → `"......"`（6 个点，不逃逸）
+   - `"data/../"` → 去掉 `/` → `"data" + ".."` = `"data.."`（不逃逸，作为文件名处理）
+   - 只有 **`".."`、`"/../"`、`"//..//"` 等去掉斜线后恰好等于 `".."`** 的输入，才会产生最终路径 `"/data/storage/petal/<name>/.."`，可向上逃逸到 `"/data/storage/petal"` 目录
+3. **不抛异常**：穿越路径被静默压平而非报错，调用方无法区分合法路径和被压平的攻击路径
 4. **后端二次校验**：内核的 `/api/file/getFile` 和 `/api/file/putFile` 会校验路径合法性（基于工作空间根目录），即使前端规范化有缺陷，后端也应拦截逃逸路径
+
+**路径处理细节验证**：
+
+- 输入 `"../../../etc/passwd"`：
+  - `parts = ["..", "..", "..", "etc", "passwd"]`
+  - 3 个 `".."` 因 `resolved` 为空被忽略 → `resolved = ["etc", "passwd"]`
+  - `resolved.length > 0` → 分支 A → `return "etc/passwd"` ✔️ 保留斜线
+- 输入 `".."`：
+  - `parts = [".."]`
+  - `".."` 因 `resolved` 为空被忽略 → `resolved = []`
+  - `resolved.length === 0` → 分支 B → `"..".replace(/[\/\\]+/g, "")` → `".."` ✔️ 斜线已不存在，返回原值
+- 输入 `"../.."`：
+  - `parts = ["..", ".."]`
+  - 两个 `".."` 都被忽略 → `resolved = []`
+  - 分支 B → `"../..".replace(/[\/\\]+/g, "")` → `"...."` ✔️ 斜线被完全删除，两个 `".."` 连在一起
 
 ### 3.3 暴露的 API 对象
 
@@ -693,12 +754,13 @@ requireFunc.__proto__ = window.require
 
 插件可通过 `Object.getPrototypeOf(requireFunc)("child_process")` 直接调用 Electron 原生 `require`，绕过白名单访问任意 Node 模块。
 
-#### 风险 3：`normalizeStoragePath` 防穿越的边界情况
+#### 风险 3：`normalizeStoragePath` 回退策略的一级逃逸漏洞
 
-[pathName.ts:730-742](file:///d:/fz/0601/solo-dogfeeding/code/287-siyuan/app/src/util/pathName.ts#L730-L742) 路径穿越防护存在以下边界：
+[pathName.ts:730-742](file:///d:/fz/0601/solo-dogfeeding/code/287-siyuan/app/src/util/pathName.ts#L730-L742) 路径穿越防护存在以下真实边界：
 
-- 纯 `..` 输入（如 `"../../etc/passwd"`）会被压平为 `etcpasswd`，不逃逸但也不报错
-- 回退策略 `storageName.replace(/[\/\\]+/g, "")` 在极端输入下可能产生非预期结果
+- 大多数穿越路径被有效压平：`"../../../etc/passwd"` → `"etc/passwd"`（保留斜线，不逃逸）
+- 分支 B 去斜线导致的特殊风险：只有 `".."`、`"/../"`、`"//..//"` 等**去掉所有斜线后恰好等于 `".."`** 的输入，才能产生最终路径 `"/data/storage/petal/<name>/.."`，可向上逃逸一级到 `"/data/storage/petal"` 目录
+- 多级 `..` 不会被放大逃逸：`"../.."` → `"...."`（4 个点，作为文件名），`"../../.."` → `"......"`（6 个点，作为文件名），均不逃逸
 - 后端 `/api/file/getFile` 应有路径校验作为第二道防线
 
 #### 风险 4：`window.siyuan` 全局对象完全暴露
@@ -748,7 +810,7 @@ try {
 
 5. **`requireFunc.__proto__` 是否可被利用**：在 Electron 环境下，插件通过 `Object.getPrototypeOf(requireFunc)` 获取原生 `require` 的完整路径需要验证。如果 Electron 启用了 `contextIsolation` 或 `nodeIntegration: false`，则 `window.require` 不可用。
 
-6. **`normalizeStoragePath` 对纯 `..` 输入的处理**：输入 `".."` → `parts = [".."]` → `resolved.pop()` (resolved 为空，pop 不执行) → `resolved` 为空 → 返回 `"..".replace(/[\/\\]+/g, "")` = `".."`。此时路径变为 `/data/storage/petal/<name>/..`，后端是否正确处理？
+6. **`normalizeStoragePath` 一级逃逸后的后端拦截**：通过 Node.js 真实运行代码已确认，输入 `".."` → `parts = [".."]` → `".."` 因 `resolved` 为空被静默忽略（**不执行 pop**） → `resolved = []` → 进入分支 B → 返回 `"..".replace(/[\/\\]+/g, "")` = `".."`。最终路径为 `"/data/storage/petal/<name>/.."`，可逃逸到 `"/data/storage/petal"` 目录。需验证后端 `/api/file/getFile` 和 `/api/file/putFile` 是否对 `..` 做了工作空间根目录限制。
 
 7. **`DisallowInstall` 的自动禁用时机**：[plugin.go:125-128](file:///d:/fz/0601/solo-dogfeeding/code/287-siyuan/kernel/model/plugin.go#L125-L128) 当检测到 `DisallowInstall` 时会调用 `SetPetalEnabled(name, false)` 自动禁用，但这是在 `LoadPetals` 的只读加载路径中触发的副作用，是否会导致意外持久化修改？
 
