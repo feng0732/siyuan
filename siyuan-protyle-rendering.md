@@ -8,11 +8,11 @@ Protyle 是 SiYuan 笔记应用的核心富文本编辑器，采用 **所见即�
 
 | 层级 | 职责 | 核心文件 |
 |------|------|----------|
-| 入口层 | 生命周期管理、事件分发 | [index.ts](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/index.ts#L53-L542) |
-| 交互层 | 用户输入、键盘/鼠标事件 | [wysiwyg/index.ts](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/wysiwyg/index.ts#L108-L928) |
-| 渲染层 | 块渲染、特殊元素渲染 | [render/blockRender.ts](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/render/blockRender.ts#L12-L139) |
-| 事务层 | 操作提交、增量同步 | [wysiwyg/transaction.ts](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/wysiwyg/transaction.ts#L64-L275) |
-| 数据层 | 内核 API 通信、数据获取 | [util/onGet.ts](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/util/onGet.ts#L24-L533) |
+| 入口层 | 生命周期管理、事件分发 | [index.ts](app/src/protyle/index.ts#L53-L542) |
+| 交互层 | 用户输入、键盘/鼠标事件 | [wysiwyg/index.ts](app/src/protyle/wysiwyg/index.ts#L108-L928) |
+| 渲染层 | 块渲染、特殊元素渲染 | [render/blockRender.ts](app/src/protyle/render/blockRender.ts#L12-L139) |
+| 事务层 | 操作提交、增量同步 | [wysiwyg/transaction.ts](app/src/protyle/wysiwyg/transaction.ts#L64-L275) |
+| 数据层 | 内核 API 通信、数据获取 | [util/onGet.ts](app/src/protyle/util/onGet.ts#L24-L533) |
 
 ### 1.2 渲染管线总览
 
@@ -44,7 +44,7 @@ interface BlockElement {
 }
 ```
 
-**块类型定义**参见 [protyle.d.ts](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/types/protyle.d.ts#L27-L141)，支持的块类型包括：
+**块类型定义**参见 [protyle.d.ts](app/src/types/protyle.d.ts#L27-L141)，支持的块类型包括：
 - `NodeDocument` - 文档块
 - `NodeParagraph` - 段落块
 - `NodeHeading` - 标题块 (1-6级)
@@ -59,16 +59,16 @@ interface BlockElement {
 
 #### 2.2.1 文档加载流程
 
-1. **发起请求** - [Protyle.getDoc()](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/index.ts#L354-L373) 调用 `/api/filetree/getDoc`
-2. **数据接收** - [onGet()](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/util/onGet.ts#L24-L131) 处理内核返回的 Block DOM HTML
-3. **XSS 净化** - 使用 DOMPurify 净化行级备注内容 ([onGet.ts#L148-L156](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/util/onGet.ts#L148-L156))
-4. **DOM 注入** - [setHTML()](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/util/onGet.ts#L133-L333) 将内容注入到 `protyle-wysiwyg` 容器
+1. **发起请求** - [Protyle.getDoc()](app/src/protyle/index.ts#L354-L373) 调用 `/api/filetree/getDoc`
+2. **数据接收** - [onGet()](app/src/protyle/util/onGet.ts#L24-L131) 处理内核返回的 Block DOM HTML
+3. **XSS 净化** - 使用 DOMPurify 净化行级备注内容 ([onGet.ts#L148-L156](app/src/protyle/util/onGet.ts#L148-L156))
+4. **DOM 注入** - [setHTML()](app/src/protyle/util/onGet.ts#L133-L333) 将内容注入到 `protyle-wysiwyg` 容器
 
 #### 2.2.2 动态加载策略
 
-- **批量加载** - 通过 `window.siyuan.config.editor.dynamicLoadBlocks` 配置，默认加载 **192** 块，内核配置可调整范围 **[48, 1024]**（参见 [editor.go#L49-L93](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/kernel/conf/editor.go#L49-L93)，前端设置仅有 `min="48"` 下限限制（参见 [config/editor.ts#L199](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/config/editor.ts#L199)），上限由内核配置校验逻辑保证
+- **批量加载** - 通过 `window.siyuan.config.editor.dynamicLoadBlocks` 配置，默认加载 **192** 块，内核配置可调整范围 **[48, 1024]**（参见 [editor.go#L49-L93](kernel/conf/editor.go#L49-L93)，前端设置仅有 `min="48"` 下限限制（参见 [config/editor.ts#L199](app/src/config/editor.ts#L199)），上限由内核配置校验逻辑保证
 - **方向加载** - 向上滚动使用 `CB_GET_BEFORE`，向下滚动使用 `CB_GET_APPEND`
-- **高度阈值** - `REMOVED_OVER_HEIGHT = contentElement.clientHeight * 8`，超过此高度时从视口外的块将被移除以节省内存 ([onGet.ts#L157](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/util/onGet.ts#L157))
+- **高度阈值** - `REMOVED_OVER_HEIGHT = contentElement.clientHeight * 8`，超过此高度时从视口外的块将被移除以节省内存 ([onGet.ts#L157](app/src/protyle/util/onGet.ts#L157))
 
 ---
 
@@ -76,21 +76,21 @@ interface BlockElement {
 
 ### 3.1 输入处理流程
 
-输入处理入口在 [input.ts](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/wysiwyg/input.ts#L17-L351) 中定义的 `input()` 函数：
+输入处理入口在 [input.ts](app/src/protyle/wysiwyg/input.ts#L17-L351) 中定义的 `input()` 函数：
 
 ```typescript
 // 核心处理步骤
-1. 插入 <wbr> 标记作为光标锚点 ([input.ts#L58-L59](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/wysiwyg/input.ts#L58-L59))
+1. 插入 <wbr> 标记作为光标锚点 ([input.ts#L58-L59](app/src/protyle/wysiwyg/input.ts#L58-L59))
 2. 特殊块类型转换检测 (任务列表、标题转列表)
 3. 语法糖解析 (```代码块、---分割线、$$公式等)
-4. Lute.SpinBlockDOM() 进行 Markdown 解析和 DOM 重构 ([input.ts#L186](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/wysiwyg/input.ts#L186))
+4. Lute.SpinBlockDOM() 进行 Markdown 解析和 DOM 重构 ([input.ts#L186](app/src/protyle/wysiwyg/input.ts#L186))
 5. 本地 DOM 更新，保持光标位置
-6. 调用 updateInput() 生成事务 ([input.ts#L310-L351](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/wysiwyg/input.ts#L310-L351))
+6. 调用 updateInput() 生成事务 ([input.ts#L310-L351](app/src/protyle/wysiwyg/input.ts#L310-L351))
 ```
 
 ### 3.2 渲染管道
 
-内容更新后，按以下顺序执行四个核心渲染阶段（参见 [onGet.ts#L232-L235](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/util/onGet.ts#L232-L235)）：
+内容更新后，按以下顺序执行四个核心渲染阶段（参见 [onGet.ts#L232-L235](app/src/protyle/util/onGet.ts#L232-L235)）：
 
 | 渲染阶段 | 处理函数 | 作用 |
 |----------|----------|------|
@@ -111,24 +111,24 @@ blockRender(protyle, protyle.wysiwyg.element);
 
 > **重要修正**：公式渲染 `mathRender()` **不是**渲染管道的独立阶段，而是通过两种路径触发：
 >
-> 1. **代码块路径**：作为 `processRender()` 内部 `RENDER_MAP` 的注册项之一（`math: mathRender`），当遇到 `data-subtype="math"` 的代码块时由其调度执行（参见 [processCode.ts#L48-L72](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/util/processCode.ts#L48-L72)）
+> 1. **代码块路径**：作为 `processRender()` 内部 `RENDER_MAP` 的注册项之一（`math: mathRender`），当遇到 `data-subtype="math"` 的代码块时由其调度执行（参见 [processCode.ts#L48-L72](app/src/protyle/util/processCode.ts#L48-L72)）
 >
 > 2. **交互场景直接调用**：在输入处理、回车换行、块删除、工具栏操作等多个交互场景中直接调用，确保公式的增量渲染正确
->    - [input.ts#L257/L277](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/wysiwyg/input.ts#L257-L277) - 行级公式输入后
->    - [enter.ts#L313/L337/L349/L482/L563/L570](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/wysiwyg/enter.ts#L313-L570) - 回车换行相关场景
->    - [remove.ts#L561](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/wysiwyg/remove.ts#L561) - 块删除后相邻公式重渲染
->    - [toolbar/index.ts#L840](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/toolbar/index.ts#L840) - 工具栏插入公式
->    - [gutter/index.ts#L2161](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/gutter/index.ts#L2161) - 折叠/展开操作后公式渲染
+>    - [input.ts#L257/L277](app/src/protyle/wysiwyg/input.ts#L257-L277) - 行级公式输入后
+>    - [enter.ts#L313/L337/L349/L482/L563/L570](app/src/protyle/wysiwyg/enter.ts#L313-L570) - 回车换行相关场景
+>    - [remove.ts#L561](app/src/protyle/wysiwyg/remove.ts#L561) - 块删除后相邻公式重渲染
+>    - [toolbar/index.ts#L840](app/src/protyle/toolbar/index.ts#L840) - 工具栏插入公式
+>    - [gutter/index.ts#L2161](app/src/protyle/gutter/index.ts#L2161) - 折叠/展开操作后公式渲染
 >
-> 公式渲染器本身位于 [mathRender.ts](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/render/mathRender.ts)，基于 KaTeX 0.16.9 实现，支持行内公式（`SPAN[data-subtype="math"]`）和块级公式（`DIV[data-subtype="math"]`）两种模式。
+> 公式渲染器本身位于 [mathRender.ts](app/src/protyle/render/mathRender.ts)，基于 KaTeX 0.16.9 实现，支持行内公式（`SPAN[data-subtype="math"]`）和块级公式（`DIV[data-subtype="math"]`）两种模式。
 
 ### 3.3 特殊元素渲染
 
-#### 3.3.1 嵌入块渲染 ([blockRender.ts](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/render/blockRender.ts))
+#### 3.3.1 嵌入块渲染 ([blockRender.ts](app/src/protyle/render/blockRender.ts))
 
-- **防重复渲染** - 使用 `data-render="true"` 标记已渲染块 ([blockRender.ts#L24](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/render/blockRender.ts#L24))
-- **递归深度限制** - 最大嵌套深度为 4 层，防止无限递归 ([blockRender.ts#L127-L132](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/render/blockRender.ts#L127-L132))
-- **加载占位** - `genRenderFrame()` 生成加载骨架，减少视觉抖动 ([util.ts#L29-L43](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/render/util.ts#L29-L43))
+- **防重复渲染** - 使用 `data-render="true"` 标记已渲染块 ([blockRender.ts#L24](app/src/protyle/render/blockRender.ts#L24))
+- **递归深度限制** - 最大嵌套深度为 4 层，防止无限递归 ([blockRender.ts#L127-L132](app/src/protyle/render/blockRender.ts#L127-L132))
+- **加载占位** - `genRenderFrame()` 生成加载骨架，减少视觉抖动 ([util.ts#L29-L43](app/src/protyle/render/util.ts#L29-L43))
 
 ---
 
@@ -155,15 +155,9 @@ interface IOperation {
 
 #### 4.1.2 事务队列与合并
 
-事务处理核心在 [transaction.ts#L1364-L1450](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/wysiwyg/transaction.ts#L1364-L1450)：
+事务处理核心在 [transaction.ts#L1364-L1460](app/src/protyle/wysiwyg/transaction.ts#L1364-L1460)：
 
-```typescript
-// 关键常量
-const TIMEOUT_INPUT = 256;   // 输入超时时间，用于合并判断
-// 提交延迟为 TIMEOUT_INPUT * 2 = 512ms
-```
-
-**精确的合并条件**（必须同时满足以下全部 6 个条件，参见 [transaction.ts#L1381-L1389](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/wysiwyg/transaction.ts#L1381-L1389)）：
+**合并条件**（必须同时满足以下全部 5 个显式条件，参见 [transaction.ts#L1381-L1389](app/src/protyle/wysiwyg/transaction.ts#L1381-L1389)）：
 
 | 序号 | 条件 | 代码判断 |
 |------|------|----------|
@@ -171,33 +165,38 @@ const TIMEOUT_INPUT = 256;   // 输入超时时间，用于合并判断
 | 2 | 新旧事务的 `doOperations` 数组长度均为 1 | `lastTransaction.doOperations.length === 1 && doOperations.length === 1` |
 | 3 | 新旧事务的操作 action 均为 `"update"` | `lastTransaction.doOperations[0].action === "update" && doOperations[0].action === "update"` |
 | 4 | 新旧事务操作的是同一个块 | `lastTransaction.doOperations[0].id === doOperations[0].id` |
-| 5 | 时间间隔小于 256ms | `protyle.transactionTime - time < Constants.TIMEOUT_INPUT` |
-| 6 | 同一编辑器实例 | 隐式：通过 `protyle.transactionTime` 判断，同一实例才会正确命中 |
+| 5 | 时间差满足阈值 | `protyle.transactionTime - time < Constants.TIMEOUT_INPUT` |
 
-> **重要修正**：合并判断使用 `TIMEOUT_INPUT = 256ms`，而 setTimeout 提交延迟使用 `TIMEOUT_INPUT * 2 = 512ms`（参见 [transaction.ts#L1449-L1451](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/wysiwyg/transaction.ts#L1449-L1451)），两者是不同时间窗口。非 update 类操作（insert/delete/move/setAttrs 等）一律不合并。
+> **关键修正——合并窗口的实际语义**：
 >
-> 对于折叠标题、设置 AV 视图等操作，会额外将 `protyle.transactionTime` 向前推进 `TIMEOUT_INPUT * 2` 以主动跳过合并，并直接发送请求不走定时器队列（参见 [transaction.ts#L1402-L1435](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/wysiwyg/transaction.ts#L1402-L1435)）。
+> 代码 `protyle.transactionTime - time < Constants.TIMEOUT_INPUT`（[transaction.ts#L1387](app/src/protyle/wysiwyg/transaction.ts#L1387)）中，正常路径下 `protyle.transactionTime` 在每次 `transaction()` 调用末尾被设为当前 `time`（[transaction.ts#L1448](app/src/protyle/wysiwyg/transaction.ts#L1448)）。下一次调用时 `time` 更大，因此 `transactionTime - time ≤ 0`，**始终小于 256**——这意味着条件 5 在正常连续输入场景下总是成立，并不构成真正的"256ms 时间窗口"限制。
+>
+> **真正的合并窗口由提交延迟控制**：`setTimeout(promiseTransaction, Constants.TIMEOUT_INPUT * 2)` = **512ms**（[transaction.ts#L1449-L1451](app/src/protyle/wysiwyg/transaction.ts#L1449-L1451)）。每次新的 `transaction()` 调用都会 `clearTimeout` 并重置 512ms 定时器。只要持续输入不断重置，同一块的 update 事务就会被持续合并替换。当输入停顿超过 512ms 后定时器触发，`promiseTransaction()` 才真正提交队列首项。
+>
+> 条件 5 的实际作用是**阻止与快速通道事务合并**：折叠/展开等快速通道会将 `protyle.transactionTime` 设为 `time + TIMEOUT_INPUT * 2`（[transaction.ts#L1407](app/src/protyle/wysiwyg/transaction.ts#L1407)），此时 `transactionTime - time ≈ 512 > 256`，条件不满足，后续事务不会被错误合并到已直接提交的快速通道事务中。
+>
+> 非 update 类操作（insert/delete/move/setAttrs 等）一律不合并，直接入队。
 
 #### 4.1.3 事务提交流程
 
-`promiseTransaction()` 函数 ([transaction.ts#L64-L275](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/wysiwyg/transaction.ts#L64-L275)) 负责：
+`promiseTransaction()` 函数 ([transaction.ts#L64-L87](app/src/protyle/wysiwyg/transaction.ts#L64-L87)) 负责：
 
 1. 从 `window.siyuan.transactions` 队列取出第一个事务
-2. 发送 POST 请求到 `/api/transactions`
+2. **先从队列移除**，再发送 POST 请求到 `/api/transactions`
 3. 响应返回后处理本地 DOM 更新
 4. 如果队列非空，递归调用下一个事务
 
-> **关键设计**：事务从队列中移除必须在请求发送前执行，防止输入过快导致"block not found"错误 ([transaction.ts#L72-L73](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/wysiwyg/transaction.ts#L72-L73))
+> **关键设计**：事务从队列中移除必须在请求发送前执行（[transaction.ts#L72-L74](app/src/protyle/wysiwyg/transaction.ts#L72-L74)），原因是：若第一步请求未返回前，`transaction()` 合并了第1、2步操作，此时第一步请求返回后 `splice(0,1)` 删除的是合并后的事务，输入第3步时就会出现 "block not found" 错误。
 
 ### 4.2 增量更新策略
 
 #### 4.2.1 本地优先更新
 
-输入处理后立即更新本地 DOM ([input.ts#L214-L218](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/wysiwyg/input.ts#L214-L218))，不等待内核响应，保证编辑流畅性。
+输入处理后立即更新本地 DOM ([input.ts#L214-L218](app/src/protyle/wysiwyg/input.ts#L214-L218))，不等待内核响应，保证编辑流畅性。
 
 #### 4.2.2 内核确认后同步
 
-事务响应返回后，`onTransaction()` ([transaction.ts#L384-L953](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/wysiwyg/transaction.ts#L384-L953)) 根据操作类型处理：
+事务响应返回后，`onTransaction()` ([transaction.ts#L384-L953](app/src/protyle/wysiwyg/transaction.ts#L384-L953)) 根据操作类型处理：
 
 | 操作类型 | 处理逻辑 |
 |----------|----------|
@@ -209,7 +208,7 @@ const TIMEOUT_INPUT = 256;   // 输入超时时间，用于合并判断
 
 #### 4.2.3 WebSocket 推送更新
 
-内核通过 WebSocket 推送 `transactions` 事件 ([index.ts#L164-L166](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/index.ts#L164-L166))，同步多窗口/多设备间的编辑状态。
+内核通过 WebSocket 推送 `transactions` 事件 ([index.ts#L164-L166](app/src/protyle/index.ts#L164-L166))，同步多窗口/多设备间的编辑状态。
 
 ---
 
@@ -219,7 +218,7 @@ const TIMEOUT_INPUT = 256;   // 输入超时时间，用于合并判断
 
 #### 5.1.1 光标定位机制
 
-使用 `<wbr>` 标签作为光标锚点 ([input.ts#L58-L59](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/wysiwyg/input.ts#L58-L59))：
+使用 `<wbr>` 标签作为光标锚点 ([input.ts#L58-L59](app/src/protyle/wysiwyg/input.ts#L58-L59))：
 
 1. 输入前插入 `<wbr>` 标记当前光标位置
 2. DOM 更新后通过 `focusByWbr()` 定位到 `<wbr>` 位置
@@ -228,11 +227,11 @@ const TIMEOUT_INPUT = 256;   // 输入超时时间，用于合并判断
 #### 5.1.2 选区处理
 
 - **块级选择** - 添加 `protyle-wysiwyg--select` 类标记选中块
-- **行内选择** - 使用原生 Range/Selection API，`fixTableRange()` 处理表格选区边界问题 ([selection.ts#L29-L47](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/util/selection.ts#L29-L47))
+- **行内选择** - 使用原生 Range/Selection API，`fixTableRange()` 处理表格选区边界问题 ([selection.ts#L29-L47](app/src/protyle/util/selection.ts#L29-L47))
 
 ### 5.2 撤销/重做 (Undo/Redo)
 
-[Undo 类](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/undo/index.ts#L14-L145) 维护两个栈：
+[Undo 类](app/src/protyle/undo/index.ts#L14-L145) 维护两个栈：
 
 ```typescript
 class Undo {
@@ -246,13 +245,13 @@ class Undo {
 2. 撤销时反向执行 `undoOperations`，通过 `onTransaction(..., isUndo=true)` 应用
 3. 重做时重新执行 `doOperations`
 
-> **栈大小限制**：`Constants.SIZE_UNDO = 64`，超过时移除最早的历史记录 ([undo/index.ts#L126-L127](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/undo/index.ts#L126-L127))
+> **栈大小限制**：`Constants.SIZE_UNDO = 64`，超过时移除最早的历史记录 ([undo/index.ts#L126-L127](app/src/protyle/undo/index.ts#L126-L127))
 
 ### 5.3 滚动与可视区域管理
 
 #### 5.3.1 动态加载触发
 
-[Scroll 类](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/scroll/index.ts#L9-L119) 和 [scroll/event.ts](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/scroll/event.ts) 监听滚动事件：
+[Scroll 类](app/src/protyle/scroll/index.ts#L9-L119) 和 [scroll/event.ts](app/src/protyle/scroll/event.ts) 监听滚动事件：
 
 - 滚动到顶部时触发向上加载 (`CB_GET_BEFORE`)
 - 滚动到底部时触发向下加载 (`CB_GET_APPEND`)
@@ -262,13 +261,13 @@ class Undo {
 
 - 文档滚动位置保存在 `localStorage[Constants.LOCAL_FILEPOSITION]`
 - 打开文档时通过 `getDocByScroll()` 恢复滚动位置
-- 使用 `ResizeObserver` 确保异步渲染后仍能准确定位 ([onGet.ts#L513-L528](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/util/onGet.ts#L513-L528))
+- 使用 `ResizeObserver` 确保异步渲染后仍能准确定位 ([onGet.ts#L513-L528](app/src/protyle/util/onGet.ts#L513-L528))
 
 ### 5.4 编辑器状态
 
 #### 5.4.1 只读模式
 
-通过 `disabledProtyle()` 和 `enableProtyle()` 切换状态 ([onGet.ts#L346-L457](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/util/onGet.ts#L346-L457))：
+通过 `disabledProtyle()` 和 `enableProtyle()` 切换状态 ([onGet.ts#L346-L457](app/src/protyle/util/onGet.ts#L346-L457))：
 
 - 设置 `contenteditable="false"`
 - 禁用拖拽、隐藏工具栏
@@ -277,7 +276,7 @@ class Undo {
 
 #### 5.4.2 聚焦状态
 
-`focusin` 事件监听确保编辑器激活时更新面板状态 ([index.ts#L393-L421](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/index.ts#L393-L421))：
+`focusin` 事件监听确保编辑器激活时更新面板状态 ([index.ts#L393-L421](app/src/protyle/index.ts#L393-L421))：
 
 - 设置面板激活状态
 - 更新大纲、反链等关联面板
@@ -335,11 +334,12 @@ Protyle (入口)
          └─ transaction(protyle, doOps, undoOps)
 
 2. transaction() 入队
-   → 检查合并条件 (时间间隔 < 256ms, 同块同操作)
-   → 合并或新建队列项
-   → setTimeout(promiseTransaction, 256)
+   → 检查合并条件 (同块同 update 操作)
+   → 满足时替换队列末项 doOperations；不满足则新增队列项
+   → clearTimeout + setTimeout(promiseTransaction, 512) 重置提交定时器
 
-3. promiseTransaction() 提交
+3. promiseTransaction() 提交（输入停顿 512ms 后触发）
+   → splice(0,1) 先出队
    → POST /api/transactions
    → 响应回调 onTransaction()
       ├─ 根据 action 类型更新 DOM
@@ -363,7 +363,7 @@ Protyle (入口)
 | 模块 | 依赖 | 耦合方式 |
 |------|------|----------|
 | input.ts | transaction.ts | 调用 `transaction()` 提交操作 |
-| transaction.ts | render/\* | 操作后调用 `processRender/highlightRender/avRender/blockRender` |
+| transaction.ts | render/* | 操作后调用 `processRender/highlightRender/avRender/blockRender` |
 | blockRender.ts | onGet.ts | 嵌入块内容加载完成后递归调用 `blockRender` |
 | undo/index.ts | transaction.ts | 调用 `onTransaction(..., isUndo=true)` 应用撤销 |
 | scroll/event.ts | onGet.ts | 滚动时调用 `onGet` 加载更多块 |
@@ -388,7 +388,7 @@ Protyle (入口)
 
 #### 7.1.3 网络开销
 
-- **事务合并**：256ms 合并窗口减少请求数，但快速输入时仍可能产生大量请求
+- **事务合并**：512ms 提交延迟窗口内持续合并同块 update 操作，但不同块的操作仍各自入队
 - **WebSocket 推送**：多设备同步时频繁推送可能导致处理压力
 - **嵌入块查询**：每个嵌入块单独发送 `/api/search/searchEmbedBlock` 请求
 
@@ -396,16 +396,17 @@ Protyle (入口)
 
 #### 7.2.1 渲染优化
 
-1. **data-render 标记** - 防止重复渲染 ([blockRender.ts#L24](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/render/blockRender.ts#L24))
+1. **data-render 标记** - 防止重复渲染 ([blockRender.ts#L24](app/src/protyle/render/blockRender.ts#L24))
 2. **骨架屏** - `genRenderFrame()` 显示加载占位，减少视觉抖动
 3. **懒加载** - 图片、嵌入块按需加载
-4. **虚拟滚动** - 通过动态加载/卸载模拟虚拟滚动 ([onGet.ts#L157-L204](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/util/onGet.ts#L157-L204))
+4. **虚拟滚动** - 通过动态加载/卸载模拟虚拟滚动 ([onGet.ts#L157-L204](app/src/protyle/util/onGet.ts#L157-L204))
 
 #### 7.2.2 事务优化
 
-1. **操作合并** - 256ms 内的同类操作合并 ([transaction.ts#L1387-L1408](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/wysiwyg/transaction.ts#L1387-L1408))
+1. **操作合并** - 同块同类型 update 操作在提交前合并替换，提交延迟 512ms 内可持续合并 ([transaction.ts#L1381-L1451](app/src/protyle/wysiwyg/transaction.ts#L1381-L1451))
 2. **异步提交** - 本地 DOM 更新不等待内核响应
 3. **队列串行** - `promiseTransaction()` 递归确保请求顺序执行
+4. **快速通道** - 折叠/展开等操作跳过队列直接提交 ([transaction.ts#L1402-L1435](app/src/protyle/wysiwyg/transaction.ts#L1402-L1435))
 
 #### 7.2.3 配置可调参数
 
@@ -413,9 +414,9 @@ Protyle (入口)
 |------|--------|------|------|
 | `dynamicLoadBlocks` | **192** | [48, 1024] | 单次加载块数量（内核强制校验区间，前端 input 仅设置 min=48） |
 | `SIZE_UNDO` | 64 | 固定常量 | 撤销栈最大步数 |
-| `TIMEOUT_INPUT` | 256ms | 固定常量 | 事务合并判断时间窗口；提交延迟为 2×该值 = 512ms |
+| `TIMEOUT_INPUT` | 256ms | 固定常量 | 合并条件阈值常量；实际提交延迟为 2×该值 = 512ms |
 | `REMOVED_OVER_HEIGHT` | clientHeight × 8 | 动态计算 | 内存回收触发阈值（滚动内容高度超过时卸载视口外块） |
-| `MinDynamicLoadBlocks` | 48 | 固定常量 | 内核侧的 `dynamicLoadBlocks` 最小取值（参见 [editor.go#L66](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/kernel/conf/editor.go#L66)） |
+| `MinDynamicLoadBlocks` | 48 | 固定常量 | 内核侧的 `dynamicLoadBlocks` 最小取值（参见 [editor.go#L66](kernel/conf/editor.go#L66)） |
 
 ---
 
@@ -425,7 +426,7 @@ Protyle (入口)
 
 #### 8.1.1 WebSocket 通信
 
-每个 Protyle 实例注册 Model 监听 WebSocket 消息 ([index.ts#L127-L265](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/index.ts#L127-L265))：
+每个 Protyle 实例注册 Model 监听 WebSocket 消息 ([index.ts#L127-L265](app/src/protyle/index.ts#L127-L265))：
 
 ```typescript
 // 关注的消息类型
@@ -441,7 +442,7 @@ case "heading2doc":          // 标题转文档
 #### 8.1.2 冲突处理
 
 - **最后写入胜出** (Last Write Win) - 无冲突检测，以后提交的事务为准
-- **光标保护** - 正在编辑的块 (`item.contains(range.startContainer)`) 不进行远程更新 ([transaction.ts#L108-L112](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/wysiwyg/transaction.ts#L108-L112))
+- **光标保护** - 正在编辑的块 (`item.contains(range.startContainer)`) 不进行远程更新 ([transaction.ts#L108-L112](app/src/protyle/wysiwyg/transaction.ts#L108-L112))
 
 ### 8.2 前后端状态一致性
 
@@ -452,14 +453,14 @@ case "heading2doc":          // 标题转文档
 protyle.wysiwyg.lastHTMLs: { [key: string]: string } = {};
 
 // 用于：
-// 1. 生成 undoOperations ([input.ts#L328](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/wysiwyg/input.ts#L328))
+// 1. 生成 undoOperations ([input.ts#L328](app/src/protyle/wysiwyg/input.ts#L328))
 // 2. 检测内容变化
 ```
 
 #### 8.2.2 异常恢复
 
-- 内核返回 `code: 1` (错误) 或 `code: 3` (block not found) 时的处理 ([onGet.ts#L37-L51](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/util/onGet.ts#L37-L51))
-- 同步中 (`isSyncing=true`) 的文档永久禁用编辑 ([onGet.ts#L248-L250](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/util/onGet.ts#L248-L250))
+- 内核返回 `code: 1` (错误) 或 `code: 3` (block not found) 时的处理 ([onGet.ts#L37-L51](app/src/protyle/util/onGet.ts#L37-L51))
+- 同步中 (`isSyncing=true`) 的文档永久禁用编辑 ([onGet.ts#L248-L250](app/src/protyle/util/onGet.ts#L248-L250))
 
 ### 8.3 关联面板同步
 
@@ -478,12 +479,12 @@ protyle.wysiwyg.lastHTMLs: { [key: string]: string } = {};
 
 | 错误场景 | 处理方式 | 代码位置 |
 |----------|----------|----------|
-| 块未找到 (code=3) | 静默返回，不渲染 | [onGet.ts#L48-L51](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/util/onGet.ts#L48-L51) |
-| 引用过期 | 显示 "引用已过期" 提示 | [blockRender.ts#L117](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/render/blockRender.ts#L117) |
-| 嵌入块 JS 执行错误 | 显示错误提示，继续执行 | [blockRender.ts#L65-L67](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/render/blockRender.ts#L65-L67) |
-| XSS 注入 | DOMPurify 净化行级备注内容 | [onGet.ts#L148-L156](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/util/onGet.ts#L148-L156) |
-| 文档同步中 | 永久禁用编辑，显示同步提示 | [onGet.ts#L248-L250](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/util/onGet.ts#L248-L250) |
-| 剪贴板写入失败 | 控制台打印错误，不阻塞流程 | [wysiwyg/index.ts#L504-L506](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/wysiwyg/index.ts#L504-L506) |
+| 块未找到 (code=3) | 静默返回，不渲染 | [onGet.ts#L48-L51](app/src/protyle/util/onGet.ts#L48-L51) |
+| 引用过期 | 显示 "引用已过期" 提示 | [blockRender.ts#L117](app/src/protyle/render/blockRender.ts#L117) |
+| 嵌入块 JS 执行错误 | 显示错误提示，继续执行 | [blockRender.ts#L65-L67](app/src/protyle/render/blockRender.ts#L65-L67) |
+| XSS 注入 | DOMPurify 净化行级备注内容 | [onGet.ts#L148-L156](app/src/protyle/util/onGet.ts#L148-L156) |
+| 文档同步中 | 永久禁用编辑，显示同步提示 | [onGet.ts#L248-L250](app/src/protyle/util/onGet.ts#L248-L250) |
+| 剪贴板写入失败 | 控制台打印错误，不阻塞流程 | [wysiwyg/index.ts#L504-L506](app/src/protyle/wysiwyg/index.ts#L504-L506) |
 
 ### 9.2 防御性编程措施
 
@@ -496,7 +497,7 @@ if (!blockElement.parentElement) {
     return;
 }
 ```
-*[input.ts#L18-L21](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/wysiwyg/input.ts#L18-L21)*
+*[input.ts#L18-L21](app/src/protyle/wysiwyg/input.ts#L18-L21)*
 
 #### 9.2.2 边界保护
 
@@ -507,7 +508,7 @@ if (protyle.wysiwyg.element.childElementCount === 0) {
     zoomOut({...});
 }
 ```
-*[transaction.ts#L259-L273](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/wysiwyg/transaction.ts#L259-L273)*
+*[transaction.ts#L259-L273](app/src/protyle/wysiwyg/transaction.ts#L259-L273)*
 
 #### 9.2.3 错误边界
 
@@ -520,7 +521,7 @@ try {
     renderEmbed([], protyle, item, top, e);
 }
 ```
-*[blockRender.ts#L44-L82](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/render/blockRender.ts#L44-L82)*
+*[blockRender.ts#L44-L82](app/src/protyle/render/blockRender.ts#L44-L82)*
 
 ---
 
@@ -545,7 +546,7 @@ try {
 window.siyuan.transactions.splice(0, 1);  // 先移除
 fetchPost("/api/transactions", ...);     // 后发送
 ```
-*[transaction.ts#L72-L74](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/wysiwyg/transaction.ts#L72-L74)*
+*[transaction.ts#L72-L74](app/src/protyle/wysiwyg/transaction.ts#L72-L74)*
 
 **风险**：如果请求发送失败（网络中断），事务已从队列移除，无法重试，导致数据丢失。
 
