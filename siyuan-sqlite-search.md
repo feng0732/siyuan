@@ -12,8 +12,6 @@ SiYuan（思源笔记）采用 **SQLite + FTS5 全文搜索引擎** 作为核心
 | 历史库 | `util.HistoryDBPath` | 历史版本全文检索 | MaxOpen=3 |
 | 资源内容库 | `util.AssetContentDBPath` | PDF/Office 等附件内容全文索引 | MaxOpen=3 |
 
-参考代码：[database.go#L228-L370](file:///d:/fz/0601/solo-dogfeeding/code/290-siyuan/kernel/sql/database.go#L228-L370)
-
 ### 1.2 模块关系图
 
 ```
@@ -56,11 +54,11 @@ SiYuan（思源笔记）采用 **SQLite + FTS5 全文搜索引擎** 作为核心
 CREATE TABLE blocks (
   id, parent_id, root_id, hash, box, path, hpath,
   name, alias, memo, tag, content, fcontent, markdown,
-  length, type, subtype, ial, sort, created, updated
+  length, subtype, ial, sort, created, updated
 );
 ```
 
-**B-Tree 索引配置**（参考 [database.go#L128-L207](file:///d:/fz/0601/solo-dogfeeding/code/290-siyuan/kernel/sql/database.go#L128-L207)）：
+**B-Tree 索引配置**：
 
 | 索引名 | 字段 | 用途 |
 |-------|------|------|
@@ -76,7 +74,7 @@ CREATE TABLE blocks (
 
 ### 2.2 FTS5 全文索引虚拟表
 
-系统采用 **双 FTS5 表切换** 方案支持大小写敏感配置（参考 [database.go#L148-L164](file:///d:/fz/0601/solo-dogfeeding/code/290-siyuan/kernel/sql/database.go#L148-L164)）：
+系统采用 **双 FTS5 表切换** 方案支持大小写敏感配置：
 
 ```sql
 -- 大小写敏感
@@ -100,12 +98,10 @@ CREATE VIRTUAL TABLE blocks_fts_case_insensitive USING fts5(
 - 搜索时根据 `Conf.Search.CaseSensitive` 动态选择目标表
 
 **历史库与资源库 FTS5 表**：
-- `histories_fts_case_insensitive`：仅大小写不敏感模式（参考 [database.go#L304-L310](file:///d:/fz/0601/solo-dogfeeding/code/290-siyuan/kernel/sql/database.go#L304-L310)）
-- `asset_contents_fts_case_insensitive`：附件内容索引，列含 `name, ext, path, content`（参考 [database.go#L364-L370](file:///d:/fz/0601/solo-dogfeeding/code/290-siyuan/kernel/sql/database.go#L364-L370)）
+- `histories_fts_case_insensitive`：仅大小写不敏感模式
+- `asset_contents_fts_case_insensitive`：附件内容索引，列含 `name, ext, path, content`
 
 ### 2.3 SQLite 连接关键参数
-
-参考 [database.go#L232-L241](file:///d:/fz/0601/solo-dogfeeding/code/290-siyuan/kernel/sql/database.go#L232-L241)：
 
 ```
 _journal_mode=WAL          -- 写前日志，支持高并发读
@@ -139,7 +135,7 @@ sql.UpsertTreeQueue(tree)            ─── 入队（相同 root_id 覆盖旧
     │
     ▼
 定时任务 Cron (every 3s)             ─── util.SQLFlushInterval = 3000ms
-    │  参考 cron.go#L39
+    │
     ▼
 sql.FlushTxJob() → FlushQueue()
     │
@@ -153,7 +149,6 @@ sql.FlushTxJob() → FlushQueue()
     │     ├─ queryBlockHashes(root_id)    ─── 查旧块哈希（用复合索引）
     │     ├─ fromTree() → 构造新 Block[]
     │     ├─ hash 对比：unchanges / toRemoves
-    │     │   └─ 参考 upsert.go#L399-L426
     │     │
     │     ├─ deleteBlocksByIDs(toRemoves)
     │     │   └─ 同步删除 blocks + FTS 表（按 ROWID）
@@ -176,8 +171,6 @@ sql.FlushTxJob() → FlushQueue()
 ```
 
 ### 3.2 操作队列（Operation Queue）设计
-
-参考 [queue.go#L37-L437](file:///d:/fz/0601/solo-dogfeeding/code/290-siyuan/kernel/sql/queue.go#L37-L437)
 
 **数据结构**：
 ```go
@@ -212,8 +205,6 @@ type dbQueueOperation struct {
 **关键去重机制**：入队前遍历队列，若存在相同 key 的同类型操作则直接覆盖，避免短时间内对同一文档反复写入。例如连续编辑同一文档时，队列中始终只保留最新的 `upsertTree`。
 
 ### 3.3 Hash 增量更新算法
-
-参考 [upsert.go#L399-L453](file:///d:/fz/0601/solo-dogfeeding/code/290-siyuan/kernel/sql/upsert.go#L399-L453)
 
 核心思想：**仅重写有变更的块**。
 
@@ -263,8 +254,6 @@ deleteBlocksByIDs(tx, toRemoves)   // blocks + FTS 双表删除
 
 ### 4.1 四种搜索方法
 
-参考 [model/search.go#L1156-L1214](file:///d:/fz/0601/solo-dogfeeding/code/290-siyuan/kernel/model/search.go#L1156-L1214)
-
 `FullTextSearchBlock()` 的 `method` 参数：
 
 | method | 名称 | 执行路径 | 适用场景 |
@@ -290,11 +279,9 @@ if 2 > len(strings.Split(strings.TrimSpace(query), " ")) {
 
 ### 4.2 FTS5 查询构造流程
 
-参考 [model/search.go#L1619-L1663](file:///d:/fz/0601/solo-dogfeeding/code/290-siyuan/kernel/model/search.go#L1619-L1663)
-
 **步骤 1：列过滤**（`columnFilter()` 函数）
 
-根据配置选择要检索的 FTS5 列（参考 [model/search.go#L1979-L1996](file:///d:/fz/0601/solo-dogfeeding/code/290-siyuan/kernel/model/search.go#L1979-L1996)）：
+根据配置选择要检索的 FTS5 列：
 ```go
 // 示例：Name/Alias/Memo 开启，IAL 关闭
 "{content name alias memo tag}"
@@ -302,7 +289,6 @@ if 2 > len(strings.Split(strings.TrimSpace(query), " ")) {
 
 **步骤 2：关键词转义**（`stringQuery()` 函数）
 
-参考 [model/search.go#L2017-L2038](file:///d:/fz/0601/solo-dogfeeding/code/290-siyuan/kernel/model/search.go#L2017-L2038)：
 - 双引号内部双写：`"` → `""`
 - 单引号双写：`'` → `''`
 - 多空格分隔 → 每词独立双引号包裹
@@ -329,8 +315,6 @@ LIMIT 32 OFFSET 0
 
 ### 4.3 多关键词文档模式（LIKE + GROUP_CONCAT）
 
-参考 [model/search.go#L1665-L1719](file:///d:/fz/0601/solo-dogfeeding/code/290-siyuan/kernel/model/search.go#L1665-L1719)
-
 当查询包含 2+ 空格分隔的关键词时，切换到文档级聚合策略：
 
 ```sql
@@ -347,23 +331,21 @@ WITH docBlocks AS (
 )
 
 -- Step 2: 拉取命中文档内的具体块（文档块 + 具体命中块）
-SELECT *, (content||name||...) AS concatContent
+SELECT *, (content||name||...) AS concatContent,
+       (CASE WHEN (root_id IN (...) AND (命中条件)) THEN 1 ELSE 0 END) AS blockSort
 FROM blocks
 WHERE type IN (...) ...
   AND (id IN (SELECT root_id FROM docBlocks LIMIT 32)
     OR (root_id IN (SELECT root_id FROM docBlocks LIMIT 32)
        AND concatContent LIKE '%kw1%' AND concatContent LIKE '%kw2%'))
-ORDER BY ...  -- 自定义排序 + blockSort 标志位
 ```
 
 ### 4.4 正则表达式搜索
 
-参考 [model/search.go#L1586-L1617](file:///d:/fz/0601/solo-dogfeeding/code/290-siyuan/kernel/model/search.go#L1586-L1617)
-
 通过自定义注册的 `regexp` SQLite 函数实现：
 
 ```go
-// database.go#L58-L69 注册
+// database.go 注册
 sql.Register("sqlite3_extended", &sqlite3.SQLiteDriver{
     ConnectHook: func(conn *sqlite3.SQLiteConn) error {
         return conn.RegisterFunc("regexp", regex, true)
@@ -382,74 +364,192 @@ WHERE (content REGEXP 'exp' OR name REGEXP 'exp' OR alias REGEXP 'exp' OR ...)
 
 ## 5. 排序策略深度分析
 
-### 5.1 八种排序模式
+SiYuan 的排序体系根据 **搜索模式** 和 **orderBy 参数** 的组合产生完全不同的行为。很多排序仅在特定搜索路径下生效，不能一概而论。
 
-参考 [buildOrderBy()](file:///d:/fz/0601/solo-dogfeeding/code/290-siyuan/kernel/model/search.go#L1367-L1398)
+### 5.1 `buildOrderBy()` —— 全局排序子句生成器
 
-| orderBy | 模式 | SQL 片段 |
-|---------|------|---------|
-| **0** | **按块类型（默认，最复杂）** | 多层 CASE + sort ASC + updated DESC |
+`buildOrderBy(query, method, orderBy)` 是 `FullTextSearchBlock()` 统一调用的排序子句生成函数，它根据 `orderBy` 参数返回 SQL ORDER BY 片段：
+
+| orderBy | 含义 | 返回的 SQL |
+|---------|------|-----------|
+| 0 | 按块类型（默认） | `ORDER BY CASE WHEN name='${kw}' THEN 10 WHEN alias='${kw}' THEN 20 WHEN name LIKE '%${kw}%' THEN 50 WHEN alias LIKE '%${kw}%' THEN 60 ELSE 65535 END ASC, sort ASC, updated DESC` |
 | 1 | 创建时间升序 | `ORDER BY created ASC` |
 | 2 | 创建时间降序 | `ORDER BY created DESC` |
 | 3 | 更新时间升序 | `ORDER BY updated ASC` |
 | 4 | 更新时间降序 | `ORDER BY updated DESC` |
-| 5 | 内容顺序（仅分组） | 遍历树记录 sortVal，内存排序 |
-| 6 | 相关度升序 | FTS: `ORDER BY rank DESC`（反向） |
-| 7 | 相关度降序 | FTS: `ORDER BY rank` |
+| 5 | 内容顺序 | **不生成 SQL**（由 Go 层内存排序处理） |
+| 6 | 相关度升序 | method=0/1 时：`ORDER BY rank DESC`；method=2/3 时：降级为 `ORDER BY sort DESC, updated DESC` |
+| 7 | 相关度降序 | method=0/1 时：`ORDER BY rank`；method=2/3 时：降级为 `ORDER BY sort ASC, updated DESC` |
 
-### 5.2 「按块类型」排序算法详解
+**关键发现 1**：`buildOrderBy()` 的 orderBy=0（默认）CASE 分支 **只有 4 层**，远比引用搜索的 12 层简单。它仅关注 name 和 alias 两个字段的精确/模糊匹配，不涉及 content/type/memo/fcontent 等字段。
 
-这是 SiYuan 的默认排序，**语义分层排序**，核心思想：精确匹配 > 标题匹配 > 文档内容匹配 > 列表项匹配 > 其他。
+**关键发现 2**：orderBy=6/7 的「相关度」排序，**仅在 method=0（关键字）和 method=1（查询语法）时才使用 FTS5 的 `rank`**；在 method=2（SQL）和 method=3（正则）时，由于不经过 FTS5 表（没有 `rank` 列），**会静默降级为 sort + updated 排序**，此时「相关度」名不副实。
 
-参考 `fullTextSearchRefBlock()` 中的完整版本 [model/search.go#L1544-L1559](file:///d:/fz/0601/solo-dogfeeding/code/290-siyuan/kernel/model/search.go#L1544-L1559)：
+**关键发现 3**：`rank` 的语义——FTS5 的 `rank` 值越小代表越相关（基于 BM25），所以 `ORDER BY rank` 是相关度降序（最相关排最前），而 `ORDER BY rank DESC` 才是相关度升序。代码注释 `// 默认是按相关度降序，所以按相关度升序要反过来使用 DESC` 对此做了解释。
+
+### 5.2 普通搜索（method=0）排序行为
+
+普通搜索是最常用的搜索模式，其排序行为根据关键词数量分为两条完全不同的路径：
+
+#### 5.2.1 单关键词路径 → `fullTextSearchByFTS()`
+
+- **执行层**：FTS5 虚拟表（`blocks_fts` 或 `blocks_fts_case_insensitive`）
+- **排序子句**：直接使用 `buildOrderBy()` 返回值
+- **orderBy=0（默认）**：CASE 4 层（name精确=10, alias精确=20, name模糊=50, alias模糊=60, ELSE 65535）→ sort ASC → updated DESC
+- **orderBy=6/7**：使用 FTS5 `rank`，真正的 BM25 相关度
+- **性能**：FTS5 内部利用倒排索引 + 辅助函数 `rank` 计算，无需全表扫描
+
+**风险**：默认排序（orderBy=0）的 CASE 仅基于 name/alias，content 命中的块全部落入 ELSE 65535，**内容命中与未命中之间没有区分度**，完全靠二级 sort（块类型）和三级 updated 区分。这意味着一个内容精确匹配的段落块可能排在 name 模糊匹配的块之后。
+
+#### 5.2.2 多关键词路径 → `fullTextSearchByLikeWithRoot()`
+
+- **执行层**：普通 `blocks` 表 + CTE 子查询
+- **排序子句**：对 `buildOrderBy()` 返回值做了**大幅改写**
+
+多关键词模式中，由于查询走的是 `blocks` 表而非 FTS5 表，`rank` 列不存在。代码中对 orderBy 做了如下降级和注入处理：
+
+```
+原始 orderBy               → 实际注入的排序
+─────────────────────────────────────────────────────────────────
+ORDER BY rank DESC (升序)   → 降级为 buildOrderBy(0,0)，即 CASE 4层
+                              注入 blockSort ASC（命中的块优先）
+ORDER BY rank (降序)        → 降级为 buildOrderBy(0,0)，即 CASE 4层
+                              注入 blockSort DESC（命中的块优先）
+含 "sort ASC" 的子句        → 在 CASE 后注入 blockSort DESC
+其他 orderBy                → 原样使用
+```
+
+**`blockSort` 字段**的生成逻辑：
+```sql
+CASE WHEN (root_id IN (SELECT root_id FROM docBlocks)
+       AND (concatContent LIKE '%kw1%' AND concatContent LIKE '%kw2%'))
+     THEN 1 ELSE 0 END AS blockSort
+```
+
+即：该块所在文档命中 **且** 该块自身也命中所有关键词 → blockSort=1；否则 blockSort=0。排序时将 blockSort 注入到 CASE 和 sort 之间，确保自身命中的块排在仅文档命中的块之前。
+
+**CTE 第一阶段排序**（文档级）：
+```sql
+ORDER BY (docContent LIKE '%kw1%') + (docContent LIKE '%kw2%') DESC, MAX(updated) DESC
+```
+命中的关键词越多，文档越靠前；关键词命中数相同则按更新时间降序。
+
+**风险**：
+1. **rank 降级后语义丢失**：用户选择「按相关度排序」，但在多关键词模式下实际得到的是 CASE name/alias 匹配 + blockSort + sort + updated，与 BM25 完全无关
+2. **GROUP_CONCAT 性能问题**：CTE 第一阶段对每文档做 `GROUP_CONCAT(content||name||...)`，大文档下字符串拼接开销极大
+3. **matchedBlockCount = matchedRootCount**：多关键词模式中，`matchedBlockCount` 被设为文档数而非实际块数，这是因为 COUNT 查询走的是 `docBlocks` 子查询
+
+### 5.3 查询语法搜索（method=1）排序行为
+
+- **执行层**：与单关键词路径相同，走 `fullTextSearchByFTS()`
+- **排序子句**：直接使用 `buildOrderBy()` 返回值
+- **与 method=0 单关键词的唯一区别**：query 不经过 `stringQuery()` 包裹双引号，用户可以直接写 FTS5 查询语法（如 `A AND B`、`prefix*`、`NEAR(...)` 等）
+- **orderBy=6/7**：同样使用 FTS5 `rank`，语义正确
+
+**风险**：
+1. **默认排序的 CASE 用原始 query 替换 `${keyword}`**：如果用户输入的是复杂语法（如 `siyuan AND note`），CASE 中的 `name = 'siyuan AND note'` 几乎不可能命中，默认排序退化为纯 sort+updated
+2. **FTS5 语法错误**：用户输入的查询语法不合法时，FTS5 会返回错误，代码中通过 `sql.SelectBlocksRawStmt` 内部的 `sqlparser` 解析容错，但可能导致空结果
+
+### 5.4 引用搜索（`fullTextSearchRefBlock`）排序行为
+
+引用搜索是独立于 `FullTextSearchBlock()` 的搜索路径，用于反向链接、提及等场景。它 **不使用 `buildOrderBy()`**，而是内置了一套更精细的 12 层 CASE 排序：
 
 ```sql
 ORDER BY CASE
-  WHEN name = '${keyword}'                        THEN 10   -- 命名属性精确匹配
-  WHEN alias = '${keyword}'                       THEN 20   -- 别名精确匹配
-  WHEN memo = '${keyword}'                        THEN 30   -- 备注精确匹配
-  WHEN content = '${keyword}' AND type = 'd'      THEN 40   -- 文档标题精确匹配
-  WHEN content LIKE '%${keyword}%' AND type='d'  THEN 41   -- 文档标题部分匹配
-  WHEN name LIKE '%${keyword}%'                   THEN 50   -- 命名模糊匹配
-  WHEN alias LIKE '%${keyword}%'                  THEN 60   -- 别名模糊匹配
-  WHEN content = '${keyword}' AND type = 'h'      THEN 70   -- 标题块精确匹配
-  WHEN content LIKE '%${keyword}%' AND type='h'  THEN 71   -- 标题块模糊匹配
-  WHEN fcontent = '${keyword}' AND type = 'i'     THEN 80   -- 列表项首块精确匹配
-  WHEN fcontent LIKE '%${keyword}%' AND type='i' THEN 81   -- 列表项首块模糊匹配
-  WHEN memo LIKE '%${keyword}%'                   THEN 90   -- 备注模糊匹配
+  WHEN name = '${keyword}'                        THEN 10
+  WHEN alias = '${keyword}'                       THEN 20
+  WHEN memo = '${keyword}'                        THEN 30
+  WHEN content = '${keyword}' AND type = 'd'      THEN 40
+  WHEN content LIKE '%${keyword}%' AND type = 'd' THEN 41
+  WHEN name LIKE '%${keyword}%'                   THEN 50
+  WHEN alias LIKE '%${keyword}%'                  THEN 60
+  WHEN content = '${keyword}' AND type = 'h'      THEN 70
+  WHEN content LIKE '%${keyword}%' AND type = 'h' THEN 71
+  WHEN fcontent = '${keyword}' AND type = 'i'     THEN 80
+  WHEN fcontent LIKE '%${keyword}%' AND type = 'i'THEN 81
+  WHEN memo LIKE '%${keyword}%'                   THEN 90
   WHEN content LIKE '%${keyword}%'
-    AND type != 'i' AND type != 'l'               THEN 100  -- 普通块内容模糊匹配
+    AND type != 'i' AND type != 'l'               THEN 100
   ELSE 65535
 END ASC,
-sort ASC,          -- 块类型二级排序（文档=0，标题=5，段落=10...）
-length ASC         -- 同级别按长度，短的优先
+sort ASC,
+length ASC
 ```
 
-**块类型 sort 值**（参考 `nSort()` [database.go#L1532-L1567](file:///d:/fz/0601/solo-dogfeeding/code/290-siyuan/kernel/sql/database.go#L1532-L1567)）：
+**与普通搜索默认排序的关键差异**：
 
-| sort 值 | 块类型 |
-|---------|--------|
-| 0 | Document 文档 |
-| 5 | Heading 标题 |
-| 10 | Paragraph / CodeBlock / MathBlock / Table / HTMLBlock |
-| 20 | List / ListItem / Blockquote / Callout |
-| 30 | SuperBlock / AttributeView |
-| 200 | Text / TextMark |
-| 205 | Tag 标签 |
-| 100 | 其他 |
+| 对比维度 | 普通搜索 orderBy=0 | 引用搜索 |
+|---------|-------------------|---------|
+| CASE 层数 | 4 层 | 12 层 |
+| 涉及字段 | name, alias | name, alias, memo, content, fcontent |
+| 类型感知 | 无 | 有（d/h/i 类型分层） |
+| 精确 vs 模糊 | name/alias 各一层 | 每字段精确+模糊两层 |
+| 三级排序 | sort → updated | sort → **length** |
+| 输出限制 | 分页 LIMIT+OFFSET | 单一 LIMIT（`Conf.Search.Limit`） |
 
-### 5.3 FTS5 相关度排序
+**引用搜索排序的设计逻辑**：引用场景下用户更关心语义关联度——命名精确匹配 > 文档标题匹配 > 标题块匹配 > 列表项匹配 > 内容模糊匹配。这与普通搜索的「粗粒度 name/alias 优先」形成鲜明对比。
 
-对于 method=0/1 且 orderBy=6/7，使用 FTS5 内置的 `rank` 排序值：
-```sql
--- 相关度降序（默认相关度搜索）
-ORDER BY rank
+**引用搜索的 snippet 参数**：`snippet(..., 64)` —— 片段长度仅 64 字符（普通搜索为 512），因为反链面板空间有限。
 
--- 相关度升序（注意 rank 越小越相关，所以 ASC 实际是最相关在前，这里作者做了反直觉处理）
-ORDER BY rank DESC
-```
+**风险**：
+1. **12 层 CASE 依赖 content 全量比较**：`content = '${keyword}'` 需要完整内容精确匹配，对长文本块几乎不可能命中；`content LIKE '%${keyword}%'` 在 B-Tree 表上无法利用索引
+2. **无 rank 可用**：引用搜索固定走 FTS5 MATCH 查结果，但排序完全由 CASE 覆盖，未利用 FTS5 的 BM25 相关度信息
+3. **LIMIT 无 OFFSET**：引用搜索使用 `Conf.Search.Limit` 做硬截断，不支持分页
 
-FTS5 的 `rank` 值基于 **BM25 算法** 计算：综合词频(TF)、逆文档频率(IDF)、文档长度归一化。
+### 5.5 正则搜索（method=3）排序行为
+
+- **执行层**：普通 `blocks` 表 + `REGEXP` 函数（全表扫描 + Go 层二次过滤）
+- **排序子句**：直接使用 `buildOrderBy()` 返回值
+- **orderBy=6/7**：**降级为 `sort DESC, updated DESC` / `sort ASC, updated DESC`**，因为 `blocks` 表无 `rank` 列
+- **orderBy=0**：CASE 4 层同普通搜索
+- **二级排序**：Go 层 `SelectBlocksRegex()` 在内存中做正则二次过滤后手动分页，可能影响最终结果顺序
+
+**风险**：
+1. **相关度排序名不副实**：用户选择「按相关度排序」，实际得到的是块类型+更新时间排序
+2. **内存层过滤与 SQL 排序的交互**：SQL 的 ORDER BY 在全表扫描后执行，但 Go 层的正则过滤可能在 SQL LIMIT 之后做二次裁剪，导致分页不准
+
+### 5.6 SQL 搜索（method=2）排序行为
+
+- **执行层**：用户自定义 SQL，直接透传执行
+- **排序子句**：由用户 SQL 自带，`buildOrderBy()` 的返回值被**完全忽略**
+- **无任何排序干预**：代码仅通过 `sqlparser` 注入分页 LIMIT/OFFSET，不修改 ORDER BY
+
+**风险**：
+1. **用户 SQL 无 ORDER BY**：结果顺序不确定，分页无意义
+2. **SQL 注入**：虽然需要管理员权限，但允许执行任意 DQL（包括 UNION、子查询等）
+
+### 5.7 按文档分组（groupBy=1）的排序叠加
+
+无论哪种搜索模式，当 `groupBy=1` 时，排序结果会在 Go 层被重新组织：
+
+1. **提取文档根**：遍历搜索结果，按 `rootID` 去重
+2. **加载 AST 树**：对每个文档根调用 `loadTreeByBlockTree()` 获取完整树
+3. **orderBy=5 时**：遍历 AST 树，为每个块赋值 `contentSorts[blockID] = sortVal++`（DFS 顺序），此排序仅在 Go 层生效
+4. **文档内排序**（Children 排序）：
+   - orderBy=1/2/3/4：按 created/updated 排序
+   - orderBy=5：按 contentSorts 值排序（AST 遍历序）
+   - 默认（orderBy=0）：按 sort 值排序
+5. **文档间排序**（Root 排序）：
+   - orderBy=1/2/3/4：按 created/updated 排序
+   - orderBy=5：按 updated 降序（代码注释：都是文档，按更新时间降序）
+   - orderBy=6/7：已在 SQL 中处理（但 FTS rank 在分组后语义已变）
+   - 默认：不排序（代码注释：都是文档，不需要再次排序）
+
+**风险**：
+1. **AST 加载开销**：每个命中文档都要 `loadTreeByBlockTree()`，命中文档数多时内存和 CPU 开销大
+2. **分组后 rank 语义丢失**：文档根的 rank 值是根块的 rank，不反映子块的聚合相关度
+3. **orderBy=0 分组后退化**：文档间不排序，文档内按 sort（块类型码）排序，丢失了 CASE name/alias 的精细排序
+
+### 5.8 各模式排序汇总
+
+| 搜索模式 | orderBy=0 | orderBy=6 | orderBy=7 | 三级排序 |
+|---------|-----------|-----------|-----------|---------|
+| 普通-单关键词(FTS) | CASE 4层(name/alias) + sort + updated | `rank DESC` (BM25升序) | `rank` (BM25降序) | sort→updated |
+| 普通-多关键词(LIKE) | CASE 4层 + blockSort + sort + updated | 降级为CASE+blockSort ASC | 降级为CASE+blockSort DESC | blockSort→sort→updated |
+| 查询语法(FTS) | CASE 4层(query原文) + sort + updated | `rank DESC` | `rank` | sort→updated |
+| 引用搜索 | **CASE 12层**(含content/type/fcontent) + sort + length | N/A(固定CASE排序) | N/A | sort→length |
+| 正则(blocks表) | CASE 4层 + sort + updated | 降级为sort DESC,updated DESC | 降级为sort ASC,updated DESC | sort→updated |
+| SQL(自定义) | 用户SQL自带 | 用户SQL自带 | 用户SQL自带 | 由用户SQL决定 |
 
 ---
 
@@ -457,7 +557,7 @@ FTS5 的 `rank` 值基于 **BM25 算法** 计算：综合词频(TF)、逆文档�
 
 ### 6.1 事务粒度
 
-**每操作 = 每事务**：参考 [FlushQueue()](file:///d:/fz/0601/solo-dogfeeding/code/290-siyuan/kernel/sql/queue.go#L102-L180)
+**每操作 = 每事务**：
 
 ```go
 for i, op := range ops {
@@ -477,7 +577,6 @@ for i, op := range ops {
 
 blocks（B-Tree）和 blocks_fts（FTS5）的写入通过**同一事务**中的两条 INSERT 语句保证原子性：
 
-参考 [insertBlocks0()](file:///d:/fz/0601/solo-dogfeeding/code/290-siyuan/kernel/sql/upsert.go#L85-L141)：
 ```go
 prepareExecInsertTx(tx, BlocksInsert, ...)       // blocks 表
 if caseSensitive {
@@ -503,7 +602,7 @@ if caseSensitive {
 
 ### 6.4 缓存一致性
 
-**块缓存层**（ristretto 高性能缓存，参考 [cache.go#L42-L82](file:///d:/fz/0601/solo-dogfeeding/code/290-siyuan/kernel/sql/cache.go#L42-L82)）：
+**块缓存层**（ristretto 高性能缓存）：
 - 写入时：`putBlockCache(block)` 克隆后存入，移除高亮标记
 - 删除时：`removeBlockCache(id)` 同时删除引用缓存
 - 批量操作（>512 ops）：`disableCache()` 清空缓存跳过写入，避免缓存失效风暴
@@ -533,22 +632,35 @@ if caseSensitive {
 | **多关键词 LIKE 模式** | 空格分隔的 2+ 关键词搜索 | `GROUP_CONCAT` + 全表聚合，百万块级查询 >5s |
 | **正则搜索** | method=3 且无其他过滤条件 | 全表扫描 + Go 层 regexp 二次校验，O(N) |
 | **按文档分组 + 内容顺序** | groupBy=1, orderBy=5 | 需重新遍历每棵 AST 树记录 sortVal，内存开销大 |
-| **SQL 注入（用户自定义 SQL）** | method=2 管理员模式 | 虽然有 sqlparser 注入 LIMIT，但本质允许任意 DQL |
+| **SQL 搜索（用户自定义 SQL）** | method=2 管理员模式 | 虽然有 sqlparser 注入 LIMIT，但本质允许任意 DQL |
 | **FTS5 长查询** | 单关键词过长 + snippet(512) | 高亮计算开销随片段数线性增长 |
+| **引用搜索 12 层 CASE** | 反链面板打开时 | CASE 中 `content LIKE` 对每行求值，无法利用索引 |
 
-### 7.3 一致性边界问题
+### 7.3 排序相关的一致性与语义风险
+
+1. **默认排序对内容命中无区分度**：普通搜索 orderBy=0 的 CASE 仅覆盖 name/alias（4 层），content 命中全部落入 ELSE 65535。**一个 content 精确匹配的块与一个完全不匹配的块在 CASE 层面同权重**，仅靠 sort（块类型）和 updated 区分，用户体验上可能感到「搜到了但排序不合理」。
+
+2. **多关键词模式下 rank 降级隐蔽**：用户在 UI 选择「按相关度排序」时，无法感知多关键词模式已将 rank 降级为 CASE+blockSort。BM25 的「词频+逆文档频率」语义完全丢失，blockSort 仅区分「自身命中/仅文档命中」两档。
+
+3. **正则/SQL 模式下相关度排序名不副实**：orderBy=6/7 在 method=2/3 时降级为 sort+updated，前端 UI 仍显示「按相关度排序」选项，但实际与「按块类型」排序几乎等效。
+
+4. **引用搜索排序独立于 `buildOrderBy()`**：引用搜索硬编码 12 层 CASE + length 三级排序，与普通搜索的 4 层 CASE + updated 三级排序完全不同。同一关键词在普通搜索和引用搜索中可能出现在不同位置。
+
+5. **分组后排序体系重构**：groupBy=1 时 Go 层对结果重新排序，文档根的排序逻辑与 SQL 层不一致。例如 orderBy=0 分组后文档间不排序，而 SQL 中有 CASE 排序。
+
+### 7.4 一致性边界问题
 
 1. **3 秒延迟窗口内搜索旧数据**：队列未刷盘时，最新编辑不可搜。属于「写入后读己之写」不一致，需靠前端提示或 `WaitFlushTx()`。
 
-2. **大小写切换不重建**：`SetCaseSensitive()` 仅切换当前查询表，不做数据迁移。切换后旧数据只存在于另一张 FTS 表中，需手动重建索引（参考 [database.go#L377-L391](file:///d:/fz/0601/solo-dogfeeding/code/290-siyuan/kernel/sql/database.go#L377-L391)）。
+2. **大小写切换不重建**：`SetCaseSensitive()` 仅切换当前查询表，不做数据迁移。切换后旧数据只存在于另一张 FTS 表中，需手动重建索引。
 
 3. **引用解析的两步法**：先入队 `upsertTree`（不建 refs），后 `IndexRefs` 二次扫描。两步骤之间引用关系为空。且 `IndexRefs` 仅启动时执行，运行期新增引用需靠下次写文档触发。
 
-4. **删除路径前缀的 LIKE 匹配风险**：`path LIKE 'foo%'` 会匹配到 `foobar/`，存在误删隐患。正确写法是 `foo/%`，但代码在 `batchDeleteByPathPrefix()` 中使用 `pathPrefix+"%"`（参考 [database.go#L1208-L1246](file:///d:/fz/0601/solo-dogfeeding/code/290-siyuan/kernel/sql/database.go#L1208-L1246)）。
+4. **删除路径前缀的 LIKE 匹配风险**：`path LIKE 'foo%'` 会匹配到 `foobar/`，存在误删隐患。正确写法是 `foo/%`，但代码在 `batchDeleteByPathPrefix()` 中使用 `pathPrefix+"%"`。
 
 5. **FTS5 插入非 UNINDEXED 列空值**：`name/alias/memo/tag` 等可索引列若为 NULL 或空串不参与倒排，但仍占用 FTS 行存储。
 
-### 7.4 资源与内存风险
+### 7.5 资源与内存风险
 
 | 风险点 | 分析 |
 |--------|------|
@@ -571,39 +683,49 @@ if caseSensitive {
 
 4. **向量检索混合查询**：将当前 keyword-only 搜索扩展为「关键词倒排 + 语义向量 ANN」混合检索，支持自然语言相似度查询。需要新增向量索引（如 sqlite-vss 扩展）。
 
-### 8.2 性能优化方向
+### 8.2 排序语义优化方向
 
-5. **多关键词搜索优化**：当前 2+ 关键词走 `GROUP_CONCAT` 全表聚合。可改为：
+5. **统一排序体系**：当前普通搜索（4 层 CASE）、引用搜索（12 层 CASE）和 rank 排序是三套独立逻辑。建议将引用搜索的精细 CASE 也回迁到普通搜索的默认排序中，至少增加 content/memo 的匹配层级，解决「内容命中无区分度」问题。
+
+6. **多关键词模式 rank 降级透明化**：当 `fullTextSearchByLikeWithRoot` 接收到 orderBy=6/7 时，应向用户明确提示「多关键词搜索不支持 BM25 相关度排序，已切换为语义匹配排序」，或在 CTE 中模拟近似 rank（如基于命中关键词数的加权评分）。
+
+7. **正则/SQL 模式下隐藏 rank 选项**：method=2/3 时 orderBy=6/7 已降级为 sort+updated，前端应禁用或标注降级，避免误导用户。
+
+8. **引用搜索引入 FTS5 rank 辅助排序**：当前引用搜索的 12 层 CASE 完全覆盖了排序逻辑，未利用 FTS5 的 BM25 信息。可在 CASE ELSE 分支中引入 `rank` 作为更深层的区分因子。
+
+### 8.3 性能优化方向
+
+9. **多关键词搜索优化**：当前 2+ 关键词走 `GROUP_CONCAT` 全表聚合。可改为：
    ```
    FTS5('"kw1"') INTERSECT FTS5('"kw2"') INTERSECT ...
    ```
    或使用 FTS5 `phrase` 查询而非纯 LIKE。
 
-6. **查询结果预取 + 滚动游标**：当前 `SelectBlocksRawStmt` 一次加载全量结果到内存。对大 LIMIT 可改为流式游标，配合前端虚拟滚动。
+10. **查询结果预取 + 滚动游标**：当前 `SelectBlocksRawStmt` 一次加载全量结果到内存。对大 LIMIT 可改为流式游标，配合前端虚拟滚动。
 
-7. **二级索引增强**：当前仅有 root_id / parent_id / id 单列索引。可增加 `(box, path, type)` 复合索引，加速笔记本内类型过滤。
+11. **二级索引增强**：当前仅有 root_id / parent_id / id 单列索引。可增加 `(box, path, type)` 复合索引，加速笔记本内类型过滤。
 
-8. **tokenizer 热更新**：当前 `siyuan` tokenizer 为编译期绑定。可研究支持自定义词典、停用词表在线 reload。
+12. **tokenizer 热更新**：当前 `siyuan` tokenizer 为编译期绑定。可研究支持自定义词典、停用词表在线 reload。
 
-### 8.3 一致性增强方向
+### 8.4 一致性增强方向
 
-9. **队列级事务合并**：对同一 root_id 的连续 upsert+rename+move 合并为单事务执行，减少 IO 次数并消除中间可见状态。
+13. **队列级事务合并**：对同一 root_id 的连续 upsert+rename+move 合并为单事务执行，减少 IO 次数并消除中间可见状态。
 
-10. **刷盘确认回执**：`FlushQueue` 完成后通过 WebSocket 推送 `databaseIndexCommit` 事件（已实现，见 [queue.go#L177](file:///d:/fz/0601/solo-dogfeeding/code/290-siyuan/kernel/sql/queue.go#L177)），前端据此展示搜索图标状态，并在 API 层提供「等待索引完成」参数。
+14. **刷盘确认回执**：`FlushQueue` 完成后通过 WebSocket 推送 `databaseIndexCommit` 事件，前端据此展示搜索图标状态，并在 API 层提供「等待索引完成」参数。
 
-11. **FTS 表一致性巡检**：启动时对比 `blocks COUNT` 与 `blocks_fts COUNT`，不一致自动修复。当前仅检测表结构版本（`DatabaseVer`），不检测行数一致性。
+15. **FTS 表一致性巡检**：启动时对比 `blocks COUNT` 与 `blocks_fts COUNT`，不一致自动修复。当前仅检测表结构版本（`DatabaseVer`），不检测行数一致性。
 
-12. **大小写切换平滑迁移**：`SetCaseSensitive` 变更时自动同步迁移数据（INSERT ... SELECT），而非依赖重建。
+16. **大小写切换平滑迁移**：`SetCaseSensitive` 变更时自动同步迁移数据（INSERT ... SELECT），而非依赖重建。
 
-### 8.4 边界与鲁棒性研究
+### 8.5 边界与鲁棒性研究
 
-13. **超大数据集基准测试**：测试 100w 块 / 10GB 数据规模下的 FTS5 首次查询延迟、WAL checkpoint 抖动、B-Tree 页分裂频率。
+17. **超大数据集基准测试**：测试 100w 块 / 10GB 数据规模下的 FTS5 首次查询延迟、WAL checkpoint 抖动、B-Tree 页分裂频率。
 
-14. **并发写入场景压测**：多个协程同时 `UpsertTreeQueue` 不同笔记本时，观察 `sqlite3_busy_timeout` 触发频率与 WAL 竞争。
+18. **并发写入场景压测**：多个协程同时 `UpsertTreeQueue` 不同笔记本时，观察 `sqlite3_busy_timeout` 触发频率与 WAL 竞争。
 
-15. **`_synchronous=OFF` 的 crash-consistency 验证**：使用 kill -9 / 断电测试，验证 WAL 重放能否保证数据库完整，以及最多丢失多少秒的数据。
+19. **`_synchronous=OFF` 的 crash-consistency 验证**：使用 kill -9 / 断电测试，验证 WAL 重放能否保证数据库完整，以及最多丢失多少秒的数据。
 
-16. **嵌入块递归查询防护**：A 嵌入 B 的查询结果，B 的结果又包含 A → 无限递归。当前靠 `content = "no query result"` 中断，但需检测循环引用。
+20. **嵌入块递归查询防护**：A 嵌入 B 的查询结果，B 的结果又包含 A → 无限递归。当前靠 `content = "no query result"` 中断，但需检测循环引用。
 
 ---
 
@@ -611,15 +733,15 @@ if caseSensitive {
 
 | 模块 | 文件 | 关键函数/结构 |
 |------|------|-------------|
-| DB 初始化 | [database.go](file:///d:/fz/0601/solo-dogfeeding/code/290-siyuan/kernel/sql/database.go) | `InitDatabase`, `initDBTables`, `SetCaseSensitive` |
-| 操作队列 | [queue.go](file:///d:/fz/0601/solo-dogfeeding/code/290-siyuan/kernel/sql/queue.go) | `FlushQueue`, `UpsertTreeQueue`, `execOp` |
-| 数据插入 | [upsert.go](file:///d:/fz/0601/solo-dogfeeding/code/290-siyuan/kernel/sql/upsert.go) | `upsertTree`, `insertBlocks0`, `insertTree0` |
-| 块查询 | [block_query.go](file:///d:/fz/0601/solo-dogfeeding/code/290-siyuan/kernel/sql/block_query.go) | `SelectBlocksRawStmt`, `GetBlock`, `Query` |
-| 全文搜索 | [model/search.go](file:///d:/fz/0601/solo-dogfeeding/code/290-siyuan/kernel/model/search.go) | `FullTextSearchBlock`, `fullTextSearchByFTS` |
-| 搜索高亮 | [search/mark.go](file:///d:/fz/0601/solo-dogfeeding/code/290-siyuan/kernel/search/mark.go) | `MarkText`, `EncloseHighlighting` |
-| 缓存层 | [sql/cache.go](file:///d:/fz/0601/solo-dogfeeding/code/290-siyuan/kernel/sql/cache.go) | `putBlockCache`, `defIDRefsCache` |
-| 索引构建 | [model/index.go](file:///d:/fz/0601/solo-dogfeeding/code/290-siyuan/kernel/model/index.go) | `indexBox`, `IndexRefs`, `IndexEmbedBlockJob` |
-| 任务调度 | [task/queue.go](file:///d:/fz/0601/solo-dogfeeding/code/290-siyuan/kernel/task/queue.go) | `AppendTask`, `ExecTaskJob`, `popTask` |
-| 定时任务 | [job/cron.go](file:///d:/fz/0601/solo-dogfeeding/code/290-siyuan/kernel/job/cron.go) | `StartCron`, `every` |
-| 搜索配置 | [conf/search.go](file:///d:/fz/0601/solo-dogfeeding/code/290-siyuan/kernel/conf/search.go) | `Search.TypeFilter`, `NewSearch` |
-| HTTP API | [api/search.go](file:///d:/fz/0601/solo-dogfeeding/code/290-siyuan/kernel/api/search.go) | `fullTextSearchBlock`, `searchRefBlock` |
+| DB 初始化 | `kernel/sql/database.go` | `InitDatabase`, `initDBTables`, `SetCaseSensitive` |
+| 操作队列 | `kernel/sql/queue.go` | `FlushQueue`, `UpsertTreeQueue`, `execOp` |
+| 数据插入 | `kernel/sql/upsert.go` | `upsertTree`, `insertBlocks0`, `insertTree0` |
+| 块查询 | `kernel/sql/block_query.go` | `SelectBlocksRawStmt`, `GetBlock`, `Query` |
+| 全文搜索 | `kernel/model/search.go` | `FullTextSearchBlock`, `fullTextSearchByFTS`, `fullTextSearchByLikeWithRoot`, `fullTextSearchRefBlock`, `buildOrderBy` |
+| 搜索高亮 | `kernel/search/mark.go` | `MarkText`, `EncloseHighlighting` |
+| 缓存层 | `kernel/sql/cache.go` | `putBlockCache`, `defIDRefsCache` |
+| 索引构建 | `kernel/model/index.go` | `indexBox`, `IndexRefs`, `IndexEmbedBlockJob` |
+| 任务调度 | `kernel/task/queue.go` | `AppendTask`, `ExecTaskJob`, `popTask` |
+| 定时任务 | `kernel/job/cron.go` | `StartCron`, `every` |
+| 搜索配置 | `kernel/conf/search.go` | `Search.TypeFilter`, `NewSearch` |
+| HTTP API | `kernel/api/search.go` | `fullTextSearchBlock`, `searchRefBlock` |
