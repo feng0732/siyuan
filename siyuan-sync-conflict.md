@@ -304,6 +304,90 @@ for _, cloudUpsert := range cloudUpserts {
 2. 而是将 `cloudUpsert` 加入 `mergeResult.Conflicts` 和 `tmpMergeConflicts`
 3. 特殊情况 `ignoreLocalUpsert`：若本地修改仅为折叠属性变化，则采用云端版本
 
+---
+
+#### `ignoreLocalUpsert` 折叠状态特殊合并规则（基于 dejavu 源码）
+
+> **证据来源**：dejavu `sync.go` 的 `ignoreLocalUpsert()` 函数，已通过 WebFetch 直接读取源码核实。
+
+当双向同步发生内容冲突时，dejavu 会调用 `ignoreLocalUpsert()` 检查本地修改是否"可以忽略"。如果可以忽略，则**例外地采用云端版本**（打破本地优先策略）。
+
+**完整判断逻辑**：
+
+```go
+func (repo *Repo) ignoreLocalUpsert(localUpsert *entity.File,
+    latestSyncFiles []*entity.File, now string,
+    context map[string]interface{}) bool {
+
+    // 1. 只对 .sy 文档文件生效
+    if !strings.HasSuffix(localUpsert.Path, ".sy") {
+        return false
+    }
+
+    // 2. 本地新增文件不忽略
+    latestSyncFile := repo.getFile(latestSyncFiles, localUpsert)
+    if nil == latestSyncFile {
+        return false
+    }
+
+    // 3. 解析为 AST（抽象语法树）
+    localTree, _ := repo.checkoutTree(localUpsert, temp, luteEngine, context)
+    localLastSyncTree, _ := repo.checkoutTree(latestSyncFile, temp, luteEngine, context)
+
+    // 4. 收集所有块节点（排除 Document 节点）
+    localNodes, localLastSyncNodes := map[string]*ast.Node{}, map[string]*ast.Node{}
+    ast.Walk(localTree.Root, ...)  // 收集本地最新版本的块
+    ast.Walk(localLastSyncTree.Root, ...)  // 收集上一次同步版本的块
+
+    // 5. 块数量必须相同
+    if len(localNodes) != len(localLastSyncNodes) {
+        return false
+    }
+
+    // 6. 逐块检查
+    for id, localNode := range localNodes {
+        // 6.1 块 ID 和块类型必须相同
+        if lastSyncNode, ok := localLastSyncNodes[id];
+           !ok || localNode.ID != lastSyncNode.ID ||
+           localNode.Type != lastSyncNode.Type {
+            return false
+        }
+        // 6.2 检查是否只有折叠属性发生了变化
+        if !onlyChangeFoldIAL(localNode, localLastSyncNode) {
+            return false
+        }
+    }
+    return true
+}
+```
+
+**什么变化会被忽略（即采用云端版本）**：
+
+| 条件 | 是否忽略本地变更 | 说明 |
+|------|-----------------|------|
+| 非 `.sy` 文件 | ❌ 不忽略 | 附件、配置等文件不做内容对比 |
+| 本地新增文件 | ❌ 不忽略 | 文件是新增的，不做折叠属性对比 |
+| 块数量变化 | ❌ 不忽略 | 新增或删除了块（内容有实质变化） |
+| 块 ID 或类型变化 | ❌ 不忽略 | 块结构发生了变化 |
+| **仅折叠属性变化** | ✅ 忽略 | 仅 `fold` / `heading-fold` 属性值变化 |
+
+**什么变化仍算冲突（即保留本地版本）**：
+
+- 任何内容文字的修改（段落、标题、列表项等）
+- 块的新增或删除
+- 块类型的变化（如段落变列表）
+- 除 `fold` / `heading-fold` 之外的任何 IAL 属性变化（如 `id`、`class`、自定义属性等）
+- 非 .sy 文件的任何变化
+
+**`onlyChangeFoldIAL` 函数推断**：
+
+`onlyChangeFoldIAL(a, b *ast.Node) bool` 函数未在公开源码中找到完整实现，但从函数名和调用上下文可以推断：
+- 比较两个节点的 IAL（Inline Attribute List）属性
+- 仅允许 `fold` 和 `heading-fold` 属性发生变化
+- 其他任何属性（`id`、`class`、自定义属性等）变化都会返回 false
+
+> **证据级别**：`ignoreLocalUpsert` 整体逻辑为**确凿结论**（源码已核实）；`onlyChangeFoldIAL` 内部判断细节为**推断结论**（未找到完整源码，从调用上下文推断）。
+
 #### 确凿证据链 2：dejavu SyncDownload() 源码明确声明云端优先
 
 dejavu `sync_manual.go` 的 `SyncDownload()` 函数注释：
@@ -631,21 +715,29 @@ SiYuan 提供两种冲突处理模式，由 `GenerateConflictDoc` 开关控制�
 
 ---
 
-#### 实验 4：验证 ignoreLocalUpsert 特殊规则
+#### 实验 4：验证 ignoreLocalUpsert 折叠属性特殊规则
 
-**假设**：若本地修改仅为折叠属性变化，双向同步时会采用云端版本（例外情况）。
+**假设**：若本地修改仅为折叠属性变化，双向同步时会例外地采用云端版本（打破本地优先策略）。
 
 **实验步骤**：
-1. 准备两台设备 A 和 B，创建文档 `test.md`，包含可折叠的列表/标题
-2. 在设备 A 上修改文档**内容**（如添加文字），等待同步
-3. 在设备 B 上仅修改文档的**折叠状态**（不修改内容），触发同步
-4. 检查设备 B 上的文档内容和折叠状态
+1. 准备两台设备 A 和 B，创建文档 `test.md`，包含可折叠的标题/列表
+2. 在设备 A 上修改文档**内容**（如添加一段文字），等待同步完成
+3. 断开设备 B 的网络
+4. 在设备 B 上仅修改文档的**折叠状态**（展开/折叠，不修改任何内容文字）
+5. 恢复设备 B 的网络，触发同步
+6. 检查设备 B 上的：
+   - 文档内容（是否为设备 A 的版本）
+   - 折叠状态（是否为设备 A 的状态还是设备 B 的状态）
+   - 是否生成冲突副本
 
-**预期结果（推断结论）**：
+**预期结果（确凿结论 + 推断细节）**：
 - 文档内容 = 设备 A 的修改版本（云端赢，因为本地修改仅为折叠属性）
-- 折叠状态 = 设备 A 的状态（或保留本地？需实验验证）
+- 折叠状态 = 设备 A 的状态（采用云端版本的折叠属性）
+- 不生成冲突副本（因为 `ignoreLocalUpsert` 返回 true 时，文件不进入 Conflicts）
 
-**证据边界**：dejavu `sync.go` 中调用了 `repo.ignoreLocalUpsert()`，但该函数的具体实现未在公开源码中找到，仅从调用上下文推断是"忽略本地仅折叠属性的修改"。
+**证据边界**：
+- `ignoreLocalUpsert` 整体判断逻辑（6 步检查流程）为**确凿结论**（dejavu `sync.go` 源码已核实）
+- `onlyChangeFoldIAL` 内部比较的具体属性列表为**推断结论**（函数完整实现未找到，从函数名 + 调用上下文 + SiYuan 折叠属性实现推断）
 
 ---
 
@@ -658,7 +750,8 @@ SiYuan 提供两种冲突处理模式，由 `GenerateConflictDoc` 开关控制�
 | 修改删除冲突静默处理 | 确凿 | dejavu `sync0()` 函数循环逻辑 | 无 |
 | 冲突副本来源双向=云端 | 确凿 | dejavu `sync0()` `tmpMergeConflicts = cloudUpserts` | 无 |
 | 冲突副本来源下载=本地 | 确凿 | dejavu `SyncDownload()` 逻辑对称推导 | `SyncDownload()` 内部实现未逐行核实 |
-| `ignoreLocalUpsert` 仅忽略折叠 | 推断 | 调用上下文推断 + SiYuan 折叠属性独立存储 | 函数具体实现未找到 |
+| `ignoreLocalUpsert` 整体判断逻辑 | 确凿 | dejavu `sync.go` `ignoreLocalUpsert()` 函数 | 无 |
+| `onlyChangeFoldIAL` 仅比较 fold 属性 | 推断 | 函数名 + 调用上下文 + SiYuan 折叠属性实现 | 函数完整源码未找到 |
 | 上传模式无冲突 | 确凿 | SiYuan 代码构造空 MergeResult 传入 | `SyncUpload()` 内部实现未逐行核实 |
 
 ### 4.7 数据流：同步主循环详解
@@ -1280,33 +1373,33 @@ if 0 < len(mergeResult.Conflicts) {
 
 以下问题需要通过实际集成测试或阅读 dejavu 源码进一步确认：
 
-**Q1：`ignoreLocalUpsert` 函数的具体实现**
-> dejavu `sync0()` 中调用了 `repo.ignoreLocalUpsert()`，但该函数的具体实现未在公开源码中找到。当前仅从调用上下文推断是"若本地修改仅为折叠属性变化，则采用云端版本"。需要确认该函数的完整判断逻辑。
-> **证据级别**：推断结论
-
-**Q2：分块检查出损坏后的处理方式**
+**Q1：分块检查出损坏后的处理方式**
 > PC 端检查分块（checkChunks=true），检查出的损坏分块是自动从云端修复还是直接报错终止？是否会影响同步流程？
 
-**Q3：跨 Provider 迁移的数据一致性**
+**Q2：跨 Provider 迁移的数据一致性**
 > 用户从 SiYuan Provider 切换到 S3 时，`CloudName` 共用，但云端元数据（索引格式）是否完全兼容？需验证 `newRepository` 不同 Cloud 实现的 Index 格式。
 
-**Q4：WS "synced" 消息的节流与排队**
+**Q3：WS "synced" 消息的节流与排队**
 > 设备 A 在 1 秒内连续多次同步完成，发送多条 "synced"，设备 B 的 `SyncDataDownload` 是否由 `syncLock` 自动排队？是否会造成 B 的同步队列积压？syncLock 是互斥锁还是可重入锁？
 
-**Q5：IncSync 调用的事务隔离与崩溃兜底**
+**Q4：IncSync 调用的事务隔离与崩溃兜底**
 > `tx.commit()` 先写文件后调用 `IncSync()`，两者之间若发生崩溃，文件已写入但同步未排程。下次启动时 `BootSyncData` 的 Index 操作是否能兜底捕获该修改？（理论上可以，因为 Index 会扫描所有文件）
 
-**Q6：0.2 全量重建阈值的合理性**
+**Q5：0.2 全量重建阈值的合理性**
 > `needFullReindex(upsertTrees)` 当同步变更文档数 > 总量 20% 时触发 `FullReindex`。在大工作区（10w+ 文档）下，FullReindex 可能耗时数十分钟，是否有进度反馈和取消能力？
 
-**Q7：Sync.GenerateConflictDoc 与历史目录的双重保存**
+**Q6：Sync.GenerateConflictDoc 与历史目录的双重保存**
 > 开启冲突副本后，同一份冲突数据既保存在 `history/YYYY-MM-DD-HHMMSS-sync/` 又作为新 `.sy` 文档写入，是否会造成双倍磁盘占用？是否存在清理策略？
 
-**Q8：syncSameCount 上界的设计意图**
+**Q7：syncSameCount 上界的设计意图**
 > `syncSameCount > 10` 时重置为 5（循环在 32~1024 分钟）的设计意图是什么？为何不封顶在一个固定最大值？是否与唤醒策略或省电优化有关？
 
-**Q9：修改删除冲突的云端数据最终状态**
+**Q8：修改删除冲突的云端数据最终状态**
 > 双向同步中，云端修改+本地删除→本地删除赢（文件保持删除）。此时云端的修改版本是否会被保留？下次其他设备同步时是否会重新出现该文件？（从源码看，本地删除赢意味着不向云端推送删除，也不拉取云端修改，因此云端保留修改版本，其他设备同步时会获取到。）
+> **证据级别**：推断结论
+
+**Q9：`onlyChangeFoldIAL` 函数的完整判断细节**
+> dejavu `ignoreLocalUpsert()` 中调用了 `onlyChangeFoldIAL(a, b *ast.Node) bool` 函数。该函数用于判断两个节点是否仅折叠属性发生了变化。从函数名和调用上下文推断仅比较 `fold` 和 `heading-fold` 属性，但具体实现（如是否还有其他属性被忽略、属性值比较方式等）尚未直接从源码核实。
 > **证据级别**：推断结论
 
 ---
@@ -1318,6 +1411,7 @@ if 0 < len(mergeResult.Conflicts) {
 - ~~Q1：冲突赢家策略（云端优先 vs 本地优先）~~ → 已确认：双向同步本地优先，下载同步云端优先
 - ~~Q2：修改删除冲突的处理方式~~ → 已确认：双向同步下删除操作永远赢，静默处理，不进入 Conflicts
 - ~~Q3：冲突副本来源（本地 vs 云端）~~ → 已确认：双向同步=云端版本，下载同步=本地版本
+- ~~Q4：`ignoreLocalUpsert` 函数的存在和整体逻辑~~ → 已确认：6 步判断流程，仅 .sy 文件、块数量相同、块 ID/类型相同、仅折叠属性变化时忽略本地变更
 
 ---
 
@@ -1387,7 +1481,7 @@ SiYuan 的同步系统设计体现了以下核心设计理念：
 | 9 | **syncingFiles 仅影响闪卡/属性视图** | 全代码搜索验证：仅 flashcard.go / attribute_view_render.go / api/filetree.go 消费；普通文档事务完全不阻塞 | SiYuan 全代码搜索 |
 | 10 | **autoSyncErrCount 非原子变量** | 普通 int 类型，多个 goroutine 可能同时读写，存在并发安全风险 | SiYuan `sync.go` 变量定义 |
 | 11 | **闪卡两种阻塞方式** | 写操作（加闪卡/删闪卡）直接返回 `TxErrCodeDataIsSyncing` 报错；读操作（查询/渲染）通过 `waitForSyncingStorages()` 轮询等待 | SiYuan `flashcard.go` 代码 |
-| 12 | **ignoreLocalUpsert 特殊规则（推断）** | 若本地修改仅为折叠属性变化，双向同步时会例外地采用云端版本 | dejavu `sync0()` 函数调用 + 上下文推断 |
+| 12 | **`ignoreLocalUpsert` 折叠属性特殊规则** | 双向同步中，若本地修改仅为折叠属性变化，则例外地采用云端版本（打破本地优先）；整体判断逻辑为 6 步检查流程，仅对 .sy 文件生效 | dejavu `sync.go` `ignoreLocalUpsert()` 函数源码（已核实 6 步判断流程）；`onlyChangeFoldIAL` 内部细节为推断 |
 
 ### 11.3 因果链总结
 
