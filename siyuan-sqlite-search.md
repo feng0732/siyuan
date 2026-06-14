@@ -113,10 +113,42 @@ CREATE VIRTUAL TABLE blocks_fts_case_insensitive USING fts5(
 
 **设计要点**：
 - 使用 SiYuan 自研的 `siyuan` tokenizer 分词器（支持中文切分）
-- **UNINDEXED 字段（13 个）**：`id, parent_id, root_id, hash, box, path, hpath, markdown, length, type, subtype, sort, created, updated` — 这些列仅存储于 FTS5 内容表中，不参与倒排索引构建
-- **可索引列（7 个）**：`name, alias, memo, tag, content, fcontent, ial` — 仅这 7 列构建倒排索引，参与 MATCH 查询和 snippet/highlight 高亮
-- FTS5 列按建表顺序编号（从 0 起），snippet 中引用的索引号对应：0=id, 1=parent_id, 2=root_id, 3=hash, 4=box, 5=path, 6=hpath, 7=name, 8=alias, 9=memo, 10=tag, 11=content, 12=fcontent, 13=markdown, 14=length, 15=type, 16=subtype, 17=ial, 18=sort, 19=created, 20=updated
-- 搜索时根据 `Conf.Search.CaseSensitive` 动态选择目标表
+- 总列数 21 列，其中 **14 个 UNINDEXED 列** + **7 个可索引列**
+
+**UNINDEXED 列（14 个，不参与倒排索引，仅存储原值用于返回）**：
+
+| 列号 | 列名 | 说明 |
+|------|------|------|
+| 0 | `id` | 块 ID |
+| 1 | `parent_id` | 父块 ID |
+| 2 | `root_id` | 文档根 ID |
+| 3 | `hash` | 内容哈希 |
+| 4 | `box` | 笔记本 ID |
+| 5 | `path` | 文档路径 |
+| 6 | `hpath` | 可读路径（人类友好路径） |
+| 13 | `markdown` | Markdown 原文 |
+| 14 | `length` | 内容长度 |
+| 15 | `type` | 块类型缩写（d/h/l/i/c/m/...） |
+| 16 | `subtype` | 块子类型（h1-h6 / u/o/t 列表类型） |
+| 18 | `sort` | 块排序码（nSort 函数生成） |
+| 19 | `created` | 创建时间 |
+| 20 | `updated` | 更新时间 |
+
+**可索引列（7 个，构建倒排索引，参与 MATCH 和 snippet）**：
+
+| 列号 | 列名 | 默认参与搜索 | 说明 |
+|------|------|------------|------|
+| 7 | `name` | 是（`Conf.Search.Name`） | 块命名属性 |
+| 8 | `alias` | 是（`Conf.Search.Alias`） | 块别名 |
+| 9 | `memo` | 是（`Conf.Search.Memo`） | 备注 |
+| 10 | `tag` | 始终参与 | 标签 |
+| 11 | `content` | 始终参与 | 块纯文本内容 |
+| 12 | `fcontent` | **否** | 容器块的首叶子块内容（用于列表项排序，不参与 MATCH） |
+| 17 | `ial` | 否（`Conf.Search.IAL` 默认关） | IAL 属性列表字符串 |
+
+> **注意**：7 个可索引列中，`columnFilter()` 实际只返回最多 6 个用于 MATCH 查询（content + 可选的 name/alias/memo/ial + tag），`fcontent` 虽然是可索引列但**不参与搜索**，仅在引用搜索排序的 CASE 中用 `fcontent LIKE` 匹配（这是 SQL 层的 LIKE，不是 FTS5 MATCH，不走倒排）。
+
+- 搜索时根据 `Conf.Search.CaseSensitive` 动态选择 `blocks_fts` 或 `blocks_fts_case_insensitive`
 
 **历史库与资源库 FTS5 表**：
 - `histories_fts_case_insensitive`：仅大小写不敏感模式
@@ -302,11 +334,16 @@ if 2 > len(strings.Split(strings.TrimSpace(query), " ")) {
 
 **步骤 1：列过滤**（`columnFilter()` 函数）
 
-根据配置选择要检索的 FTS5 列：
+根据配置选择要检索的 FTS5 可索引列，返回 FTS5 MATCH 语法的列过滤器：
 ```go
-// 示例：Name/Alias/Memo 开启，IAL 关闭
-"{content name alias memo tag}"
+// 默认配置（Name=true, Alias=true, Memo=true, IAL=false）
+"{content name alias memo tag}"    // 5 列
+
+// IAL 也开启时
+"{content name alias memo ial tag}"  // 6 列
 ```
+
+> **关键差异**：FTS5 共有 7 个可索引列（name/alias/memo/tag/content/fcontent/ial），但 `columnFilter()` **不包含 fcontent**。fcontent 虽然构建了倒排索引，但不参与 MATCH 搜索，仅在引用搜索排序的 CASE 表达式中通过 `LIKE` 使用（走全量扫描，不走倒排）。
 
 **步骤 2：关键词转义**（`stringQuery()` 函数）
 
@@ -319,14 +356,18 @@ if 2 > len(strings.Split(strings.TrimSpace(query), " ")) {
 ```sql
 SELECT
   id, parent_id, root_id, hash, box, path,
-  snippet(blocks_fts_case_insensitive, 6, '__@mark__', '__mark@__', '...', 512) AS hpath,
-  snippet(..., 7, ...) AS name,   -- 8=alias, 9=memo, 10=tag, 11=content
+  snippet(fts, 6, '__@mark__', '__mark@__', '...', 512) AS hpath,    -- 列6: hpath（UNINDEXED，无高亮标记）
+  snippet(fts, 7, '__@mark__', '__mark@__', '...', 512) AS name,     -- 列7: name
+  snippet(fts, 8, '__@mark__', '__mark@__', '...', 512) AS alias,    -- 列8: alias
+  snippet(fts, 9, '__@mark__', '__mark@__', '...', 512) AS memo,     -- 列9: memo
+  snippet(fts, 10, '__@mark__', '__mark@__', '...', 64) AS tag,      -- 列10: tag（仅64 token）
+  snippet(fts, 11, '__@mark__', '__mark@__', '...', 512) AS content, -- 列11: content
   fcontent, markdown, length, type, subtype, ial, sort, created, updated
-FROM blocks_fts_case_insensitive
-WHERE (blocks_fts_case_insensitive MATCH '{content name alias memo tag}:("关键词")')
-  AND type IN ('d','h','c','m','t','html','av','p')  -- TypeFilter()，默认开启的类型
+FROM blocks_fts_case_insensitive fts
+WHERE (fts MATCH '{content name alias memo tag}:("关键词")')
+  AND type IN ('d','h','c','m','t','html','av','p')  -- TypeFilter()，默认8种类型
   AND (box = 'box1' OR box = 'box2')                  -- 笔记本过滤
-  AND (path LIKE 'path1%' OR path LIKE 'path2%')      -- 路径过滤
+  AND (path LIKE 'path1%' OR path LIKE 'path2%')      -- 路径前缀过滤
 ORDER BY CASE WHEN name='kw' THEN 10 ... END          -- 自定义排序
 LIMIT 32 OFFSET 0
 ```
@@ -356,37 +397,56 @@ LIMIT 32 OFFSET 0
 
 注意：引用搜索排序 CASE 中的 `type = 'd'`（文档块）、`type = 'h'`（标题块）、`type = 'i'`（列表项块）、`type != 'l'`（排除列表块）均使用此缩写体系。
 
-**`snippet()` 函数**：FTS5 内置，返回含高亮片段的文本，参数为：
-- 表名、列索引号、左标记、右标记、省略符、每片段最大token数
-- 普通搜索使用 snippet 长度 512（hpath/name/alias/memo/content）和 64（tag）
-- 引用搜索全部使用 snippet 长度 64
+**`snippet()` 函数**：FTS5 内置，返回含高亮标记的文本片段。参数依次为：表名、列索引号、左标记、右标记、省略符、**最大 token 数**（注意：是 token 数，不是字符数，由 siyuan 分词器切分后的 token 计数）。
+
+- 普通搜索共 **6 个 snippet 输出列**：hpath(6, 512) / name(7, 512) / alias(8, 512) / memo(9, 512) / tag(10, 64) / content(11, 512)
+- hpath 虽是 UNINDEXED 列（不参与 MATCH 匹配），但 snippet 仍可返回其原值（不会插入高亮标记）
+- `fcontent`（列12）和 `ial`（列17）不在 snippet 输出中
+- 引用搜索所有 snippet 统一使用 64 token 长度（反链面板空间有限）
 
 ### 4.3 多关键词文档模式（LIKE + GROUP_CONCAT）
 
-当查询包含 2+ 空格分隔的关键词时，切换到文档级聚合策略：
+当查询包含 2+ 空格分隔的关键词时，切换到文档级聚合策略（`docMode=true`）。此模式下不走 FTS5 索引，完全基于 B-Tree 表的 `LIKE` 匹配和 `GROUP_CONCAT` 聚合。
+
+**`columnConcat()` 拼接字符串**（与 `columnFilter()` 列集对称）：
+- 默认配置：`content||name||alias||memo||tag`（5 个字段拼接）
+- IAL 开启时：`content||name||alias||memo||ial||tag`（6 个字段拼接）
+- 同样**不包含 fcontent**
 
 ```sql
--- Step 1: 找出命中文档（所有关键词在同一文档内至少出现一次）
+-- Step 1: CTE 第一阶段 — 找出命中文档（所有关键词在同一文档内至少出现一次）
 WITH docBlocks AS (
   SELECT root_id,
-         MAX(CASE WHEN type='d' THEN content||name||alias||memo||ial||tag END) AS docContent
+         MAX(CASE WHEN type='d' THEN content||name||alias||memo||tag END) AS docContent
   FROM blocks
-  WHERE type IN (...) ...
+  WHERE type IN ('d','h','c','m','t','html','av','p')
+    AND (box = 'box1' OR box = 'box2')
   GROUP BY root_id
-  HAVING GROUP_CONCAT(content||name||...) LIKE '%kw1%'
-     AND GROUP_CONCAT(content||name||...) LIKE '%kw2%'
-  ORDER BY (docContent LIKE '%kw1%') + ... DESC, MAX(updated) DESC
+  HAVING GROUP_CONCAT(content||name||alias||memo||tag) LIKE '%kw1%'
+     AND GROUP_CONCAT(content||name||alias||memo||tag) LIKE '%kw2%'
+     ...
+  ORDER BY (CAST(docContent LIKE '%kw1%' AS INT) + CAST(docContent LIKE '%kw2%' AS INT) + ...) DESC,
+           MAX(updated) DESC
 )
 
--- Step 2: 拉取命中文档内的具体块（文档块 + 具体命中块）
-SELECT *, (content||name||...) AS concatContent,
-       (CASE WHEN (root_id IN (...) AND (命中条件)) THEN 1 ELSE 0 END) AS blockSort
+-- Step 2: 第二阶段 — 拉取命中文档内的具体块（文档块本身 + 文档内命中的块）
+SELECT *,
+       (content||name||alias||memo||tag) AS concatContent,
+       CASE WHEN (root_id IN (SELECT root_id FROM docBlocks LIMIT 32)
+                  AND (content||name||alias||memo||tag LIKE '%kw1%'
+                   AND content||name||alias||memo||tag LIKE '%kw2%'))
+            THEN 1 ELSE 0 END AS blockSort
 FROM blocks
-WHERE type IN (...) ...
-  AND (id IN (SELECT root_id FROM docBlocks LIMIT 32)
-    OR (root_id IN (SELECT root_id FROM docBlocks LIMIT 32)
+WHERE type IN ('d','h','c','m','t','html','av','p')
+  AND (id IN (SELECT root_id FROM docBlocks LIMIT 32)       -- 文档块本身
+    OR (root_id IN (SELECT root_id FROM docBlocks LIMIT 32)  -- 文档内命中的块
        AND concatContent LIKE '%kw1%' AND concatContent LIKE '%kw2%'))
+ORDER BY  -- 注入的 ORDER BY，详见排序章节
+LIMIT 32 OFFSET 0
 ```
+
+> **性能代价**：第一阶段对全文档做 `GROUP_CONCAT` 字符串拼接，每个文档的拼接结果可能达 MB 级。大语料库下此查询可能需要数秒甚至数十秒。
+
 
 ### 4.4 正则表达式搜索
 
@@ -429,7 +489,7 @@ SiYuan 的排序体系根据 **搜索模式** 和 **orderBy 参数** 的组合�
 | 6 | 相关度升序 | method=0/1 时：`ORDER BY rank DESC`；method=2/3 时：降级为 `ORDER BY sort DESC, updated DESC` |
 | 7 | 相关度降序 | method=0/1 时：`ORDER BY rank`；method=2/3 时：降级为 `ORDER BY sort ASC, updated DESC` |
 
-**关键发现 1**：`buildOrderBy()` 的 orderBy=0（默认）CASE 分支 **只有 4 层**，远比引用搜索的 12 层简单。它仅关注 name 和 alias 两个字段的精确/模糊匹配，不涉及 content/type/memo/fcontent 等字段。
+**关键发现 1**：`buildOrderBy()` 的 orderBy=0（默认）CASE 分支 **只有 4 层**，远比引用搜索的 13 层简单。它仅关注 name 和 alias 两个字段的精确/模糊匹配，不涉及 content/type/memo/fcontent 等字段。
 
 **关键发现 2**：orderBy=6/7 的「相关度」排序，**仅在 method=0（关键字）和 method=1（查询语法）时才使用 FTS5 的 `rank`**；在 method=2（SQL）和 method=3（正则）时，由于不经过 FTS5 表（没有 `rank` 列），**会静默降级为 sort + updated 排序**，此时「相关度」名不副实。
 
@@ -500,7 +560,7 @@ ORDER BY (docContent LIKE '%kw1%') + (docContent LIKE '%kw2%') DESC, MAX(updated
 
 ### 5.4 引用搜索（`fullTextSearchRefBlock`）排序行为
 
-引用搜索是独立于 `FullTextSearchBlock()` 的搜索路径，用于反向链接、提及等场景。它 **不使用 `buildOrderBy()`**，而是内置了一套更精细的 12 层 CASE 排序：
+引用搜索是独立于 `FullTextSearchBlock()` 的搜索路径，用于反向链接、提及等场景。它 **不使用 `buildOrderBy()`**，而是内置了一套更精细的 13 层 CASE 排序：
 
 ```sql
 ORDER BY CASE
@@ -528,7 +588,7 @@ length ASC
 
 | 对比维度 | 普通搜索 orderBy=0 | 引用搜索 |
 |---------|-------------------|---------|
-| CASE 层数 | 4 层 | 12 层 |
+| CASE 层数 | 4 层 | 13 层 |
 | 涉及字段 | name, alias | name, alias, memo, content, fcontent |
 | 类型感知 | 无 | 有（`d`=文档/`h`=标题/`i`=列表项 三层类型分层） |
 | 精确 vs 模糊 | name/alias 各一层 | 每字段精确+模糊两层 |
@@ -540,7 +600,7 @@ length ASC
 **引用搜索的 snippet 参数**：`snippet(..., 64)` —— 片段长度仅 64 字符（普通搜索为 512），因为反链面板空间有限。
 
 **风险**：
-1. **12 层 CASE 依赖 content 全量比较**：`content = '${keyword}'` 需要完整内容精确匹配，对长文本块几乎不可能命中；`content LIKE '%${keyword}%'` 在 B-Tree 表上无法利用索引
+1. **13 层 CASE 依赖 content 全量比较**：`content = '${keyword}'` 需要完整内容精确匹配，对长文本块几乎不可能命中；`content LIKE '%${keyword}%'` 在 B-Tree 表上无法利用索引
 2. **无 rank 可用**：引用搜索固定走 FTS5 MATCH 查结果，但排序完全由 CASE 覆盖，未利用 FTS5 的 BM25 相关度信息
 3. **LIMIT 无 OFFSET**：引用搜索使用 `Conf.Search.Limit` 做硬截断，不支持分页
 
@@ -595,7 +655,7 @@ length ASC
 | 普通-单关键词(FTS) | CASE 4层(name/alias) + sort + updated | `rank DESC` (BM25升序) | `rank` (BM25降序) | sort→updated |
 | 普通-多关键词(LIKE) | CASE 4层 + blockSort + sort + updated | 降级为CASE+blockSort ASC | 降级为CASE+blockSort DESC | blockSort→sort→updated |
 | 查询语法(FTS) | CASE 4层(query原文) + sort + updated | `rank DESC` | `rank` | sort→updated |
-| 引用搜索 | **CASE 12层**(含content/`d`/`h`/`i`类型/fcontent) + sort + length | N/A(固定CASE排序) | N/A | sort→length |
+| 引用搜索 | **CASE 13层**(含content/`d`/`h`/`i`类型/fcontent) + sort + length | N/A(固定CASE排序) | N/A | sort→length |
 | 正则(blocks表) | CASE 4层 + sort + updated | 降级为sort DESC,updated DESC | 降级为sort ASC,updated DESC | sort→updated |
 | SQL(自定义) | 用户SQL自带 | 用户SQL自带 | 用户SQL自带 | 由用户SQL决定 |
 
@@ -682,7 +742,7 @@ if caseSensitive {
 | **按文档分组 + 内容顺序** | groupBy=1, orderBy=5 | 需重新遍历每棵 AST 树记录 sortVal，内存开销大 |
 | **SQL 搜索（用户自定义 SQL）** | method=2 管理员模式 | 虽然有 sqlparser 注入 LIMIT，但本质允许任意 DQL |
 | **FTS5 长查询** | 单关键词过长 + snippet(512) | 高亮计算开销随片段数线性增长 |
-| **引用搜索 12 层 CASE** | 反链面板打开时 | CASE 中 `content LIKE` 对每行求值，无法利用索引 |
+| **引用搜索 13 层 CASE** | 反链面板打开时 | CASE 中 `content LIKE` 对每行求值，无法利用索引 |
 
 ### 7.3 排序相关的一致性与语义风险
 
@@ -692,7 +752,7 @@ if caseSensitive {
 
 3. **正则/SQL 模式下相关度排序名不副实**：orderBy=6/7 在 method=2/3 时降级为 sort+updated，前端 UI 仍显示「按相关度排序」选项，但实际与「按块类型」排序几乎等效。
 
-4. **引用搜索排序独立于 `buildOrderBy()`**：引用搜索硬编码 12 层 CASE + length 三级排序，与普通搜索的 4 层 CASE + updated 三级排序完全不同。同一关键词在普通搜索和引用搜索中可能出现在不同位置。
+4. **引用搜索排序独立于 `buildOrderBy()`**：引用搜索硬编码 13 层 CASE + length 三级排序，与普通搜索的 4 层 CASE + updated 三级排序完全不同。同一关键词在普通搜索和引用搜索中可能出现在不同位置。
 
 5. **分组后排序体系重构**：groupBy=1 时 Go 层对结果重新排序，文档根的排序逻辑与 SQL 层不一致。例如 orderBy=0 分组后文档间不排序，而 SQL 中有 CASE 排序。
 
@@ -733,13 +793,13 @@ if caseSensitive {
 
 ### 8.2 排序语义优化方向
 
-5. **统一排序体系**：当前普通搜索（4 层 CASE）、引用搜索（12 层 CASE）和 rank 排序是三套独立逻辑。建议将引用搜索的精细 CASE 也回迁到普通搜索的默认排序中，至少增加 content/memo 的匹配层级，解决「内容命中无区分度」问题。
+5. **统一排序体系**：当前普通搜索（4 层 CASE）、引用搜索（13 层 CASE）和 rank 排序是三套独立逻辑。建议将引用搜索的精细 CASE 也回迁到普通搜索的默认排序中，至少增加 content/memo 的匹配层级，解决「内容命中无区分度」问题。
 
 6. **多关键词模式 rank 降级透明化**：当 `fullTextSearchByLikeWithRoot` 接收到 orderBy=6/7 时，应向用户明确提示「多关键词搜索不支持 BM25 相关度排序，已切换为语义匹配排序」，或在 CTE 中模拟近似 rank（如基于命中关键词数的加权评分）。
 
 7. **正则/SQL 模式下隐藏 rank 选项**：method=2/3 时 orderBy=6/7 已降级为 sort+updated，前端应禁用或标注降级，避免误导用户。
 
-8. **引用搜索引入 FTS5 rank 辅助排序**：当前引用搜索的 12 层 CASE 完全覆盖了排序逻辑，未利用 FTS5 的 BM25 信息。可在 CASE ELSE 分支中引入 `rank` 作为更深层的区分因子。
+8. **引用搜索引入 FTS5 rank 辅助排序**：当前引用搜索的 13 层 CASE 完全覆盖了排序逻辑，未利用 FTS5 的 BM25 信息。可在 CASE ELSE 分支中引入 `rank` 作为更深层的区分因子。
 
 ### 8.3 性能优化方向
 
