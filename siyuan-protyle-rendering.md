@@ -59,16 +59,16 @@ interface BlockElement {
 
 #### 2.2.1 文档加载流程
 
-1. **发起请求** - [Prototype.getDoc()](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/index.ts#L354-L373) 调用 `/api/filetree/getDoc`
+1. **发起请求** - [Protyle.getDoc()](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/index.ts#L354-L373) 调用 `/api/filetree/getDoc`
 2. **数据接收** - [onGet()](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/util/onGet.ts#L24-L131) 处理内核返回的 Block DOM HTML
 3. **XSS 净化** - 使用 DOMPurify 净化行级备注内容 ([onGet.ts#L148-L156](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/util/onGet.ts#L148-L156))
 4. **DOM 注入** - [setHTML()](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/util/onGet.ts#L133-L333) 将内容注入到 `protyle-wysiwyg` 容器
 
 #### 2.2.2 动态加载策略
 
-- **批量加载** - 通过 `window.siyuan.config.editor.dynamicLoadBlocks` 配置，默认加载指定数量的块（可配置范围 48-1024）
+- **批量加载** - 通过 `window.siyuan.config.editor.dynamicLoadBlocks` 配置，默认加载 **192** 块，内核配置可调整范围 **[48, 1024]**（参见 [editor.go#L49-L93](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/kernel/conf/editor.go#L49-L93)，前端设置仅有 `min="48"` 下限限制（参见 [config/editor.ts#L199](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/config/editor.ts#L199)），上限由内核配置校验逻辑保证
 - **方向加载** - 向上滚动使用 `CB_GET_BEFORE`，向下滚动使用 `CB_GET_APPEND`
-- **高度阈值** - `REMOVED_OVER_HEIGHT = contentElement.clientHeight * 8`，超过此高度时移除顶部块以节省内存 ([onGet.ts#L157](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/util/onGet.ts#L157))
+- **高度阈值** - `REMOVED_OVER_HEIGHT = contentElement.clientHeight * 8`，超过此高度时从视口外的块将被移除以节省内存 ([onGet.ts#L157](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/util/onGet.ts#L157))
 
 ---
 
@@ -90,23 +90,37 @@ interface BlockElement {
 
 ### 3.2 渲染管道
 
-内容更新后，按以下顺序执行渲染：
+内容更新后，按以下顺序执行四个核心渲染阶段（参见 [onGet.ts#L232-L235](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/util/onGet.ts#L232-L235)）：
 
 | 渲染阶段 | 处理函数 | 作用 |
 |----------|----------|------|
-| 代码处理 | `processRender()` | 代码块高亮、特殊渲染节点处理 |
-| 文本高亮 | `highlightRender()` | 搜索结果高亮、自定义高亮 |
-| 数学公式 | `mathRender()` | MathJax/KaTeX 公式渲染 |
-| 数据库 | `avRender()` | 属性视图 (Attribute View) 渲染 |
-| 嵌入块 | `blockRender()` | 块引用、查询嵌入渲染 |
+| 代码与特殊渲染 | `processRender()` | 代码块语言识别与渲染调度，内部通过 `RENDER_MAP` 分发至各渲染器（含公式/图表/Mermaid等） |
+| 文本高亮 | `highlightRender()` | 搜索结果高亮、自定义高亮标记渲染 |
+| 数据库视图 | `avRender()` | 属性视图 (Attribute View) 渲染，含表格/看板/画廊等视图 |
+| 嵌入块 | `blockRender()` | 块引用、SQL/JS 查询嵌入渲染，支持递归嵌套 |
 
-渲染管道调用链参见 [onGet.ts#L232-L235](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/util/onGet.ts#L232-L235)：
 ```typescript
+// onGet.ts 中的渲染管道调用
 processRender(protyle.wysiwyg.element);
 highlightRender(protyle.wysiwyg.element);
 avRender(protyle.wysiwyg.element, protyle);
 blockRender(protyle, protyle.wysiwyg.element);
 ```
+
+#### 3.2.1 公式渲染的多入口调用
+
+> **重要修正**：公式渲染 `mathRender()` **不是**渲染管道的独立阶段，而是通过两种路径触发：
+>
+> 1. **代码块路径**：作为 `processRender()` 内部 `RENDER_MAP` 的注册项之一（`math: mathRender`），当遇到 `data-subtype="math"` 的代码块时由其调度执行（参见 [processCode.ts#L48-L72](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/util/processCode.ts#L48-L72)）
+>
+> 2. **交互场景直接调用**：在输入处理、回车换行、块删除、工具栏操作等多个交互场景中直接调用，确保公式的增量渲染正确
+>    - [input.ts#L257/L277](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/wysiwyg/input.ts#L257-L277) - 行级公式输入后
+>    - [enter.ts#L313/L337/L349/L482/L563/L570](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/wysiwyg/enter.ts#L313-L570) - 回车换行相关场景
+>    - [remove.ts#L561](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/wysiwyg/remove.ts#L561) - 块删除后相邻公式重渲染
+>    - [toolbar/index.ts#L840](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/toolbar/index.ts#L840) - 工具栏插入公式
+>    - [gutter/index.ts#L2161](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/gutter/index.ts#L2161) - 折叠/展开操作后公式渲染
+>
+> 公式渲染器本身位于 [mathRender.ts](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/render/mathRender.ts)，基于 KaTeX 0.16.9 实现，支持行内公式（`SPAN[data-subtype="math"]`）和块级公式（`DIV[data-subtype="math"]`）两种模式。
 
 ### 3.3 特殊元素渲染
 
@@ -144,15 +158,25 @@ interface IOperation {
 事务处理核心在 [transaction.ts#L1364-L1450](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/wysiwyg/transaction.ts#L1364-L1450)：
 
 ```typescript
-// 合并逻辑关键参数
-const TIMEOUT_INPUT = 256;  // 输入超时时间，256ms 内的连续输入合并
-
-// 合并条件：
-1. 同一编辑器实例 (protyle.id 相同)
-2. 时间间隔 < TIMEOUT_INPUT * 2
-3. 操作类型相同 (均为 update)
-4. 操作的块 ID 相同
+// 关键常量
+const TIMEOUT_INPUT = 256;   // 输入超时时间，用于合并判断
+// 提交延迟为 TIMEOUT_INPUT * 2 = 512ms
 ```
+
+**精确的合并条件**（必须同时满足以下全部 6 个条件，参见 [transaction.ts#L1381-L1389](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/wysiwyg/transaction.ts#L1381-L1389)）：
+
+| 序号 | 条件 | 代码判断 |
+|------|------|----------|
+| 1 | 队列中存在上一个事务 | `lastTransaction != null` |
+| 2 | 新旧事务的 `doOperations` 数组长度均为 1 | `lastTransaction.doOperations.length === 1 && doOperations.length === 1` |
+| 3 | 新旧事务的操作 action 均为 `"update"` | `lastTransaction.doOperations[0].action === "update" && doOperations[0].action === "update"` |
+| 4 | 新旧事务操作的是同一个块 | `lastTransaction.doOperations[0].id === doOperations[0].id` |
+| 5 | 时间间隔小于 256ms | `protyle.transactionTime - time < Constants.TIMEOUT_INPUT` |
+| 6 | 同一编辑器实例 | 隐式：通过 `protyle.transactionTime` 判断，同一实例才会正确命中 |
+
+> **重要修正**：合并判断使用 `TIMEOUT_INPUT = 256ms`，而 setTimeout 提交延迟使用 `TIMEOUT_INPUT * 2 = 512ms`（参见 [transaction.ts#L1449-L1451](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/wysiwyg/transaction.ts#L1449-L1451)），两者是不同时间窗口。非 update 类操作（insert/delete/move/setAttrs 等）一律不合并。
+>
+> 对于折叠标题、设置 AV 视图等操作，会额外将 `protyle.transactionTime` 向前推进 `TIMEOUT_INPUT * 2` 以主动跳过合并，并直接发送请求不走定时器队列（参见 [transaction.ts#L1402-L1435](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/app/src/protyle/wysiwyg/transaction.ts#L1402-L1435)）。
 
 #### 4.1.3 事务提交流程
 
@@ -279,15 +303,22 @@ Protyle (入口)
 │   ├── undoStack / redoStack
 │   └── undo() / redo()
 ├── Render (渲染)
-│   ├── blockRender() → 嵌入块
-│   ├── mathRender() → 公式
-│   └── avRender() → 数据库
+│   ├── processRender() → 渲染总入口（内部调度 mathRender/abcRender/mermaidRender 等）
+│   │   └── mathRender() → 公式（KaTeX）
+│   │   └── abcRender() → 乐谱
+│   │   └── mermaidRender() → 流程图
+│   │   └── ...
+│   ├── highlightRender() → 代码高亮
+│   ├── avRender() → 数据库
+│   └── blockRender() → 嵌入块
 ├── Scroll (滚动)
 │   └── 动态加载触发
 └── Lute (解析引擎)
     ├── SpinBlockDOM() → MD→DOM
     └── BlockDOM2Content() → DOM→MD
 ```
+
+> **注意**：`mathRender()` 在多处被直接调用（input/enter/remove/toolbar 等交互场景），而非仅依赖渲染管道。
 
 ### 6.2 关键数据流
 
@@ -320,7 +351,7 @@ Protyle (入口)
 
 ```
 内核 → WebSocket "transactions" 事件
-    → Prototype.onTransaction(data)
+    → Protyle.onTransaction(data)
         ├─ 检查是否涉及当前文档
         ├─ onTransaction(protyle, operation, false) 应用操作
         ├─ 更新预览模式内容
@@ -380,10 +411,11 @@ Protyle (入口)
 
 | 参数 | 默认值 | 范围 | 说明 |
 |------|--------|------|------|
-| `dynamicLoadBlocks` | 视配置而定 | 48-1024 | 单次加载块数量 |
-| `SIZE_UNDO` | 64 | 固定 | 撤销栈大小 |
-| `TIMEOUT_INPUT` | 256ms | 固定 | 事务合并窗口 |
-| `REMOVED_OVER_HEIGHT` | clientHeight * 8 | 动态 | 内存回收阈值 |
+| `dynamicLoadBlocks` | **192** | [48, 1024] | 单次加载块数量（内核强制校验区间，前端 input 仅设置 min=48） |
+| `SIZE_UNDO` | 64 | 固定常量 | 撤销栈最大步数 |
+| `TIMEOUT_INPUT` | 256ms | 固定常量 | 事务合并判断时间窗口；提交延迟为 2×该值 = 512ms |
+| `REMOVED_OVER_HEIGHT` | clientHeight × 8 | 动态计算 | 内存回收触发阈值（滚动内容高度超过时卸载视口外块） |
+| `MinDynamicLoadBlocks` | 48 | 固定常量 | 内核侧的 `dynamicLoadBlocks` 最小取值（参见 [editor.go#L66](file:///d:/fz/0601/solo-dogfeeding/code/289-siyuan/kernel/conf/editor.go#L66)） |
 
 ---
 
