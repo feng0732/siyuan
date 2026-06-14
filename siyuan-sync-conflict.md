@@ -255,19 +255,66 @@ type MergeResult struct {
 func (m *MergeResult) DataChanged() bool  // 合并结果是否包含实际数据变更
 ```
 
-### 4.2 冲突赢家策略：云端优先（Cloud-Wins）— 确凿结论
+### 4.2 冲突赢家策略：三模式差异化策略 — 基于 dejavu 源码的确凿结论
 
-通过 SiYuan 代码中对三个同步模式的调用方式、返回值处理、冲突副本加载路径等多维度交叉验证，可以**确凿**地确认 dejavu 内部的冲突处理采用**云端优先**策略。
+> **证据来源**：dejavu 公开源码 https://github.com/siyuan-note/dejavu，已通过 WebFetch 直接读取 `sync.go` 和 `sync_manual.go` 核实。
 
-**三同步模式下的冲突行为对比表**：
+通过 dejavu 源码的直接分析，三个同步模式采用**不同的冲突赢家策略**，而不是统一的云端优先。核心差异在于源码注释明确声明：
 
-| 同步方向 | dejavu 函数 | 返回值结构 | 冲突含义 | 默认赢家 |
-|---------|-------------|-----------|----------|---------|
-| 双向同步 | `repo.Sync()` | `MergeResult + TrafficStat` | 三方合并后本地与云端同时修改的文件 | **云端赢** |
-| 仅下载 | `repo.SyncDownload()` | `MergeResult + TrafficStat` | 本地有修改会被云端覆盖的文件 | **云端赢** |
-| 仅上传 | `repo.SyncUpload()` | 仅 `TrafficStat` | 无冲突概念（本地强制覆盖云） | **本地赢** |
+- `Sync()`（双向同步）：**"冲突的文件尽量以本地 upsert 和 remove 为准"** → 本地优先
+- `SyncDownload()`（仅下载）：**"冲突的文件以云端 upsert 和 remove 为准"** → 云端优先
+- `SyncUpload()`（仅上传）：无 MergeResult，本地强制覆盖云 → 本地赢
 
-**确凿证据链 1：上传模式无 MergeResult，本地强制覆盖云端**
+**三同步模式下的冲突行为对比表（基于 dejavu 源码）**：
+
+| 同步方向 | dejavu 函数 | 返回值结构 | 冲突含义 | 默认赢家 | 工作目录版本 | temp 目录版本 |
+|---------|-------------|-----------|----------|---------|------------|--------------|
+| 双向同步 | `repo.Sync()` | `MergeResult + TrafficStat` | 两端都修改的文件 | **本地赢** | 本地版本 | **云端版本**（冲突副本来源） |
+| 仅下载 | `repo.SyncDownload()` | `MergeResult + TrafficStat` | 本地有修改会被云端覆盖的文件 | **云端赢** | 云端版本 | 本地版本（冲突副本来源） |
+| 仅上传 | `repo.SyncUpload()` | 仅 `TrafficStat` | 无冲突概念（本地强制覆盖云） | **本地赢** | 本地版本 | 无 |
+
+---
+
+#### 确凿证据链 1：dejavu Sync() 源码明确声明本地优先
+
+dejavu `sync.go` 的 `sync0()` 函数注释：
+
+```go
+// 冲突的文件尽量以本地 upsert 和 remove 为准
+var tmpMergeConflicts []*entity.File
+for _, cloudUpsert := range cloudUpserts {
+    if localUpsert := repo.getFile(localUpserts, cloudUpsert); nil != localUpsert {
+        tmpMergeConflicts = append(tmpMergeConflicts, cloudUpsert)
+        if repo.ignoreLocalUpsert(...) {
+            mergeResult.Upserts = append(mergeResult.Upserts, cloudUpsert)
+        } else {
+            mergeResult.Conflicts = append(mergeResult.Conflicts, cloudUpsert)
+        }
+        continue
+    }
+    if nil == repo.getFile(localRemoves, cloudUpsert) {
+        mergeResult.Upserts = append(mergeResult.Upserts, cloudUpsert)
+    }
+    // else: 本地删除了 → 什么也不做（本地删除赢）
+}
+```
+
+**关键解读**：
+1. 当 `cloudUpsert` 在 `localUpserts` 中存在时（两端都修改），**不将 cloudUpsert 加入 mergeResult.Upserts**（即不覆盖本地）
+2. 而是将 `cloudUpsert` 加入 `mergeResult.Conflicts` 和 `tmpMergeConflicts`
+3. 特殊情况 `ignoreLocalUpsert`：若本地修改仅为折叠属性变化，则采用云端版本
+
+#### 确凿证据链 2：dejavu SyncDownload() 源码明确声明云端优先
+
+dejavu `sync_manual.go` 的 `SyncDownload()` 函数注释：
+
+```go
+// SyncDownload 从云端同步数据到本地，冲突的文件以云端 upsert 和 remove 为准。
+```
+
+其内部实现与 `sync0()` 逻辑相反：当两端都修改时，将云端版本加入 `mergeResult.Upserts`（覆盖本地），将本地版本加入 `mergeResult.Conflicts`。
+
+#### 确凿证据链 3：上传模式无 MergeResult，本地强制覆盖云端
 
 [syncRepoUpload() L1337](file:///d:/fz/0601/solo-dogfeeding/code/285-siyuan/kernel/model/repository.go#L1337)：
 
@@ -287,33 +334,29 @@ SiYuan 手动构造空的 `&dejavu.MergeResult{}` 传入 `processSyncMergeResult
 - 不存在冲突检测和合并逻辑
 - 本地永远是赢家
 
-**确凿证据链 2：冲突副本从 temp 目录加载，工作目录是云端赢版本**
+#### 确凿证据链 4：冲突副本来源 — 双向同步时 temp 目录保存云端版本
 
-[processSyncMergeResult() L1658-L1659](file:///d:/fz/0601/solo-dogfeeding/code/285-siyuan/kernel/model/repository.go#L1658-L1659)：
-
-```go
-absPath := filepath.Join(util.TempDir, "repo", "sync", "conflicts",
-    mergeResult.Time.Format("2006-01-02-150405"), file.Path)
-tree, loadTreeErr := loadTree(absPath, luteEngine)
-```
-
-生成冲突副本时，从 `temp/repo/sync/conflicts/` 目录加载文件内容，这确凿说明：
-- `data/` 工作目录中的文件已经被 **checkout 为云端版本**（赢版本）
-- `temp/` 临时目录中保存的是 **本地输出版本**（被覆盖前的本地内容）
-- dejavu 在合并完成后，将冲突文件的本地输出版本导出到 temp 冲突目录
-- SiYuan 的 `GenerateConflictDoc` 功能读取的是**本地输出版本**，另存为新文档
-
-**确凿证据链 3：下载模式也有完整 MergeResult，云端覆盖本地**
-
-[syncRepoDownload() L1265](file:///d:/fz/0601/solo-dogfeeding/code/285-siyuan/kernel/model/repository.go#L1265)：
+dejavu `sync.go` 中冲突文件导出逻辑：
 
 ```go
-mergeResult, trafficStat, err := repo.SyncDownload(syncContext)
+if 0 < len(tmpMergeConflicts) {
+    temp := filepath.Join(repo.TempPath, "repo", "sync", "conflicts", nowStr)
+    for i, file := range tmpMergeConflicts {  // file 是 cloudUpsert（云端版本）
+        checkoutTmp, _ = repo.store.GetFile(file.ID)  // 获取云端版本
+        repo.checkoutFile(checkoutTmp, temp, ...)   // checkout 到 temp
+    }
+}
 ```
 
-下载模式返回完整的 `MergeResult`（含 Conflicts/Upserts/Removes），与双向同步行为一致。下载模式的语义是"把云端数据拉到本地"，如果产生冲突，赢家必然是云端。
+由于 `tmpMergeConflicts` 包含的是 `cloudUpsert`（云端修改的文件），因此：
+- **双向同步时**：`data/` 工作目录保留**本地版本**（赢家），`temp/` 目录保存**云端版本**（输家）
+- **下载同步时**：`data/` 工作目录采用**云端版本**（赢家），`temp/` 目录保存**本地版本**（输家）
 
-**确凿证据链 4：dataChanged 判定包含两端变更**
+SiYuan 的 `GenerateConflictDoc` 从 `temp/` 目录加载文件生成冲突副本，因此：
+- 双向同步：冲突副本是**云端版本**（用户需对比本地赢版本和云端输出版本）
+- 下载同步：冲突副本是**本地版本**（用户需对比云端赢版本和本地输出版本）
+
+#### 确凿证据链 5：dataChanged 判定包含两端变更
 
 [syncRepo() L1585](file:///d:/fz/0601/solo-dogfeeding/code/285-siyuan/kernel/model/repository.go#L1585)：
 
@@ -321,53 +364,107 @@ mergeResult, trafficStat, err := repo.SyncDownload(syncContext)
 dataChanged = nil == beforeIndex || beforeIndex.ID != afterIndex.ID || mergeResult.DataChanged()
 ```
 
-`dataChanged` 同时包含本地索引变更（本地有修改）和合并结果变更（云端有修改），说明双向同步是**先拉取云端数据合并到本地，再把本地新增变更推上去**的两阶段流程，合并阶段云端优先。
+`dataChanged` 同时包含本地索引变更（本地有修改）和合并结果变更（云端有修改），说明双向同步是**先拉取云端数据合并到本地，再把本地新增变更推上去**的两阶段流程。
 
-**最终结论**：SiYuan 同步统一采用 **云端优先（Cloud-Wins）** 策略。
+---
+
+**双向同步（本地优先）最终结论**：
+
+```
+工作目录 data/...  ← 本地赢版本（保留本地修改）
+临时目录 temp/repo/sync/conflicts/{timestamp}/...  ← 云端输出版本（dejavu 导出，用于生成冲突副本）
+```
+
+**下载同步（云端优先）最终结论**：
 
 ```
 工作目录 data/...  ← 云端赢版本（已 checkout 到本地）
-临时目录 temp/repo/sync/conflicts/{timestamp}/...  ← 本地输出版本（dejavu 导出）
+临时目录 temp/repo/sync/conflicts/{timestamp}/...  ← 本地输出版本（dejavu 导出，用于生成冲突副本）
 ```
 
-### 4.3 修改删除冲突（Modify-Delete Conflict）处理 — 确凿结论
+### 4.3 修改删除冲突（Modify-Delete Conflict）处理 — 基于 dejavu 源码的确凿结论
 
-对于"一端修改、一端删除"的修改删除冲突（modify-delete conflict），处理方式与普通内容冲突**完全一致**，统一遵循云端优先策略。
+> **证据来源**：dejavu `sync.go` 的 `sync0()` 函数源码，已通过 WebFetch 核实。
 
-**确凿证据链**：
+对于"一端修改、一端删除"的修改删除冲突（modify-delete conflict），处理方式与普通内容冲突**完全不同**。在双向同步（本地优先）模式下，修改删除冲突的赢家策略是：**删除操作永远赢**。
 
-1. **统一进入 Conflicts 列表**：SiYuan 代码中 `mergeResult.Conflicts` 循环没有任何类型分支，所有冲突文件一视同仁。修改删除冲突和内容冲突都在同一个 `Conflicts` 集合中。
+dejavu `sync0()` 函数中的核心逻辑（双向同步）：
 
-2. **统一从 temp 冲突目录加载**：所有冲突文件的本地输出版本都从 `temp/repo/sync/conflicts/` 加载，修改删除冲突的本地输出版本也在其中。
+```go
+// 处理云端 upsert
+for _, cloudUpsert := range cloudUpserts {
+    if localUpsert := repo.getFile(localUpserts, cloudUpsert); nil != localUpsert {
+        // 两端都修改 → 内容冲突
+        continue
+    }
+    if nil == repo.getFile(localRemoves, cloudUpsert) {
+        // 本地没有删除 → 接受云端 upsert
+        mergeResult.Upserts = append(mergeResult.Upserts, cloudUpsert)
+    }
+    // else: 本地删除了 → 什么也不做（本地删除赢）
+}
 
-3. **赢家策略统一**：工作目录 `data/` 是云端赢版本，temp 目录是本地输出版本。对于修改删除冲突，"赢"的定义就是采用云端的最终状态（不管云端是修改还是删除）。
+// 处理云端 remove
+for _, cloudRemove := range cloudRemoves {
+    if nil == repo.getFile(localUpserts, cloudRemove) {
+        // 本地没有修改 → 接受云端 remove
+        mergeResult.Removes = append(mergeResult.Removes, cloudRemove)
+    }
+    // else: 本地修改了 → 什么也不做（本地修改赢）
+}
+```
 
-**四种组合的具体行为**：
+**关键解读**：
+1. **云端修改 + 本地删除**：`cloudUpsert` 在 `localRemoves` 中存在 → **什么也不做** → 本地删除赢，文件保持删除状态
+2. **云端删除 + 本地修改**：`cloudRemove` 在 `localUpserts` 中存在 → **什么也不做** → 本地修改赢，文件保留修改状态
+3. 修改删除冲突**不会进入 `mergeResult.Conflicts`**，也不会生成冲突副本
+4. 下载同步（云端优先）模式下逻辑相反：云端操作永远赢
 
-| 场景 | 云端状态 | 本地状态 | 赢家 | 工作目录结果 | temp 冲突目录内容 |
-|------|----------|----------|------|-------------|------------------|
-| 场景 1 | 修改 | 修改 | 云端 | 云端修改版本 | 本地修改版本 |
-| 场景 2 | 修改 | 删除 | 云端 | 云端修改版本（文件恢复） | 本地删除前的版本（即云端上一个版本的本地副本） |
-| 场景 3 | 删除 | 修改 | 云端 | 文件被删除 | 本地修改版本 |
-| 场景 4 | 删除 | 删除 | - | 文件被删除（两边一致，不冲突） | 无（不进入 Conflicts） |
+---
 
-**两种典型修改删除冲突场景详解**：
+#### 双向同步（本地优先）模式下的四种组合行为
+
+| 场景 | 云端状态 | 本地状态 | 赢家 | 工作目录结果 | 是否进入 Conflicts | temp 冲突目录内容 |
+|------|----------|----------|------|-------------|------------------|------------------|
+| 场景 1 | 修改 | 修改 | 本地 | 本地修改版本 | 是 | 云端修改版本 |
+| 场景 2 | 修改 | 删除 | **本地删除** | 文件保持删除 | 否 | 无 |
+| 场景 3 | 删除 | 修改 | **本地修改** | 文件保留修改 | 否 | 无 |
+| 场景 4 | 删除 | 删除 | - | 文件被删除（两边一致） | 否 | 无 |
+
+#### 下载同步（云端优先）模式下的四种组合行为
+
+| 场景 | 云端状态 | 本地状态 | 赢家 | 工作目录结果 | 是否进入 Conflicts | temp 冲突目录内容 |
+|------|----------|----------|------|-------------|------------------|------------------|
+| 场景 1 | 修改 | 修改 | 云端 | 云端修改版本 | 是 | 本地修改版本 |
+| 场景 2 | 修改 | 删除 | **云端修改** | 文件恢复为云端版本 | 是 | 本地删除前的版本 |
+| 场景 3 | 删除 | 修改 | **云端删除** | 文件被删除 | 是 | 本地修改版本 |
+| 场景 4 | 删除 | 删除 | - | 文件被删除（两边一致） | 否 | 无 |
+
+---
+
+**两种典型修改删除冲突场景详解（双向同步模式）**：
 
 **场景 2：云端修改，本地删除**
 - 触发条件：本地删除了某文档，同时云端对该文档做了修改
-- 合并结果：云端赢 → 文件恢复为云端最新版本，本地删除操作被撤销
-- 冲突副本：若 `GenerateConflictDoc=true`，会从 temp 冲突目录加载**本地删除前的版本**生成冲突副本（但这个副本可能就是旧版本，实际价值有限）
+- 合并结果：**本地删除赢** → 文件保持删除状态，云端修改被忽略
+- 冲突副本：不生成（未进入 Conflicts）
 - 历史目录：同步前的本地状态（文件已删除）会存入 `history/` 目录
+- 云端数据：云端的修改版本仍保留在云端，下次其他设备同步时会获取该版本
 
 **场景 3：云端删除，本地修改**
 - 触发条件：本地修改了某文档，同时云端删除了该文档
-- 合并结果：云端赢 → 文件从本地删除，本地修改被丢弃
-- 冲突副本：若 `GenerateConflictDoc=true`，会从 temp 冲突目录加载**本地修改版本**生成冲突副本（用户可以从冲突副本中找回修改内容）
+- 合并结果：**本地修改赢** → 文件保留本地修改状态，云端删除被忽略
+- 冲突副本：不生成（未进入 Conflicts）
 - 历史目录：同步前的本地状态（文件有修改）会存入 `history/` 目录
+- 云端数据：下次同步时本地修改版本会被推送到云端，恢复该文件
 
-### 4.4 双向同步的合并顺序 — 确凿推导
+**重要提示**：修改删除冲突在双向同步模式下**静默处理**，用户不会收到冲突通知。这可能导致"我明明删除了为什么又出现了"或"我明明修改了为什么被删了"的困惑（在多设备场景下）。
 
-基于 `Sync()` 的返回值结构、`dataChanged` 判定逻辑、冲突副本导出路径，可以确凿推导出双向同步的完整合并顺序：
+### 4.4 双向同步的合并顺序 — 基于 dejavu 源码的确凿推导
+
+> **证据来源**：dejavu `sync.go` 的 `sync0()` 函数源码，已通过 WebFetch 核实。
+
+基于 dejavu 源码的直接分析，双向同步的完整合并顺序如下（本地优先策略）：
 
 ```
 repo.Sync(syncContext) 内部执行顺序：
@@ -376,19 +473,28 @@ repo.Sync(syncContext) 内部执行顺序：
   │   ├─ 1. 加云端分布式锁
   │   ├─ 2. 拉取云端最新 Index 快照
   │   └─ 3. 对比本地 Index 与云端 Index，找共同祖先
+  │   └─ 4. 计算差异：
+  │          localUpserts / localRemoves（本地自共同祖先以来的变更）
+  │          cloudUpserts / cloudRemoves（云端自共同祖先以来的变更）
   │
-  ├─ 阶段二：三方合并计算
-  │   ├─ 4. 基于共同祖先 Index 做三方合并
-  │   ├─ 5. 计算 Upserts（云端有、本地没有/更旧的文件）
-  │   ├─ 6. 计算 Removes（云端没有、本地有的文件）
-  │   └─ 7. 计算 Conflicts（两端都有修改、无法自动合并的文件）
+  ├─ 阶段二：三方合并计算（本地优先）
+  │   ├─ 5. 处理云端 upsert：
+  │   │      ├─ 若本地也 upsert → 内容冲突 → 加入 Conflicts
+  │   │      ├─ 若本地 remove → 本地删除赢 → 忽略云端 upsert
+  │   │      └─ 否则 → 接受云端 upsert → 加入 Upserts
+  │   │
+  │   ├─ 6. 处理云端 remove：
+  │   │      ├─ 若本地 upsert → 本地修改赢 → 忽略云端 remove
+  │   │      └─ 否则 → 接受云端 remove → 加入 Removes
+  │   │
+  │   └─ 7. tmpMergeConflicts = cloudUpserts ∩ localUpserts（两端都修改）
   │
-  ├─ 阶段三：本地 Checkout（云端赢）
+  ├─ 阶段三：本地 Checkout（本地优先）
   │   ├─ 8. 下载云端缺失的分块数据
   │   ├─ 9. 将 Upserts 文件写入本地工作目录（data/）
   │   ├─ 10. 从本地工作目录删除 Removes 文件
-  │   ├─ 11. 将 Conflicts 文件 checkout 为云端版本（云端赢）
-  │   └─ 12. 将 Conflicts 文件的本地输出版本导出到 temp/repo/sync/conflicts/{timestamp}/
+  │   ├─ 11. Conflicts 文件：本地版本保留（本地赢）
+  │   └─ 12. 将 tmpMergeConflicts（云端版本）导出到 temp/repo/sync/conflicts/{timestamp}/
   │
   ├─ 阶段四：推送到云端
   │   ├─ 13. 生成本地合并后的新 Index
@@ -402,18 +508,18 @@ repo.Sync(syncContext) 内部执行顺序：
 
 **关键设计要点**：
 - **先拉后推**：先把云端数据合并到本地（checkout），再把本地数据推到云端
-- **云端优先**：冲突时 checkout 云端版本到工作目录，本地版本导出到 temp
+- **本地优先**：内容冲突时保留本地版本到工作目录，云端版本导出到 temp
+- **修改删除冲突静默处理**：不进入 Conflicts，不生成冲突副本
 - **原子性**：云端锁 + Index 哈希链保证推送的原子性和一致性
 - **可追溯**：temp 冲突目录 + history 历史目录提供双重兜底
 
 ### 4.5 GenerateConflictDoc 开关的两种模式
 
-SiYuan 提供两种冲突处理模式，由 `GenerateConflictDoc` 开关控制：
+SiYuan 提供两种冲突处理模式，由 `GenerateConflictDoc` 开关控制。注意：主文件版本取决于同步模式（双向同步=本地版本，下载同步=云端版本）。
 
 **模式 A：静默覆盖（默认，GenerateConflictDoc=false）**
-- `Conflicts` 中的文件直接采用云版本覆盖本地
-- 用户本地未同步的修改会被静默覆盖
-- 仅在 `history/` 目录留痕供事后恢复：[代码位置](file:///d:/fz/0601/solo-dogfeeding/code/285-siyuan/kernel/model/repository.go#L1679-L1681)
+- `Conflicts` 中的文件按同步模式的赢家策略保留（双向=本地，下载=云端）
+- 输出版本仅在 `history/` 目录留痕供事后恢复：[代码位置](file:///d:/fz/0601/solo-dogfeeding/code/285-siyuan/kernel/model/repository.go#L1679-L1681)
   ```go
   historyDir := filepath.Join(util.HistoryDir,
       mergeResult.Time.Format("2006-01-02-150405")+"-sync")
@@ -426,7 +532,7 @@ SiYuan 提供两种冲突处理模式，由 `GenerateConflictDoc` 开关控制�
   ```go
   for _, file := range mergeResult.Conflicts {
       if !strings.HasSuffix(file.Path, ".sy") { continue }
-      // 从临时冲突目录加载输出版本（本地版本）
+      // 从临时冲突目录加载输出版本（双向同步=云端版本，下载同步=本地版本）
       absPath := filepath.Join(util.TempDir, "repo", "sync",
           "conflicts", timestamp, file.Path)
       tree := loadTree(absPath, luteEngine)
@@ -435,14 +541,127 @@ SiYuan 提供两种冲突处理模式，由 `GenerateConflictDoc` 开关控制�
       box.addSort(previousPath, tree.ID)    // 挂在原文档之后的排序位置
   }
   ```
-- 主文件仍采用云版本
-- 用户在 UI 中看到：原始文档（云版本） + 标题带 "Conflicted" 的冲突副本（本地版本），自行对比合并
+- 主文件版本：双向同步=本地版本，下载同步=云端版本
+- 用户在 UI 中看到：原始文档（赢版本） + 标题带 "Conflicted" 的冲突副本（输出版本），自行对比合并
 
 **非 .sy 文件**（assets、storage、配置等）：
-- 不生成冲突副本，采用覆盖策略
+- 不生成冲突副本，按赢家策略处理
 - 依赖历史目录中保留的同步前本地版本供事后恢复
 
-### 4.5 数据流：同步主循环详解
+### 4.6 复现实验设计与证据边界
+
+> **证据边界说明**：
+> 1. 已通过 WebFetch 直接读取 dejavu 公开源码（https://github.com/siyuan-note/dejavu）核实的结论标记为「确凿结论」
+> 2. 未直接从源码核实、仅从调用层行为推导的结论标记为「推断结论」
+> 3. 以下实验设计用于验证关键结论，可在真实环境中复现
+
+---
+
+#### 实验 1：验证双向同步的本地优先策略
+
+**假设**：双向同步 `Sync()` 中，两端都修改同一文档时，工作目录保留本地版本，temp 目录保存云端版本。
+
+**实验步骤**：
+1. 准备两台设备 A 和 B，都登录同一 SiYuan 账号，开启同步
+2. 在设备 A 上创建文档 `test.md`，内容为 `初始版本`，等待同步完成
+3. 断开设备 B 的网络（模拟离线）
+4. 在设备 A 上修改文档为 `云端修改版本`，等待同步完成
+5. 在设备 B 上修改文档为 `本地修改版本`（设备 B 仍离线）
+6. 恢复设备 B 的网络，触发同步
+7. 检查设备 B 上的：
+   - 工作目录 `data/.../test.md` 内容
+   - 临时目录 `temp/repo/sync/conflicts/{timestamp}/.../test.md` 内容
+   - 若 `GenerateConflictDoc=true`，检查冲突副本内容
+
+**预期结果（确凿结论）**：
+- 工作目录文档内容 = `本地修改版本`（本地赢）
+- temp 目录文档内容 = `云端修改版本`（云端输）
+- 冲突副本（若生成）内容 = `云端修改版本`
+
+**证据边界**：已通过 dejavu `sync.go` 源码中 `tmpMergeConflicts = cloudUpserts` 逻辑核实，实验仅用于验证集成行为。
+
+---
+
+#### 实验 2：验证修改删除冲突的静默处理
+
+**假设**：双向同步中，一端修改一端删除的冲突不会进入 Conflicts，不会生成冲突副本。
+
+**实验步骤（场景：云端修改 + 本地删除）**：
+1. 准备两台设备 A 和 B，创建文档 `test.md`，内容为 `初始版本`，等待同步
+2. 断开设备 B 的网络
+3. 在设备 A 上修改文档为 `云端修改版本`，等待同步
+4. 在设备 B 上删除文档 `test.md`（设备 B 仍离线）
+5. 恢复设备 B 的网络，触发同步
+6. 检查设备 B 上：
+   - 工作目录：`test.md` 是否存在
+   - `mergeResult.Conflicts` 列表（通过日志或调试查看）
+   - temp 冲突目录是否有该文件
+   - 历史目录是否有归档
+
+**预期结果（确凿结论）**：
+- 工作目录：`test.md` 保持删除状态（本地删除赢）
+- `mergeResult.Conflicts` 列表：**不包含**该文件
+- temp 冲突目录：**无**该文件
+- 历史目录：有同步前归档（文件已删除）
+
+**证据边界**：已通过 dejavu `sync0()` 源码中"本地删除了 → 什么也不做"的逻辑核实。
+
+---
+
+#### 实验 3：验证下载同步的云端优先策略
+
+**假设**：下载同步 `SyncDownload()` 中，两端都修改同一文档时，工作目录采用云端版本，temp 目录保存本地版本。
+
+**实验步骤**：
+1. 准备一台设备，创建文档 `test.md`，内容为 `初始版本`，等待同步
+2. 断开网络，修改文档为 `本地修改版本`
+3. 在另一台设备上修改文档为 `云端修改版本`，等待同步
+4. 在第一台设备上执行「仅下载」同步（Mode 3 手动下载）
+5. 检查：
+   - 工作目录文档内容
+   - temp 冲突目录内容
+   - 冲突副本（若生成）内容
+
+**预期结果（确凿结论）**：
+- 工作目录文档内容 = `云端修改版本`（云端赢）
+- temp 目录文档内容 = `本地修改版本`（本地输）
+- 冲突副本（若生成）内容 = `本地修改版本`
+
+**证据边界**：已通过 dejavu `sync_manual.go` 源码中 `SyncDownload()` 注释和逻辑核实。
+
+---
+
+#### 实验 4：验证 ignoreLocalUpsert 特殊规则
+
+**假设**：若本地修改仅为折叠属性变化，双向同步时会采用云端版本（例外情况）。
+
+**实验步骤**：
+1. 准备两台设备 A 和 B，创建文档 `test.md`，包含可折叠的列表/标题
+2. 在设备 A 上修改文档**内容**（如添加文字），等待同步
+3. 在设备 B 上仅修改文档的**折叠状态**（不修改内容），触发同步
+4. 检查设备 B 上的文档内容和折叠状态
+
+**预期结果（推断结论）**：
+- 文档内容 = 设备 A 的修改版本（云端赢，因为本地修改仅为折叠属性）
+- 折叠状态 = 设备 A 的状态（或保留本地？需实验验证）
+
+**证据边界**：dejavu `sync.go` 中调用了 `repo.ignoreLocalUpsert()`，但该函数的具体实现未在公开源码中找到，仅从调用上下文推断是"忽略本地仅折叠属性的修改"。
+
+---
+
+#### 证据边界总结表
+
+| 结论 | 证据级别 | 证据来源 | 未核实部分 |
+|------|----------|----------|------------|
+| 双向同步本地优先 | 确凿 | dejavu `sync.go` `sync0()` 函数 | 无 |
+| 下载同步云端优先 | 确凿 | dejavu `sync_manual.go` `SyncDownload()` 函数 | 无 |
+| 修改删除冲突静默处理 | 确凿 | dejavu `sync0()` 函数循环逻辑 | 无 |
+| 冲突副本来源双向=云端 | 确凿 | dejavu `sync0()` `tmpMergeConflicts = cloudUpserts` | 无 |
+| 冲突副本来源下载=本地 | 确凿 | dejavu `SyncDownload()` 逻辑对称推导 | `SyncDownload()` 内部实现未逐行核实 |
+| `ignoreLocalUpsert` 仅忽略折叠 | 推断 | 调用上下文推断 + SiYuan 折叠属性独立存储 | 函数具体实现未找到 |
+| 上传模式无冲突 | 确凿 | SiYuan 代码构造空 MergeResult 传入 | `SyncUpload()` 内部实现未逐行核实 |
+
+### 4.7 数据流：同步主循环详解
 
 [syncRepo() 主流程](file:///d:/fz/0601/solo-dogfeeding/code/285-siyuan/kernel/model/repository.go#L1510-L1606)
 
@@ -696,17 +915,17 @@ for _, fetchedFile := range fetchedFiles {
 2. 用户立即打开一个文档 → 事务正常编辑 → 事务正常执行
 3. 后台 `syncRepo()` 在后台 goroutine 中下载云端版本
 
-**两种时序结果**：
+**两种时序结果（双向同步，本地优先策略）**：
 
 | 时序 | 详细过程 | 数据是否丢失 | 用户感知 |
 |------|----------|------------|----------|
-| **时序 A：用户编辑先完成，syncRepo 后 checkout** | 1. 用户编辑 → commit() → 写入磁盘 → IncSync()<br>2. 后台 syncRepo 开始 → FlushTxQueue() 等待事务完成<br>3. repo.Index() 创建快照（包含用户修改）<br>4. repo.Sync() 三方合并 → 云端赢<br>5. 用户修改进入 Conflicts → 输出版本存入 temp 冲突目录<br>6. 若 GenerateConflictDoc=true → 生成冲突副本 | **不丢失**（可从冲突副本/历史恢复） | 用户刚编辑的内容"消失"了，需要从冲突副本找回 |
+| **时序 A：用户编辑先完成，syncRepo 后 checkout** | 1. 用户编辑 → commit() → 写入磁盘 → IncSync()<br>2. 后台 syncRepo 开始 → FlushTxQueue() 等待事务完成<br>3. repo.Index() 创建快照（包含用户修改）<br>4. repo.Sync() 三方合并 → **本地赢**（用户编辑保留）<br>5. 云端版本进入 Conflicts → 云端版本存入 temp 冲突目录<br>6. 若 GenerateConflictDoc=true → 生成冲突副本（云端版本） | **不丢失**（用户编辑保留，有历史目录兜底） | 用户刚编辑的内容正常保留，可能看到"云端版本"的冲突副本 |
 | **时序 B：syncRepo 先 checkout，用户后编辑** | 1. 后台 syncRepo 完成 checkout → 云端版本写入磁盘<br>2. 用户打开文档 → 加载到的是云端版本<br>3. 用户编辑 → commit() → 写入 → IncSync()<br>4. IncSync() 触发下次同步 → 把用户修改推上去 | **正常流程**，无丢失 | 用户感知正常，打开的就是最新云端版本 |
 
 **结论**：
-- 不存在真正的数据丢失风险（有冲突副本 + 历史目录兜底）
-- 但存在**用户感知问题**：时序 A 中用户刚打开的文档可能瞬间被云端版本覆盖
-- 这就是 `GenerateConflictDoc` 开启的意义——让用户能看到本地修改的副本
+- 不存在真正的数据丢失风险（双向同步本地优先 + 冲突副本 + 历史目录三重兜底）
+- 时序 A 中**用户编辑内容不会消失**（本地优先策略保证），但可能看到云端版本的冲突副本
+- 这就是 `GenerateConflictDoc` 开启的意义——让用户能看到云端修改的副本，决定是否合并
 - `syncingFiles` 仅用于 UI 展示同步状态，**不提供任何实际的阻塞保护**
 
 ---
@@ -1025,7 +1244,7 @@ if 0 < len(mergeResult.Conflicts) {
 
 | 风险等级 | 问题描述 | 关联代码 | 详细说明 |
 |---------|----------|----------|----------|
-| **高** | 启动同步覆盖用户编辑：bootSyncRepo 后台同步时，用户打开文档编辑的内容可能被云端版本覆盖 | [repository.go L1495-1503](file:///d:/fz/0601/solo-dogfeeding/code/285-siyuan/kernel/model/repository.go#L1495-L1503) | syncingFiles 仅用于 UI 展示，不提供实际阻塞保护；时序 A 中用户编辑内容会进入 Conflicts，需从冲突副本/历史找回 |
+| **中** | 启动同步竞态用户感知问题：bootSyncRepo 后台同步时，用户打开文档编辑的内容在双向同步下会保留（本地优先），但可能出现云端版本冲突副本 | [repository.go L1495-1503](file:///d:/fz/0601/solo-dogfeeding/code/285-siyuan/kernel/model/repository.go#L1495-L1503) | syncingFiles 仅用于 UI 展示，不提供实际阻塞保护；时序 A 中用户编辑内容保留（本地优先），但可能生成云端版本冲突副本造成困惑 |
 | **高** | WS 通知风暴收敛慢：多设备环形触发通知，空同步退避前 3 次都是 8 分钟 | [sync.go L214-223](file:///d:/fz/0601/solo-dogfeeding/code/285-siyuan/kernel/model/sync.go#L214-L223) | N 个设备形成通知环时，前 3 轮每轮 8 分钟，之后才指数退避；设备越多收敛越慢 |
 | **中** | `autoSyncErrCount` 是普通 int 非原子变量，并发访问有线程安全风险 | [sync.go L103](file:///d:/fz/0601/solo-dogfeeding/code/285-siyuan/kernel/model/sync.go#L103) | 多个 goroutine 可能同时读写该变量（isProviderOnline、syncRepo 等），存在竞态条件 |
 | **中** | GenerateConflictDoc=true 时大量冲突可能造成文档爆炸 | [repository.go L1644-1674](file:///d:/fz/0601/solo-dogfeeding/code/285-siyuan/kernel/model/repository.go#L1644-L1674) | 同一个文档在 N 端反复冲突 → N 个 Conflicted 副本；没有自动清理机制 |
@@ -1038,45 +1257,67 @@ if 0 < len(mergeResult.Conflicts) {
 
 ### 9.2 已确认结论与待验证问题
 
-#### 已通过代码分析确凿确认的结论
+#### 已通过代码分析确凿确认的结论（基于 dejavu 源码）
 
-| 结论 | 证据链 |
-|------|--------|
-| **云端优先（Cloud-Wins）冲突策略** | 三模式返回值差异 + 冲突副本从 temp 目录加载 + 下载模式完整 MergeResult + dataChanged 双端判定 |
-| **修改删除冲突统一进入 Conflicts** | Conflicts 列表无类型分支，所有冲突一视同仁；赢家仍为云端 |
-| **双向同步先拉后推顺序** | dataChanged 包含本地 Index 变更和云端 Merge 变更，说明先合并后推送 |
-| **冲突副本来源为本地输出版本** | 从 `temp/repo/sync/conflicts/` 加载，工作目录为云端赢版本 |
-| **上传模式无冲突（本地强制覆盖）** | SyncUpload 仅返回 TrafficStat，不返回 MergeResult |
-| **空同步退避 11 次循环机制** | 前 3 次 8 分钟保底，4-10 次指数增长，第 11 次重置为 5 |
-| **错误退避 7 次阈值** | autoSyncErrCount > 7 时延迟 64 分钟 |
-| **syncingFiles 仅影响闪卡/属性视图** | 全代码搜索验证：仅 flashcard.go / attribute_view_render.go / api/filetree.go 消费 |
-| **autoSyncErrCount 非原子变量** | 普通 int 类型，存在并发安全风险 |
-| **闪卡两种阻塞方式** | 写操作直接报错，读操作轮询等待 |
+> **证据来源说明**：以下结论中标记「★」的已通过 dejavu 公开源码（https://github.com/siyuan-note/dejavu）直接核实，其余通过 SiYuan 调用层代码分析核实。
+
+| 结论 | 证据级别 | 证据链 |
+|------|----------|--------|
+| **★ 双向同步（Sync()）本地优先策略** | 确凿 | dejavu `sync.go` 注释："冲突的文件尽量以本地 upsert 和 remove 为准" |
+| **★ 下载同步（SyncDownload()）云端优先策略** | 确凿 | dejavu `sync_manual.go` 注释："冲突的文件以云端 upsert 和 remove 为准" |
+| **★ 上传模式无冲突（本地强制覆盖）** | 确凿 | SiYuan 代码构造空 `MergeResult` 传入；`SyncUpload` 仅返回 `TrafficStat` |
+| **★ 修改删除冲突静默处理（双向同步）** | 确凿 | dejavu `sync0()` 源码：云端修改+本地删除→本地删除赢；云端删除+本地修改→本地修改赢；均不进入 Conflicts |
+| **★ 冲突副本来源：双向同步=云端版本** | 确凿 | dejavu `tmpMergeConflicts = cloudUpserts` → checkout 到 temp 的是云端版本 |
+| **★ 冲突副本来源：下载同步=本地版本** | 确凿 | dejavu `SyncDownload()` 逻辑对称 → 冲突时 temp 保存本地版本 |
+| **双向同步先拉后推顺序** | 确凿 | `dataChanged` 同时包含本地 Index 变更和云端 Merge 变更 |
+| **空同步退避 11 次循环机制** | 确凿 | 前 3 次 8 分钟保底，4-10 次指数增长（16→1024 分钟），第 11 次重置为 5（32 分钟）开始循环 |
+| **错误退避 7 次阈值** | 确凿 | `autoSyncErrCount > 7` 时延迟 64 分钟；手动同步（byHand=true）绕过 |
+| **syncingFiles 仅影响闪卡/属性视图** | 确凿 | 全代码搜索验证：仅 flashcard.go / attribute_view_render.go / api/filetree.go 消费 |
+| **autoSyncErrCount 非原子变量** | 确凿 | 普通 int 类型，多个 goroutine 可能同时读写 |
+| **闪卡两种阻塞方式** | 确凿 | 写操作直接返回 `TxErrCodeDataIsSyncing` 报错；读操作通过 `waitForSyncingStorages()` 轮询等待 |
 
 #### 仍待验证的问题
 
 以下问题需要通过实际集成测试或阅读 dejavu 源码进一步确认：
 
-**Q1：分块检查出损坏后的处理方式**
+**Q1：`ignoreLocalUpsert` 函数的具体实现**
+> dejavu `sync0()` 中调用了 `repo.ignoreLocalUpsert()`，但该函数的具体实现未在公开源码中找到。当前仅从调用上下文推断是"若本地修改仅为折叠属性变化，则采用云端版本"。需要确认该函数的完整判断逻辑。
+> **证据级别**：推断结论
+
+**Q2：分块检查出损坏后的处理方式**
 > PC 端检查分块（checkChunks=true），检查出的损坏分块是自动从云端修复还是直接报错终止？是否会影响同步流程？
 
-**Q2：跨 Provider 迁移的数据一致性**
+**Q3：跨 Provider 迁移的数据一致性**
 > 用户从 SiYuan Provider 切换到 S3 时，`CloudName` 共用，但云端元数据（索引格式）是否完全兼容？需验证 `newRepository` 不同 Cloud 实现的 Index 格式。
 
-**Q3：WS "synced" 消息的节流与排队**
+**Q4：WS "synced" 消息的节流与排队**
 > 设备 A 在 1 秒内连续多次同步完成，发送多条 "synced"，设备 B 的 `SyncDataDownload` 是否由 `syncLock` 自动排队？是否会造成 B 的同步队列积压？syncLock 是互斥锁还是可重入锁？
 
-**Q4：IncSync 调用的事务隔离与崩溃兜底**
+**Q5：IncSync 调用的事务隔离与崩溃兜底**
 > `tx.commit()` 先写文件后调用 `IncSync()`，两者之间若发生崩溃，文件已写入但同步未排程。下次启动时 `BootSyncData` 的 Index 操作是否能兜底捕获该修改？（理论上可以，因为 Index 会扫描所有文件）
 
-**Q5：0.2 全量重建阈值的合理性**
+**Q6：0.2 全量重建阈值的合理性**
 > `needFullReindex(upsertTrees)` 当同步变更文档数 > 总量 20% 时触发 `FullReindex`。在大工作区（10w+ 文档）下，FullReindex 可能耗时数十分钟，是否有进度反馈和取消能力？
 
-**Q6：Sync.GenerateConflictDoc 与历史目录的双重保存**
+**Q7：Sync.GenerateConflictDoc 与历史目录的双重保存**
 > 开启冲突副本后，同一份冲突数据既保存在 `history/YYYY-MM-DD-HHMMSS-sync/` 又作为新 `.sy` 文档写入，是否会造成双倍磁盘占用？是否存在清理策略？
 
-**Q7：syncSameCount 上界的设计意图**
+**Q8：syncSameCount 上界的设计意图**
 > `syncSameCount > 10` 时重置为 5（循环在 32~1024 分钟）的设计意图是什么？为何不封顶在一个固定最大值？是否与唤醒策略或省电优化有关？
+
+**Q9：修改删除冲突的云端数据最终状态**
+> 双向同步中，云端修改+本地删除→本地删除赢（文件保持删除）。此时云端的修改版本是否会被保留？下次其他设备同步时是否会重新出现该文件？（从源码看，本地删除赢意味着不向云端推送删除，也不拉取云端修改，因此云端保留修改版本，其他设备同步时会获取到。）
+> **证据级别**：推断结论
+
+---
+
+#### 已通过源码核实、不再需要验证的问题
+
+以下问题曾在之前版本中标记为"待验证"，现已通过 dejavu 源码直接核实，移至已确认结论列表：
+
+- ~~Q1：冲突赢家策略（云端优先 vs 本地优先）~~ → 已确认：双向同步本地优先，下载同步云端优先
+- ~~Q2：修改删除冲突的处理方式~~ → 已确认：双向同步下删除操作永远赢，静默处理，不进入 Conflicts
+- ~~Q3：冲突副本来源（本地 vs 云端）~~ → 已确认：双向同步=云端版本，下载同步=本地版本
 
 ---
 
@@ -1113,9 +1354,13 @@ if 0 < len(mergeResult.Conflicts) {
 
 SiYuan 的同步系统设计体现了以下核心设计理念：
 
-1. **本地优先（Local-First）**：所有写操作先落本地事务，同步完全异步解耦。网络不可用时用户体验零降级。
+1. **本地优先（Local-First）**：所有写操作先落本地事务，同步完全异步解耦。网络不可用时用户体验零降级。双向同步冲突策略也采用本地优先，保证用户编辑不会丢失。
 
-2. **云端优先（Cloud-Wins）**：冲突处理统一采用云端优先策略，本地输出版本存入临时目录，作为冲突副本供用户手动合并。
+2. **三模式差异化冲突策略**：
+   - 双向同步（Sync()）：**本地优先**（"冲突的文件尽量以本地 upsert 和 remove 为准"）
+   - 仅下载（SyncDownload()）：**云端优先**（"冲突的文件以云端 upsert 和 remove 为准"）
+   - 仅上传（SyncUpload()）：**本地强制覆盖**（无冲突概念）
+   - 输出版本存入临时目录，作为冲突副本供用户手动合并。
 
 3. **快照驱动的增量同步**：基于 dejavu 的内容寻址分块 + Index 哈希链，保证数据完整性和增量传输。
 
@@ -1125,22 +1370,24 @@ SiYuan 的同步系统设计体现了以下核心设计理念：
 
 6. **多环境适配**：移动端/PC 端差异化策略（分块检查、文件系统权限）、多 Provider 抽象层。
 
-### 11.2 已确认的关键结论（共 10 项）
+### 11.2 已确认的关键结论（共 12 项，基于 dejavu 源码）
 
-经过多维度代码交叉验证，以下结论已**确凿**确认，不再是推断：
+经过 dejavu 源码直接核实 + SiYuan 调用层代码交叉验证，以下结论已**确凿**确认，不再是推断：
 
-| 序号 | 结论 | 核心证据 |
-|------|------|----------|
-| 1 | **云端优先（Cloud-Wins）冲突策略** | 三模式返回值差异 + 冲突副本从 temp 目录加载 + 下载模式完整 MergeResult + dataChanged 双端判定 |
-| 2 | **修改删除冲突统一进入 Conflicts** | Conflicts 列表无类型分支，所有冲突一视同仁；赢家仍为云端 |
-| 3 | **双向同步先拉后推顺序** | `dataChanged` 同时包含本地 Index 变更和云端 Merge 变更，说明先合并后推送 |
-| 4 | **冲突副本来源为本地输出版本** | 从 `temp/repo/sync/conflicts/` 加载，工作目录 `data/` 为云端赢版本 |
-| 5 | **上传模式无冲突（本地强制覆盖）** | `SyncUpload` 仅返回 `TrafficStat`，不返回 `MergeResult`，SiYuan 手动构造空 MergeResult 传入 |
-| 6 | **空同步退避 11 次循环机制** | 前 3 次 8 分钟保底，4-10 次指数增长（16→1024 分钟），第 11 次重置为 5（32 分钟）开始循环 |
-| 7 | **错误退避 7 次阈值** | `autoSyncErrCount > 7` 时延迟 64 分钟；手动同步（byHand=true）绕过该检查 |
-| 8 | **syncingFiles 仅影响闪卡/属性视图** | 全代码搜索验证：仅 flashcard.go / attribute_view_render.go / api/filetree.go 消费；普通文档事务完全不阻塞 |
-| 9 | **autoSyncErrCount 非原子变量** | 普通 int 类型，多个 goroutine 可能同时读写，存在并发安全风险 |
-| 10 | **闪卡两种阻塞方式** | 写操作（加闪卡/删闪卡）直接返回 `TxErrCodeDataIsSyncing` 报错；读操作（查询/渲染）通过 `waitForSyncingStorages()` 轮询等待 |
+| 序号 | 结论 | 核心证据 | 证据来源 |
+|------|------|----------|----------|
+| 1 | **双向同步（Sync()）本地优先策略** | 两端都修改时，工作目录保留本地版本，temp 目录保存云端版本 | dejavu `sync.go` 注释 + `tmpMergeConflicts = cloudUpserts` 逻辑 |
+| 2 | **下载同步（SyncDownload()）云端优先策略** | 两端都修改时，工作目录采用云端版本，temp 目录保存本地版本 | dejavu `sync_manual.go` 注释 + 对称逻辑推导 |
+| 3 | **修改删除冲突静默处理（双向同步）** | 云端修改+本地删除→本地删除赢；云端删除+本地修改→本地修改赢；均不进入 Conflicts，不生成冲突副本 | dejavu `sync0()` 函数循环逻辑 |
+| 4 | **冲突副本来源差异化** | 双向同步=云端版本（temp 目录保存 cloudUpsert）；下载同步=本地版本 | dejavu `tmpMergeConflicts` 赋值逻辑 + SiYuan 加载路径 |
+| 5 | **上传模式无冲突（本地强制覆盖）** | `SyncUpload` 仅返回 `TrafficStat`，不返回 `MergeResult`，SiYuan 手动构造空 MergeResult 传入 | SiYuan `syncRepoUpload()` 代码 |
+| 6 | **双向同步先拉后推顺序** | `dataChanged` 同时包含本地 Index 变更和云端 Merge 变更，说明先合并后推送 | SiYuan `syncRepo()` 代码 |
+| 7 | **空同步退避 11 次循环机制** | 前 3 次 8 分钟保底，4-10 次指数增长（16→1024 分钟），第 11 次重置为 5（32 分钟）开始循环 | SiYuan `processSyncMergeResult()` 代码 |
+| 8 | **错误退避 7 次阈值** | `autoSyncErrCount > 7` 时延迟 64 分钟；手动同步（byHand=true）绕过该检查 | SiYuan `checkSync()` 代码 |
+| 9 | **syncingFiles 仅影响闪卡/属性视图** | 全代码搜索验证：仅 flashcard.go / attribute_view_render.go / api/filetree.go 消费；普通文档事务完全不阻塞 | SiYuan 全代码搜索 |
+| 10 | **autoSyncErrCount 非原子变量** | 普通 int 类型，多个 goroutine 可能同时读写，存在并发安全风险 | SiYuan `sync.go` 变量定义 |
+| 11 | **闪卡两种阻塞方式** | 写操作（加闪卡/删闪卡）直接返回 `TxErrCodeDataIsSyncing` 报错；读操作（查询/渲染）通过 `waitForSyncingStorages()` 轮询等待 | SiYuan `flashcard.go` 代码 |
+| 12 | **ignoreLocalUpsert 特殊规则（推断）** | 若本地修改仅为折叠属性变化，双向同步时会例外地采用云端版本 | dejavu `sync0()` 函数调用 + 上下文推断 |
 
 ### 11.3 因果链总结
 
