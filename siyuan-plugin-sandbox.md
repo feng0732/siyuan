@@ -298,7 +298,7 @@ export const normalizeStoragePath = (storageName: string): string | null => {
    - `"data/../"` → 去掉 `/` → `"data" + ".."` = `"data.."`（不逃逸，作为文件名处理）
    - 只有 **`".."`、`"/../"`、`"//..//"` 等去掉斜线后恰好等于 `".."`** 的输入，才会产生最终路径 `"/data/storage/petal/<name>/.."`，可向上逃逸到 `"/data/storage/petal"` 目录
 3. **不抛异常**：穿越路径被静默压平而非报错，调用方无法区分合法路径和被压平的攻击路径
-4. **后端二次校验**：内核的 `/api/file/getFile` 和 `/api/file/putFile` 会校验路径合法性（基于工作空间根目录），即使前端规范化有缺陷，后端也应拦截逃逸路径
+4. **后端二次校验**：内核的 `GetAbsPathInWorkspace` 使用 `filepath.Join + filepath.Clean` 解析路径，再检查 `IsSubPath(WorkspaceDir, absPath)`。后端会把 `..` 解析到真实父目录，即使前端只返回了 `".."` 字面量
 
 **路径处理细节验证**：
 
@@ -314,6 +314,138 @@ export const normalizeStoragePath = (storageName: string): string | null => {
   - `parts = ["..", ".."]`
   - 两个 `".."` 都被忽略 → `resolved = []`
   - 分支 B → `"../..".replace(/[\/\\]+/g, "")` → `"...."` ✔️ 斜线被完全删除，两个 `".."` 连在一起
+
+### 3.2.1 三入口存储操作行为对比
+
+插件存储操作由 `Plugin` 基类的三个方法提供，它们使用相同的路径模板，但**请求格式、参数构造和后端 API 不同**：
+
+| 维度 | loadData | saveData | removeData |
+|---|---|---|---|
+| **后端 API** | `/api/file/getFile` | `/api/file/putFile` | `/api/file/removeFile` |
+| **请求格式** | JSON body `{path}` | FormData `{path, file, isDir}` | JSON body `{path}` |
+| **路径模板** | `` `/data/storage/petal/${name}/${normalize(s)}` `` | 同左 | 同左 |
+| **额外构造** | 无 | `fileName = pathString.split("/").pop()` → `new File([blob], fileName)` | 无 |
+| **只读守卫** | 无 | ✅ `readonly \|\| isPublish` → reject 403 | ✅ `readonly \|\| isPublish` → reject 403 |
+| **后端路径解析** | `GetAbsPathInWorkspace` → `filelock.IsExist` | `GetAbsPathInWorkspace` → `IsValidUploadFileName(Base)` / `IsDir` 检查 | `GetAbsPathInWorkspace` → `os.Stat` → `RemoveWithoutFatal` |
+
+**saveData 的文件名提取差异**：
+
+[plugin/index.ts:291](file:///d:/fz/0601/solo-dogfeeding/code/287-siyuan/app/src/plugin/index.ts#L291) `saveData` 使用 **JavaScript** `pathString.split("/").pop()` 提取文件名，而非 Go 的 `filepath.Base`。两者在边界场景下行为不同：
+
+| pathString | JS `split("/").pop()` | Go `filepath.Base(Clean(path))` | 差异 |
+|---|---|---|---|
+| `.../my-plugin/` | `""` (空串) | `"my-plugin"` | ⚠️ JS 返回空串，Go 返回目录名 |
+| `.../my-plugin/.` | `"."` | `"my-plugin"` | ⚠️ JS 返回点号，Go 清除了尾部 `.` |
+| `.../my-plugin/..` | `".."` | `"petal"` | ⚠️ JS 返回字面 `..`，Go 解析了父目录 |
+| `.../my-plugin/....` | `"...."` | `"...."` | 一致（非 `..` 的多点不做特殊处理） |
+| `.../my-plugin/config.json` | `"config.json"` | `"config.json"` | 一致 |
+
+### 3.2.2 边界场景三入口行为逐项分析
+
+以下分析基于对 [plugin/index.ts:263-335](file:///d:/fz/0601/solo-dogfeeding/code/287-siyuan/app/src/plugin/index.ts#L263-L335) 前端代码和 [file.go:327-770](file:///d:/fz/0601/solo-dogfeeding/code/287-siyuan/kernel/api/file.go#L327-L770) 后端代码的交叉对照，模拟 Go `filepath.Join + filepath.Clean` 解析真实路径。
+
+#### 场景 1：`storageName = ""`（空字符串）
+
+- `normalizeStoragePath("")` → `""`（分支 B）
+- `pathString` = `/data/storage/petal/<name>/`
+- Go `filepath.Clean` → `<workspace>/data/storage/petal/<name>`（**尾斜线被去除，解析为插件目录**）
+
+| 入口 | 行为 |
+|---|---|
+| **loadData** | `getFile` → 路径指向目录 → `filelock.IsExist` 为 true → 内核读取目录 → 返回 HTTP 202（不是文件） → 前端 `failCallback` → `resolve("")` |
+| **saveData** | `split("/").pop()` → `""` → `new File([blob], "")` 创建空名 File 对象 → putFile 收到 `path` 指向目录 → `os.Stat` 显示是目录 → 返回 400 `"path is a directory"` |
+| **removeData** | `removeFile` → 路径指向插件目录 → `os.Stat` 成功 → `filelock.RemoveWithoutFatal` → **⚠️ 若目录为空则删除整个插件存储目录**；若非空则 `os.Remove` 失败（Go 的 `os.Remove` 不能删非空目录） |
+
+#### 场景 2：`storageName = "."`
+
+- `normalizeStoragePath(".")` → `"."`（分支 B）
+- `pathString` = `/data/storage/petal/<name>/.`
+- Go `filepath.Clean` → `<workspace>/data/storage/petal/<name>`（尾部 `.` 被去除，**同空字符串**）
+
+| 入口 | 行为 |
+|---|---|
+| **loadData** | 与 `""` 完全相同 → 返回 202 → `resolve("")` |
+| **saveData** | `split("/").pop()` → `"."` → `new File([blob], ".")` → putFile 路径指向目录 → 400 `"path is a directory"` |
+| **removeData** | 与 `""` 完全相同 → 指向插件目录 |
+
+#### 场景 3：`storageName = ".."`
+
+- `normalizeStoragePath("..")` → `".."`（分支 B）
+- `pathString` = `/data/storage/petal/<name>/..`
+- Go `filepath.Clean` → `<workspace>/data/storage/petal`（**上逃逸一级，指向 petal 目录**）
+
+| 入口 | 行为 |
+|---|---|
+| **loadData** | `getFile` → 路径指向 petal 目录 → 202 → `resolve("")` |
+| **saveData** | `split("/").pop()` → `".."` → `new File([blob], "..")` → putFile: `IsValidUploadFileName("petal")` = true（普通名称） → 但 `os.Stat` 显示是目录 → 400 `"path is a directory"` |
+| **removeData** | **🔴 高危** → `removeFile` → 路径指向 petal 目录 → `os.Stat` 成功 → `filelock.RemoveWithoutFatal` → **若 petal 目录为空则删除整个插件存储根目录**；非空则 `os.Remove` 失败 |
+
+#### 场景 4：`storageName = "/"` 或 `"//"` 或 `"///"`
+
+- `normalizeStoragePath` → `""`（分支 B，纯斜线全部被删除）
+- `pathString` = `/data/storage/petal/<name>/`
+- 行为**与场景 1 完全相同**
+
+#### 场景 5：`storageName = "/../"` 或 `"//..//"`
+
+- `normalizeStoragePath` → `".."`（分支 B）
+- `pathString` = `/data/storage/petal/<name>/..`
+- 行为**与场景 3 完全相同**
+
+#### 场景 6：`storageName = "../.."`
+
+- `normalizeStoragePath` → `"...."`（分支 B，斜线删除后两点段连在一起）
+- `pathString` = `/data/storage/petal/<name>/....`
+- Go `filepath.Clean` → `<workspace>/data/storage/petal/<name>/....`（`....` 是普通文件名，不做 `..` 解析）
+
+| 入口 | 行为 |
+|---|---|
+| **loadData** | `getFile` → 文件不存在 → 202 → `resolve("")` |
+| **saveData** | `split("/").pop()` → `"...."` → `IsValidUploadFileName("....")` → `FilterUploadFileName("....")` = `"..."`（`TrimSuffix(".")` 去掉尾部点） → `"...." !== "..."` → **❌ 400 无效文件名** |
+| **removeData** | 文件不存在 → `os.Stat` 失败 → 404 `"path does not exist"` |
+
+#### 场景 7：`storageName = "data/../"`
+
+- `normalizeStoragePath` → `"data.."`（分支 B）
+- `pathString` = `/data/storage/petal/<name>/data..`
+- Go `filepath.Clean` → `<workspace>/data/storage/petal/<name>/data..`（普通文件名）
+
+| 入口 | 行为 |
+|---|---|
+| **loadData** | 文件不存在 → 202 → `resolve("")` |
+| **saveData** | `IsValidUploadFileName("data..")` → `FilterUploadFileName("data..")` = `"data."`（`TrimSuffix(".")` 只去一个点） → `"data.." !== "data."` → **❌ 400 无效文件名** |
+| **removeData** | 文件不存在 → 404 |
+
+### 3.2.3 后端防线总结
+
+[file.go:327-356](file:///d:/fz/0601/solo-dogfeeding/code/287-siyuan/kernel/api/file.go#L327-L356) `getFile` 和 [file.go:645-689](file:///d:/fz/0601/solo-dogfeeding/code/287-siyuan/kernel/api/file.go#L645-L689) `removeFile` 通过 `GetAbsPathInWorkspace` → `IsSubPath` 检查路径不逃逸工作空间。
+
+[file.go:691-770](file:///d:/fz/0601/solo-dogfeeding/code/287-siyuan/kernel/api/file.go#L691-L770) `putFile` 有三层防线：
+
+1. **空路径拦截**：`filePath == ""` → 400 `"path must not be empty"`
+2. **工作空间逃逸拦截**：`GetAbsPathInWorkspace` → `IsSubPath` 检查
+3. **无效文件名拦截**：`IsValidUploadFileName(filepath.Base(absPath))` → 400（针对含点号结尾等非合规文件名，来自 [issue #14658](https://github.com/siyuan-note/siyuan/issues/14658)）
+4. **目录覆盖拦截**：`info.IsDir() && !isDir` → 400 `"path is a directory"`
+
+[path.go:355-366](file:///d:/fz/0601/solo-dogfeeding/code/287-siyuan/kernel/util/path.go#L355-L366) `GetAbsPathInWorkspace` 实现：
+
+```go
+func GetAbsPathInWorkspace(relPath string) (string, error) {
+    absPath := filepath.Join(WorkspaceDir, relPath)  // Join 自动 Clean
+    absPath = filepath.Clean(absPath)
+    if WorkspaceDir == absPath { return absPath, nil }
+    if gulu.File.IsSubPath(WorkspaceDir, absPath) { return absPath, nil }
+    return "", os.ErrPermission  // 路径逃逸工作空间
+}
+```
+
+[file.go:209-247](file:///d:/fz/0601/solo-dogfeeding/code/287-siyuan/kernel/util/file.go#L209-L247) `IsValidUploadFileName` → `FilterUploadFileName` → `FilterFileName` 链式过滤：替换非法字符 → `TrimSpace` → **`TrimSuffix(".")` 去除尾部点号**（`"."` → `""`、`".."` → `"."`、`"..."` → `".."`）。
+
+**关键发现**：`".."` 作为存储名时：
+- **前端** `normalizeStoragePath` 未能拦截，返回字面量 `".."`
+- **后端** `GetAbsPathInWorkspace` 不会拦截（`/data/storage/petal` 仍在工作空间内）
+- **后端** `getFile`/`removeFile` 不会拦截（目录确实存在）
+- **后端** `putFile` 通过 `IsDir` 检查拦截了写入，但 `removeFile` **没有目录/文件类型区分**，`filelock.RemoveWithoutFatal` 可能删除整个 petal 目录（取决于底层实现是否递归删除）
 
 ### 3.3 暴露的 API 对象
 
@@ -778,14 +910,18 @@ requireFunc.__proto__ = window.require
 
 插件可通过 `Object.getPrototypeOf(requireFunc)("child_process")` 直接调用 Electron 原生 `require`，绕过白名单访问任意 Node 模块。
 
-#### 风险 3：`normalizeStoragePath` 回退策略的一级逃逸漏洞
+#### 风险 3：`normalizeStoragePath` 回退策略的一级逃逸 + `removeData` 目录删除漏洞
 
 [pathName.ts:730-742](file:///d:/fz/0601/solo-dogfeeding/code/287-siyuan/app/src/util/pathName.ts#L730-L742) 路径穿越防护存在以下真实边界：
 
 - 大多数穿越路径被有效压平：`"../../../etc/passwd"` → `"etc/passwd"`（保留斜线，不逃逸）
-- 分支 B 去斜线导致的特殊风险：只有 `".."`、`"/../"`、`"//..//"` 等**去掉所有斜线后恰好等于 `".."`** 的输入，才能产生最终路径 `"/data/storage/petal/<name>/.."`，可向上逃逸一级到 `"/data/storage/petal"` 目录
+- 分支 B 去斜线导致的特殊风险：只有 `".."`、`"/../"`、`"//..//"` 等**去掉所有斜线后恰好等于 `".."`** 的输入，才能产生最终路径 `"/data/storage/petal/<name>/.."`，Go `filepath.Clean` 将其解析为 `<workspace>/data/storage/petal`
 - 多级 `..` 不会被放大逃逸：`"../.."` → `"...."`（4 个点，作为文件名），`"../../.."` → `"......"`（6 个点，作为文件名），均不逃逸
-- 后端 `/api/file/getFile` 应有路径校验作为第二道防线
+- 后端 `GetAbsPathInWorkspace` 的 `IsSubPath` 检查不会拦截（`/data/storage/petal` 仍在工作空间内）
+- **`loadData`** 安全：`getFile` 对目录返回 202，不会泄露目录内容
+- **`saveData`** 安全：`putFile` 的 `IsDir` 检查拦截写入目录，返回 400
+- **`removeData` 🔴 高危**：`removeFile` 不区分文件/目录类型，`filelock.RemoveWithoutFatal` 直接尝试删除。当 `storageName = ".."` 时，路径解析为 petal 目录（包含所有插件存储），若目录非空 Go 的 `os.Remove` 会失败，但需确认 `RemoveWithoutFatal` 不使用 `os.RemoveAll`（递归删除）
+- **空存储名/点号**也有类似风险：`""`、`"."`、`"/"` 等输入解析为插件目录自身，`removeData` 可能删除整个插件存储目录
 
 #### 风险 4：`window.siyuan` 全局对象完全暴露
 
