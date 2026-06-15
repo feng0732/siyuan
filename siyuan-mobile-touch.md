@@ -162,16 +162,18 @@ SiYuan 的响应式不是单一机制，而是 **端间硬切换、局部 CSS �
 └────────────────────────────────────────────────────────────────────┘
                               ↓
 ┌────────────────────────────────────────────────────────────────────┐
-│ Layer 2: 局部 CSS 媒体查询断点（组件/内容级）                         │
-│ 粒度：端内视口宽度变化 → 特定组件的微调整                            │
-│ 机制：@media (max-width: Npx) 在双端 SCSS 中共用                     │
+│ Layer 2: 局部 CSS 媒体查询断点（分级：L1 业务 → L2 组件 → L3 第三方）  │
+│ 粒度：端内视口宽度变化 → 特定组件/内容的自适应微调                    │
+│ 机制：@media (max-width: Npx) 在 SCSS 中共用                         │
 │ 切换时机：运行时视口 resize 触发（纯 CSS，无需 JS）                  │
-│ 断点与作用范围：                                                    │
-│   620px — superblock 横列 ↔ 竖排 切换（mobile/_mobile.scss）        │
-│   750px — 设置面板 Tab 文字隐藏、历史面板上下分栏、卡片表单换行       │
-│            （util/_responsive.scss，双端共用）                      │
-│   535~1199px — PDF.js 工具栏元素分级隐藏（第三方库自带断点）          │
-│   767/991/1199px — Viewer.js 分级隐藏（第三方库自带断点）            │
+│ 核心业务断点（L1，SiYuan 自有，必须保障）：                           │
+│   620px — superblock 横列 ↔ 竖排 切换（仅移动端 _mobile.scss）      │
+│   750px — 设置/历史/快捷键面板窄屏化（util/_responsive.scss 双端）   │
+│ 组件微调断点（L2，通用组件，视觉优化）：                               │
+│   520px — snackbar 通知条位置调整 + tooltips 工具提示隐藏（双端）     │
+│ 第三方库断点（L3，PDF.js / Viewer.js，升级库时自动变更）：            │
+│   535~840px — PDF.js 工具栏分级隐藏 / 侧栏空间调整                  │
+│   767~1199px — Viewer.js hide-xs/sm/md-down 响应式工具类            │
 └────────────────────────────────────────────────────────────────────┘
                               ↓
 ┌────────────────────────────────────────────────────────────────────┐
@@ -210,24 +212,28 @@ SiYuan 的响应式不是单一机制，而是 **端间硬切换、局部 CSS �
 
 #### 2.2.2 Layer 2 — 局部 CSS 媒体查询断点
 
-**确实存在 @media 断点**，只是它们作用于**端内组件级微调**而非端间切换。所有断点清单如下（从 SCSS 文件交叉验证）：
+**确实存在 @media（max-width）断点**，它们不是用来做"移动端 vs 桌面端"的端间切换，而是做**端内的视口宽度自适应微调**。按业务影响范围可分为三级：
 
-| 断点宽度 | 文件位置 | 生效端 | 影响内容 |
-|---------|---------|--------|---------|
-| **620px** | `app/src/assets/scss/main/_mobile.scss` | **仅移动端** | Superblock `[data-sb-layout="col"]` 横列布局 → 强制竖排：`flex-direction: column`；子元素 `margin-right: 0` |
-| **750px** | `app/src/assets/scss/util/_responsive.scss` | **双端共用** | 设置面板 Tab 栏隐藏文字（只留图标）、表单标签全宽换行、历史面板左右分栏→上下分栏（左栏固定40%高）、快捷键面板键位输入框全宽居中 |
-| **535px** | `app/src/assets/scss/pdf/_pdf.scss` | **双端共用** (PDF.js) | PDF.js 缩放选择器隐藏 |
-| **640px** | `app/src/assets/scss/pdf/_pdf.scss` | **双端共用** (PDF.js) | PDF.js 小型视图元素及子节点全部隐藏 |
-| **700px** | `app/src/assets/scss/pdf/_pdf.scss` | **双端共用** (PDF.js) | PDF.js 中型视图元素隐藏 |
-| **770px** | `app/src/assets/scss/pdf/_pdf.scss` | **双端共用** (PDF.js) | PDF.js 大型视图元素隐藏 |
-| **840px** | `app/src/assets/scss/pdf/_pdf.scss` | **双端共用** (PDF.js) | PDF.js 侧栏展开时不预留左侧空间（覆盖 left 属性） |
-| **767px** | `app/src/assets/scss/viewerjs/_viewer.scss` | **双端共用** (Viewer.js) | Viewer.js `hide-xs-down` 类生效 |
-| **991px** | `app/src/assets/scss/viewerjs/_viewer.scss` | **双端共用** (Viewer.js) | Viewer.js `hide-sm-down` 类生效 |
-| **1199px** | `app/src/assets/scss/viewerjs/_viewer.scss` | **双端共用** (Viewer.js) | Viewer.js `hide-md-down` 类生效 |
+```
+Level 1 — 核心业务内容适配（2 个断点，SiYuan 特有，不可缺失）
+├── 620px  superblock 列布局横→竖排（仅移动端）
+└── 750px  设置/历史/快捷键面板窄屏化（双端共用）
 
-**620px 断点对 superblock 横列布局的影响（最核心的业务断点）：**
+Level 2 — 组件级 UI 微调（1 个断点，覆盖 2 个通用组件，双端共用）
+└── 520px  snackbar 通知条位置 & tooltips 工具提示隐藏
 
-默认 superblock 列布局（`app/src/assets/scss/protyle/_wysiwyg.scss`）：
+Level 3 — 第三方库自带断点（2 个库，共 8 个断点，SiYuan 未定制）
+├── PDF.js: 535 / 640 / 700 / 770 / 840px（工具栏分级隐藏/侧栏空间调整）
+└── Viewer.js: 767 / 991 / 1199px（hide-xs/sm/md-down 响应式工具类）
+```
+
+---
+
+##### Level 1：核心业务内容适配（SiYuan 自有断点，必须保障）
+
+**620px — superblock 列布局响应式（`app/src/assets/scss/main/_mobile.scss`，仅移动端）**
+
+默认 superblock 列布局（`app/src/assets/scss/protyle/_wysiwyg.scss`，双端共用）：
 ```scss
 .sb[data-sb-layout="col"] {
     flex-direction: row;    // 横向排列（多列并排）
@@ -237,7 +243,7 @@ SiYuan 的响应式不是单一机制，而是 **端间硬切换、局部 CSS �
 }
 ```
 
-当 `max-width: 620px` 时（移动端小屏触发，`_mobile.scss`）：
+当 `max-width: 620px` 时（移动端小屏触发）：
 ```scss
 .protyle-wysiwyg [data-node-id].sb[data-sb-layout="col"] {
     flex-direction: column; // 强制纵向排列（单列竖排）
@@ -248,17 +254,73 @@ SiYuan 的响应式不是单一机制，而是 **端间硬切换、局部 CSS �
 }
 ```
 
-**含义**：用户在桌面端创建了一个"左右并排"的 superblock 列布局，在移动端（屏幕 < 620px）浏览时会**自动变为上下堆叠**，保证窄屏可读性。这是纯 CSS 驱动的运行时响应式，不需要 JS 介入。
+**业务含义**：用户在桌面端创建了一个"左右并排"的 superblock 列布局，在移动端（屏幕 < 620px）浏览时会**自动变为上下堆叠**，保证窄屏可读性。这是纯 CSS 驱动的运行时响应式，不需要 JS 介入。**此断点是 SiYuan 所有响应式规则中唯一影响"文档内容布局"的断点**，直接关系到跨端内容一致性。
 
-**750px 断点（双端通用，最广覆盖的业务断点）：**
+---
 
-覆盖 4 类组件：
-1. **设置面板 Tab 栏**：`.config__panel > .b3-tab-bar` 的 `.b3-list-item__text` 隐藏，仅保留图标，`width: auto` → 避免标签文字挤压换行
-2. **设置项表单**：`.config__item > *`（输入框/按钮/下拉/滑块）全部 `width: 100%` + `margin-top: 8px` → 从"标签-控件横排"变为"标签-控件竖排"
-3. **历史面板**：`.history__panel` 从左右分栏变为上下分栏（左 Tab 栏 `height: 40%`，`width: auto`，底部加 border）
-4. **快捷键定义**：`.config-keymap__key` 键位输入框 `width: 100%` + 居中对齐
+**750px — 表单/对话框/面板窄屏适配（`app/src/assets/scss/util/_responsive.scss`，双端共用）**
 
-**设计意图**：750px 断点作用于**弹出对话框/浮动面板**（#model 设置面板、Dialog 对话框）。这些组件在桌面端可能以较小的宽度弹出（或窗口本身就窄），在移动端则要占满屏幕。通过同一个 @media 规则覆盖双端的窄屏场景，避免重复写 CSS。
+覆盖 4 类功能面板组件：
+
+| 组件 | 调整前（>750px） | 调整后（≤750px） | CSS 选择器 |
+|------|-----------------|-----------------|-----------|
+| **设置面板 Tab 栏** | 图标 + 文字并排，固定宽度 | 仅显示图标，`width: auto` | `.config__panel > .b3-tab-bar` |
+| **设置项表单行** | 标签与控件横向并排 | 控件 `width: 100%`，全部换行竖排 | `.config__item > *` |
+| **历史版本面板** | 左右分栏（历史列表 + 差异预览） | 上下分栏，上栏 `height: 40%` | `.history__panel` |
+| **快捷键定义** | 键位输入框横向排列 | 键位输入框 `width: 100%` + 居中 | `.config-keymap__key` |
+
+**设计意图**：750px 断点作用于**弹出对话框/浮动面板**（#model 设置面板、Dialog 对话框、历史版本窗口）。这些组件在桌面端可能以较小的宽度弹出（或桌面窗口本身就被用户拖窄），在移动端则要占满整个屏幕。通过同一个 @media 规则覆盖双端的窄屏场景，避免重复写 CSS。
+
+---
+
+##### Level 2：组件级 UI 微调（1 个断点，2 个通用组件，双端共用）
+
+**520px — 通知条位置与工具提示隐藏**
+
+520px 断点同时覆盖两个独立的通用组件（均位于 `app/src/assets/scss/component/`，双端共用样式）：
+
+| 组件 | 文件 | ≤520px 时的调整 | 业务背景 |
+|------|------|----------------|---------|
+| **Snackbar 通知条** | `component/_snackbar.scss` | ① 容器 `top: 35px`（避开顶部工具栏）② `right: calc(10vw - 18px)`（偏移到右侧 10% 位置）③ 滑入动画起点改为 `translate3d(100vw, 0, 0)`（从屏幕右侧外滑入）④ 内容最大宽度 `max-width: 80vw` | 大屏时通知条固定在右上角，小屏时改为更靠下且允许更宽，避免与状态栏/刘海区重叠 |
+| **Tooltips 工具提示** | `component/_tooltips.scss` | `.b3-tooltips::after { content: none; }` — 彻底不渲染 tooltip 气泡 | 移动端（或窄屏桌面窗口）屏幕空间有限，用户手指操作本身就不需要工具提示辅助；同时 hover 语义在触控设备上也无意义 |
+
+> **业务分级说明**：520px 断点属于"锦上添花"的组件微调，不影响功能可用性——即使没有这两条规则，snackbar 和 tooltips 仍然能正常工作，只是视觉位置不佳。与 620px/750px 的"不做就会功能错乱"不在同一优先级。
+
+---
+
+##### Level 3：第三方库自带断点（SiYuan 未定制，升级库时自然变更）
+
+| 第三方库 | 断点 | 文件位置 | 作用 |
+|---------|------|---------|------|
+| **PDF.js** | 535px | `pdf/_pdf.scss` | `#scaleSelectContainer`（缩放比例选择下拉框）隐藏 |
+| **PDF.js** | 640px | `pdf/_pdf.scss` | `.hiddenSmallView` 及其所有子节点隐藏，`.visibleSmallView` 显示 |
+| **PDF.js** | 700px | `pdf/_pdf.scss` | `.hiddenMediumView` 隐藏，`.visibleMediumView` 显示 |
+| **PDF.js** | 770px | `pdf/_pdf.scss` | `.hiddenLargeView` 隐藏，`.visibleLargeView` 显示 |
+| **PDF.js** | 840px | `pdf/_pdf.scss` | 侧栏展开时 `#viewerContainer` 的 `left` 强制为 0（不再预留侧栏空间） |
+| **Viewer.js** | 767px | `viewerjs/_viewer.scss` | `.viewer-hide-xs-down` 类生效（display:none） |
+| **Viewer.js** | 991px | `viewerjs/_viewer.scss` | `.viewer-hide-sm-down` 类生效 |
+| **Viewer.js** | 1199px | `viewerjs/_viewer.scss` | `.viewer-hide-md-down` 类生效 |
+
+> **分级说明**：这些断点完全来自上游 PDF.js 和 Viewer.js 项目的默认 SCSS，SiYuan 未做任何定制修改。升级这两个库时断点值和行为可能会自然变化，不纳入 SiYuan 业务适配的测试覆盖范围。
+
+---
+
+##### 所有断点汇总表（含分级标记）
+
+| 分级 | 断点宽度 | 文件位置 | 生效端 | 影响组件 |
+|------|---------|---------|--------|---------|
+| **L1 核心业务** | **620px** | `main/_mobile.scss` | 仅移动端 | Superblock 横列→竖排 |
+| **L1 核心业务** | **750px** | `util/_responsive.scss` | 双端共用 | 设置面板/历史面板/快捷键表单 |
+| **L2 组件微调** | **520px** | `component/_snackbar.scss` | 双端共用 | Snackbar 通知条位置与滑入动画 |
+| **L2 组件微调** | **520px** | `component/_tooltips.scss` | 双端共用 | Tooltips 工具提示隐藏 |
+| L3 第三方库 | 535px | `pdf/_pdf.scss` | 双端共用 | PDF.js 缩放选择器 |
+| L3 第三方库 | 640px | `pdf/_pdf.scss` | 双端共用 | PDF.js SmallView 切换 |
+| L3 第三方库 | 700px | `pdf/_pdf.scss` | 双端共用 | PDF.js MediumView 切换 |
+| L3 第三方库 | 767px | `viewerjs/_viewer.scss` | 双端共用 | Viewer.js xs-down 工具类 |
+| L3 第三方库 | 770px | `pdf/_pdf.scss` | 双端共用 | PDF.js LargeView 切换 |
+| L3 第三方库 | 840px | `pdf/_pdf.scss` | 双端共用 | PDF.js 侧栏展开空间 |
+| L3 第三方库 | 991px | `viewerjs/_viewer.scss` | 双端共用 | Viewer.js sm-down 工具类 |
+| L3 第三方库 | 1199px | `viewerjs/_viewer.scss` | 双端共用 | Viewer.js md-down 工具类 |
 
 #### 2.2.3 Layer 3 — 横竖屏 JS 监听
 
@@ -301,7 +363,7 @@ window.addEventListener("resize", () => {
 | **实现机制** | 双 webpack 入口 + ifdef 宏 + 双 HTML 模板 | `@media (max-width: Npx)` CSS 规则 | `matchMedia("orientation")` + JS 状态/样式修改 |
 | **切换时机** | 构建发布时（一次性） | 运行时 viewport resize（纯 CSS） | 物理方向旋转/键盘弹起时 resize（JS 驱动） |
 | **改变范围** | DOM 根结构、包体内容、模块裁剪 | 特定组件的 CSS 属性（flex-direction / width / display） | 状态变量 + 少量 class（键盘缓存、卡片图标） |
-| **核心断点** | N/A（是/否移动端二选一） | 620px / 750px（业务）；535~1199px（第三方库） | portrait ↔ landscape（无中间态） |
+| **核心断点** | N/A（是/否移动端二选一） | L1 业务：620px / 750px；L2 组件：520px；L3 第三方：535~1199px | portrait ↔ landscape（无中间态） |
 | **影响 superblock 列布局** | 间接（移动端才加载 `_mobile.scss` 中的 620px 规则） | **直接**：620px 时横列→竖排 | 无直接影响 |
 | **影响键盘工具栏** | 直接（工具栏只有移动端才有） | 无直接 CSS 影响 | **直接**：height1/height2 缓存分离 |
 | **桌面端可用** | N/A（属于桌面端侧） | 是（750px 断点桌面端窗口缩窄时也生效） | 否（`updateCardHV()` 被 `/// #if MOBILE` 包裹） |
@@ -310,9 +372,16 @@ window.addEventListener("resize", () => {
 - 侧栏/模型面板样式：`app/src/assets/scss/main/_mobile.scss` `.side-panel` 规则
 - 菜单全屏样式：`app/src/assets/scss/component/_menu.scss` `.b3-menu--fullscreen` 规则
 - `#menu` 专属偏移：`app/src/assets/scss/main/_mobile.scss` `#menu { transform: translateX(100vw); top: 0; }`
-- superblock 620px 断点：`app/src/assets/scss/main/_mobile.scss` 第 510~518 行
-- superblock 默认列布局：`app/src/assets/scss/protyle/_wysiwyg.scss` 第 277~282 行
-- 750px 通用断点：`app/src/assets/scss/util/_responsive.scss` 全文
+- L1 业务断点：
+  - superblock 620px：`app/src/assets/scss/main/_mobile.scss` 第 510~518 行
+  - superblock 默认列布局：`app/src/assets/scss/protyle/_wysiwyg.scss` 第 277~282 行
+  - 750px 通用表单/面板：`app/src/assets/scss/util/_responsive.scss` 全文
+- L2 组件断点：
+  - snackbar 520px 位置：`app/src/assets/scss/component/_snackbar.scss` 第 96~109 行
+  - tooltips 520px 隐藏：`app/src/assets/scss/component/_tooltips.scss` 第 152~156 行
+- L3 第三方断点：
+  - PDF.js 535~840px：`app/src/assets/scss/pdf/_pdf.scss` 第 987~1033 行
+  - Viewer.js 767~1199px：`app/src/assets/scss/viewerjs/_viewer.scss` 第 362~377 行
 - 卡片横竖屏切换：`app/src/card/util.ts` `updateCardHV()`
 - 键盘高度横竖屏分离缓存：`app/src/mobile/util/keyboardToolbar.ts` resize 监听
 
@@ -1114,7 +1183,10 @@ SiYuan 移动端的设计在**工程可维护性**和**双端复用率**之间�
 - **强耦合：** 手势、键盘、编辑器滚动、面板切换通过全局 `window.siyuan.mobile` 共享状态紧密协作，效率高但可测试性/可调试性较弱
 - **三层响应式而非单一机制：**
   - **Layer 1 端间硬切换（编译入口级）**：双 HTML 模板 + 双 JS/SCSS 入口 + ifdef 宏裁剪，实现桌面端/移动端包体级分离
-  - **Layer 2 局部 CSS @media 断点（组件级）**：620px 控制 superblock 横列→竖排（移动端独有）、750px 控制设置/历史/快捷键面板的窄屏适配（双端共用），以及 535~1199px 第三方库（PDF.js/Viewer.js）自带断点
+  - **Layer 2 局部 CSS @media 断点（按业务影响三级分级）**：
+    - L1 核心业务（SiYuan 自有，不可缺失）：620px 控制 superblock 横列→竖排（移动端独有）、750px 控制设置/历史/快捷键面板窄屏适配（双端共用）
+    - L2 组件微调（通用组件，视觉优化）：520px 控制 snackbar 通知条位置偏移 + tooltips 工具提示隐藏（双端共用）
+    - L3 第三方库（SiYuan 未定制，升级库时自然变更）：PDF.js 535~840px / Viewer.js 767~1199px 工具栏分级隐藏
   - **Layer 3 横竖屏 JS 监听（状态级）**：`matchMedia("orientation")` 驱动键盘高度缓存分离（portrait/landscape 各存一套）和卡片图标显隐，不触发布局结构性变化
 - **非对称面板布局：** `#sidebar`（左侧，`side-panel`）与 `#menu`（右侧，`b3-menu--fullscreen`）使用不同的 CSS 类和隐藏方向（`-100vw` vs `+100vw`），手势处理代码需要针对两个面板分别计算 transform
 - **superblock 620px 断点是关键业务响应式**：用户在桌面端创建的多列并列 superblock，在移动端窄屏（<620px）时纯 CSS 自动变为上下堆叠，保证跨端内容可读性，此机制独立于端间硬切换，是"移动/桌面同内容不同展示"的核心手段
