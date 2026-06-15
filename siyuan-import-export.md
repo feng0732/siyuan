@@ -34,17 +34,23 @@ SiYuan（思源笔记）的导入导出系统采用**分层架构**设计，由 
 
 | 模块 | 文件 | 核心职责 |
 |------|------|---------|
-| 导入业务 | [import.go](file:///d:/fz/0601/solo-dogfeeding/code/298-siyuan/kernel/model/import.go) | `.sy.zip`、`data.zip`、Markdown 文件夹/文件/ZIP 导入，ID 重映射、引用修正 |
-| 导出业务 | [export.go](file:///d:/fz/0601/solo-dogfeeding/code/298-siyuan/kernel/model/export.go) | Markdown、HTML、PDF、DOCX、`.sy.zip`、多种 Pandoc 格式导出 |
-| 导出合并 | [export_merge.go](file:///d:/fz/0601/solo-dogfeeding/code/298-siyuan/kernel/model/export_merge.go) | 子文档合并为单一文档（用于 Word/PDF 导出） |
-| 资源管理 | [assets.go](file:///d:/fz/0601/solo-dogfeeding/code/298-siyuan/kernel/model/assets.go) | 资源文件（图片、附件）处理、OCR、缩略图 |
-| Pandoc 集成 | [pandoc.go](file:///d:/fz/0601/solo-dogfeeding/code/298-siyuan/kernel/util/pandoc.go) | Pandoc 二进制初始化、路径校验、命令行调用 |
-| 导入 API | [import.go](file:///d:/fz/0601/solo-dogfeeding/code/298-siyuan/kernel/api/import.go) | 4 个导入端点：`importSY`、`importData`、`importStdMd`、`importZipMd` |
-| 导出 API | [export.go](file:///d:/fz/0601/solo-dogfeeding/code/298-siyuan/kernel/api/export.go) | 30+ 个导出端点，覆盖所有导出格式 |
-| 路由注册 | [router.go](file:///d:/fz/0601/solo-dogfeeding/code/298-siyuan/kernel/api/router.go) | 统一鉴权（`CheckAuth`、`CheckAdminRole`、`CheckReadonly`） |
-| 导出配置 | [export.go](file:///d:/fz/0601/solo-dogfeeding/code/298-siyuan/kernel/conf/export.go) | 20+ 项导出参数配置（块引模式、水印、标签标记等） |
-| 树形节点 | [tree.go](file:///d:/fz/0601/solo-dogfeeding/code/298-siyuan/kernel/treenode/tree.go) | AST 节点操作、文档规范版本（Spec）校验 |
-| API 结果 | [result.go](file:///d:/fz/0601/solo-dogfeeding/code/298-siyuan/kernel/util/result.go) | 统一结果结构 `Result{Code, Msg, Data}` |
+| 导入业务 | [import.go](kernel/model/import.go) | `.sy.zip`、`data.zip`、Markdown 文件夹/文件/ZIP 导入，ID 重映射、引用修正 |
+| 导出业务 | [export.go](kernel/model/export.go) | Markdown、HTML、PDF、DOCX、`.sy.zip`、多种 Pandoc 格式导出 |
+| 导出合并 | [export_merge.go](kernel/model/export_merge.go) | 子文档合并为单一文档（用于 Word/PDF 导出） |
+| 资源管理 | [assets.go](kernel/model/assets.go) | 资源文件（图片、附件）处理、OCR、缩略图 |
+| Pandoc 集成 | [pandoc.go](kernel/util/pandoc.go) | Pandoc 二进制初始化、路径校验、命令行调用 |
+| 导入 API | [import.go](kernel/api/import.go) | 4 个导入端点：`importSY`、`importData`、`importStdMd`、`importZipMd` |
+| 导出 API | [export.go](kernel/api/export.go) | 30+ 个导出端点，覆盖所有导出格式 |
+| 路由注册 | [router.go](kernel/api/router.go) | 统一鉴权（`CheckAuth`、`CheckAdminRole`、`CheckReadonly`） |
+| 导出配置 | [export.go](kernel/conf/export.go) | 20+ 项导出参数配置（块引模式、水印、标签标记等） |
+| 树形节点 | [tree.go](kernel/treenode/tree.go) | AST 节点操作、文档规范版本（Spec）校验 |
+| API 结果 | [result.go](kernel/util/result.go) | 统一结果结构 `Result{Code, Msg, Data}` |
+| WS 广播 | [websocket.go](kernel/util/websocket.go) | WebSocket 消息广播、进度推送、消息推送 |
+| 前端 HTTP 封装 | [fetch.ts](app/src/util/fetch.ts) | 统一 POST 请求 + `processMessage` 拦截 |
+| 前端消息处理 | [processMessage.ts](app/src/util/processMessage.ts) | 全局消息拦截器：错误 Toast、进度/消息命令分发 |
+| 前端 Toast | [message.ts](app/src/dialog/message.ts) | 消息提示渲染（showMessage/hideMessage） |
+| 前端进度 | [processSystem.ts](app/src/dialog/processSystem.ts) | 进度遮罩渲染（progressLoading）、事务错误弹窗 |
+| 前端 WS 连接 | [Model.ts](app/src/layout/Model.ts) | WebSocket 连接管理、消息分发、断连重连 |
 
 ---
 
@@ -104,7 +110,7 @@ parse.NestedInlines2FlattedSpansHybrid()  ── 嵌套内联展平
 parse.Tree (内部标准 AST)
 ```
 
-**关键实现位置：** [parseStdMd](file:///d:/fz/0601/solo-dogfeeding/code/298-siyuan/kernel/model/import.go#L1210-L1222)
+**关键实现位置：** [parseStdMd](kernel/model/import.go#L1210-L1222)
 
 ### 2.3 Pandoc 桥接机制
 
@@ -121,7 +127,7 @@ parse.Tree (内部标准 AST)
    - 构造 `exec.Command`，设置工作目录为资源路径
    - 合并 stderr 和 stdout 用于错误报告
 
-**安全校验：** [IsValidPandocBin](file:///d:/fz/0601/solo-dogfeeding/code/298-siyuan/kernel/util/pandoc.go#L228-L302) 实现了严格的二进制校验：
+**安全校验：** [IsValidPandocBin](kernel/util/pandoc.go#L228-L302) 实现了严格的二进制校验：
 - 解析符号链接
 - 文件存在性 + 非目录 + 普通文件
 - 读取文件头 16 字节，拒绝 shebang (`#!`) 脚本
@@ -187,7 +193,7 @@ AST 后处理（4 步转换链）
     └─ box.setSort()               → 更新文档排序
 ```
 
-**关键实现：** [ImportFromLocalPath](file:///d:/fz/0601/solo-dogfeeding/code/298-siyuan/kernel/model/import.go#L771-L1208)
+**关键实现：** [ImportFromLocalPath](kernel/model/import.go#L771-L1208)
 
 ### 3.3 导出时的转换流程
 
@@ -224,7 +230,7 @@ exportTree()  ── 配置化 AST 变换
     └─ DOCX     → NewProtyleExportDocxRenderer
 ```
 
-**关键实现：** [exportTree](file:///d:/fz/0601/solo-dogfeeding/code/298-siyuan/kernel/model/export.go#L2423-L2627)
+**关键实现：** [exportTree](kernel/model/export.go#L2423-L2627)
 
 ---
 
@@ -248,7 +254,7 @@ data:image/png;base64,...
     └─ AST 链接目标替换为 "assets/imagename-20230101000000-abc.png"
 ```
 
-**关键实现：** [processBase64Img](file:///d:/fz/0601/solo-dogfeeding/code/298-siyuan/kernel/model/import.go#L1250-L1328)
+**关键实现：** [processBase64Img](kernel/model/import.go#L1250-L1328)
 
 #### 4.1.2 HTML SVG 图片处理 (`processHTMLBlockSvgImg`)
 
@@ -319,7 +325,7 @@ type Result struct {
 }
 ```
 
-**定义位置：** [result.go](file:///d:/fz/0601/solo-dogfeeding/code/298-siyuan/kernel/util/result.go#L35-L46)
+**定义位置：** [result.go](kernel/util/result.go#L35-L46)
 
 ### 5.2 API 层错误处理模式
 
@@ -383,6 +389,135 @@ defer func() {
 | `.sy.zip` 结构非法 | 解压后目录数量/名称模式校验 | 使用 `Conf.Language(199)` 国际化提示 |
 | 数据与工作区冲突 | `ImportData()` 预检查 `.sy` 文件存在性 | 使用 `Conf.Language(198)` 国际化提示 |
 
+### 5.6 前端错误与进度反馈传递链路
+
+导入导出操作的反馈通过**两条独立通道**从后端传递到前端 UI：HTTP 响应通道（同步结果）和 WebSocket 推送通道（异步进度/消息）。
+
+#### 5.6.1 双通道架构
+
+```
+┌────────────────────────────────────────────────────────────────────┐
+│                        后端 Kernel                                 │
+│                                                                    │
+│  Model 层                                                          │
+│  ├─ util.PushEndlessProgress(msg) ──┐                              │
+│  ├─ util.PushProgress(code,cur,tot) ├─→ websocket.go              │
+│  ├─ util.PushMsg(msg, timeout)  ────┘   BroadcastByType()         │
+│  │                                       ↓                        │
+│  └─ ret.Code = -1 / ret.Msg = "..." ──→ API JSON 响应              │
+│                                          ↓                        │
+└──────────────────────────────────────────┼─────────────────────────┘
+                                           │
+                    ┌──────────────────────┼──────────────────────┐
+                    │                      │                      │
+             WebSocket 通道          HTTP 响应通道                │
+             (异步推送)              (同步返回)                  │
+                    │                      │                      │
+                    ▼                      ▼                      │
+┌─────────────────────────────────────────────────────────────────┐
+│                       前端 App                                   │
+│                                                                  │
+│  Model.ts (WebSocket 消息入口)                                   │
+│  ├─ ws.onmessage → processMessage(data) ──→ msgCallback          │
+│  │     ├─ cmd="msg"    → showMessage()    (Toast 提示)          │
+│  │     ├─ cmd="cmsg"   → hideMessage()    (关闭指定提示)        │
+│  │     ├─ cmd="progress" → progressLoading() (进度遮罩)         │
+│  │     ├─ cmd="cprogress" → 移除进度遮罩                        │
+│  │     └─ code < 0     → showMessage(type=error/info)           │
+│  │                                                               │
+│  fetch.ts (HTTP 请求入口)                                        │
+│  └─ fetchPost(url, data, cb)                                     │
+│        └─ response → processMessage(response)                    │
+│              ├─ 返回 false → 不调用 cb (错误已处理)              │
+│              └─ 返回 response → 调用 cb (正常流程)               │
+│                                                                  │
+│  导入调用示例 (menus/navigation.ts)                              │
+│  ├─ fetchPost("/api/import/importSY", formData, () => {          │
+│  │     reloadDocTree();  // 仅 code=0 时执行                     │
+│  │  });                                                          │
+│  └─ 错误由 processMessage 自动展示，业务代码无需处理              │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+#### 5.6.2 同步错误通道：HTTP → processMessage → showMessage
+
+前端所有 API 调用统一通过 `fetchPost()` 发起，响应经过 `processMessage()` 统一拦截：
+
+1. **`fetchPost()`** ([fetch.ts](app/src/util/fetch.ts)) 发起 POST 请求，接收 JSON 响应
+2. **`processMessage(response)`** ([processMessage.ts](app/src/util/processMessage.ts)) 拦截判断：
+   - `code < 0`：自动调用 `showMessage(msg, timeout, type)`，返回 `false` 阻断回调
+     - `code === -1`：类型为 `"error"`（红色 Toast，附加版本号）
+     - `code === -2`：类型为 `"info"`（蓝色 Toast）
+   - `code === 0`：正常，返回原始 `response`，由业务回调处理
+3. **`showMessage()`** ([message.ts](app/src/dialog/message.ts)) 渲染 DOM：
+   - 在 `#message` 容器中插入 `.b3-snackbar` 元素
+   - 错误类型添加 `.b3-snackbar--error` 红色样式
+   - `timeout > 0` 时自动定时隐藏，`timeout === 0` 时显示关闭按钮需手动关闭
+   - 支持按 `messageId` 去重更新（同一 ID 的消息只保留最新内容）
+
+**导入场景示例：** 前端调用 `/api/import/importSY` 时，后端若返回 `{code: -1, msg: "import path is not sub path..."}` → `processMessage` 判断 `code < 0` → 自动弹出红色 Toast → **不执行** `reloadDocTree()` 回调。
+
+#### 5.6.3 异步进度通道：WebSocket → progressLoading
+
+耗时操作（批量导入/导出）通过 WebSocket 实时推送进度：
+
+1. **后端推送** ([websocket.go](kernel/util/websocket.go#L307-L316))：
+   - `PushEndlessProgress(msg)` → `BroadcastByType("main", "progress", 1, msg, ...)` — 无确定进度条
+   - `PushProgress(0, current, total, msg)` → 有确定进度条
+   - `ClearPushProgress(total)` → `PushProgress(2, total, total, "")` — 关闭进度
+
+2. **前端接收**：
+   - **桌面端主窗口** ([index.ts](app/src/index.ts))：`case "progress": progressLoading(data)`
+   - **移动端** ([onMessage.ts](app/src/mobile/util/onMessage.ts))：`case "progress": progressLoading(data)`
+   - **独立窗口** ([window/index.ts](app/src/window/index.ts))：同上
+
+3. **`progressLoading()`** ([processSystem.ts](app/src/dialog/processSystem.ts#L440-L469)) 渲染进度 UI：
+   - `code === 0`（有进度）：显示进度条 + `current/total` + 消息文本
+   - `code === 1`（无进度/无尽）：显示条纹动画进度条 + 消息文本
+   - `code === 2`（完成）：移除 `#progress` 元素
+
+4. **`processMessage()` 中的 `cprogress` 命令**：直接移除 `#progress` 元素，用于紧急取消进度遮罩
+
+#### 5.6.4 异步消息通道：WebSocket → msg/cmsg
+
+后端通过 `PushMsg()` / `PushMsgWithApp()` 推送消息类通知：
+
+1. **`PushMsg(msg, timeout)`** ([websocket.go](kernel/util/websocket.go#L230-L234))：
+   - 生成随机 `msgId`，通过 `BroadcastByType("main", "msg", 0, msg, {id, closeTimeout})` 广播
+   - 前端 `processMessage` 中 `cmd === "msg"` → `showMessage(msg, timeout, "info"/"error", id)`
+
+2. **`PushClearMsg(msgId)`** ([websocket.go](kernel/util/websocket.go#L319-L321))：
+   - 前端 `cmd === "cmsg"` → `hideMessage(data.id)`，精确关闭指定消息
+
+3. **`ContextPushMsg()`** ([websocket.go](kernel/util/websocket.go#L278-L290))：
+   - 根据 context 中的 `CtxPushMsg` 值选择推送方式：
+     - `CtxPushMsgToNone`：不推送
+     - `CtxPushMsgToProgress`：推送到进度遮罩
+     - `CtxPushMsgToStatusBar`：推送到状态栏
+     - `CtxPushMsgToStatusBarAndProgress`：同时推送状态栏和进度
+
+#### 5.6.5 前端消息流转汇总
+
+| 通道 | 后端函数 | WebSocket cmd | 前端处理函数 | UI 表现 |
+|------|---------|---------------|-------------|---------|
+| HTTP 同步错误 | `ret.Code = -1` | — | `processMessage()` → `showMessage()` | 右上角红色/蓝色 Toast |
+| WS 异步消息 | `PushMsg()` | `msg` | `processMessage()` → `showMessage()` | 右上角 Toast（可带关闭按钮） |
+| WS 消息关闭 | `PushClearMsg()` | `cmsg` | `processMessage()` → `hideMessage()` | 关闭指定 Toast |
+| WS 有进度 | `PushProgress(0,...)` | `progress` | `progressLoading()` | 全屏遮罩 + 进度条 |
+| WS 无尽进度 | `PushEndlessProgress()` | `progress` (code=1) | `progressLoading()` | 全屏遮罩 + 条纹动画 |
+| WS 进度完成 | `ClearPushProgress()` | `progress` (code=2) | `progressLoading()` | 移除遮罩 |
+| WS 紧急取消 | `PushClearProgress()` | `cprogress` | `processMessage()` | 直接移除 `#progress` |
+| 事务错误 | — | `txerr` | `transactionError()` | 弹窗（重建索引/退出） |
+| 内核崩溃 | — | — (连接断开) | `kernelError()` | 弹窗（重连提示） |
+
+#### 5.6.6 关键设计特征
+
+1. **错误处理去中心化**：`processMessage()` 作为全局拦截器，业务代码（如导入回调）无需手动处理 `code < 0` 的错误场景，减少了遗漏错误处理的风险
+2. **进度与消息解耦**：进度通过全屏遮罩展示（阻断用户操作），消息通过右上角 Toast 展示（非阻断），两者独立运行互不干扰
+3. **消息去重与更新**：`showMessage()` 支持按 `messageId` 更新已有消息内容，避免同类消息重复弹出造成视觉干扰
+4. **多端消息统一**：桌面端（`index.ts`）、移动端（`onMessage.ts`）、独立窗口（`window/index.ts`）三个入口使用相同的 `progressLoading()` / `showMessage()` 函数，保证跨端体验一致
+5. **WebSocket 断连恢复**：`Model.ts` 中 `ws.onclose` 检测非主动关闭后，3 秒自动重连；重连成功后自动执行 `reloadSync()` 刷新数据并关闭 `kernelError` 弹窗
+
 ---
 
 ## 6. 格式差异处理
@@ -397,7 +532,7 @@ SiYuan 的核心特性——**块引用**在不同格式中映射方式完全不
 | 3 | 仅锚文本 | 纯文本 | 纯文本 |
 | 4 | 脚注 + 锚点哈希（默认） | `text[^1]` + 文末脚注定义 | 内部锚点超链接 |
 
-**实现细节：** [exportTree 中的块引用处理](file:///d:/fz/0601/solo-dogfeeding/code/298-siyuan/kernel/model/export.go#L2504-L2554)
+**实现细节：** [exportTree 中的块引用处理](kernel/model/export.go#L2504-L2554)
 
 ### 6.2 超级块与嵌套布局
 
@@ -462,7 +597,7 @@ PDF 和 DOCX 导出无法渲染 `<iframe>`，通过 `processIFrame()` 将其降�
    - 使用栈遍历，按层级插入标题（`hLevel` 最大为 6，超出则保持在 H6）
    - 跳过末尾空段落
 
-**实现位置：** [mergeSubDocs](file:///d:/fz/0601/solo-dogfeeding/code/298-siyuan/kernel/model/export_merge.go#L27-L70)
+**实现位置：** [mergeSubDocs](kernel/model/export_merge.go#L27-L70)
 
 ---
 
@@ -490,7 +625,7 @@ func CheckSpec(tree *parse.Tree) (err error) {
 }
 ```
 
-**实现位置：** [tree.go CheckSpec](file:///d:/fz/0601/solo-dogfeeding/code/298-siyuan/kernel/treenode/tree.go#L135-L150)
+**实现位置：** [tree.go CheckSpec](kernel/treenode/tree.go#L135-L150)
 
 导入 `.sy.zip` 时通过 `treenode.UpgradeSpec(tree)` 对旧规范文档进行原地升级。
 
@@ -702,25 +837,35 @@ treenode.IndexBlockTree(tree)         // 块树缓存更新
 
 | 功能 | 函数/方法 | 文件位置 |
 |------|----------|---------|
-| .sy.zip 导入 | `ImportSY` | [import.go:L110-L702](file:///d:/fz/0601/solo-dogfeeding/code/298-siyuan/kernel/model/import.go#L110-L702) |
-| 数据全量还原 | `ImportData` | [import.go:L704-L769](file:///d:/fz/0601/solo-dogfeeding/code/298-siyuan/kernel/model/import.go#L704-L769) |
-| Markdown 本地导入 | `ImportFromLocalPath` | [import.go:L771-L1208](file:///d:/fz/0601/solo-dogfeeding/code/298-siyuan/kernel/model/import.go#L771-L1208) |
-| Markdown 标准解析 | `parseStdMd` | [import.go:L1210-L1222](file:///d:/fz/0601/solo-dogfeeding/code/298-siyuan/kernel/model/import.go#L1210-L1222) |
-| Base64 图片解码 | `processBase64Img` | [import.go:L1250-L1328](file:///d:/fz/0601/solo-dogfeeding/code/298-siyuan/kernel/model/import.go#L1250-L1328) |
-| HTML→AST 转换 | `HTML2Tree` | [import.go:L59-L108](file:///d:/fz/0601/solo-dogfeeding/code/298-siyuan/kernel/model/import.go#L59-L108) |
-| Markdown 超链接转块引 | `convertMdHyperlinks2WikiLinks` | [import.go:L1542-L1590](file:///d:/fz/0601/solo-dogfeeding/code/298-siyuan/kernel/model/import.go#L1542-L1590) |
-| 核心导出变换 | `exportTree` | [export.go:L2423-L2627](file:///d:/fz/0601/solo-dogfeeding/code/298-siyuan/kernel/model/export.go#L2423-L2627) |
-| Markdown 内容导出 | `exportMarkdownContent0` | [export.go:L2282-L2421](file:///d:/fz/0601/solo-dogfeeding/code/298-siyuan/kernel/model/export.go#L2282-L2421) |
-| Pandoc 格式批量导出 | `ExportPandocConvertZip` | [export.go:L1724-L1749](file:///d:/fz/0601/solo-dogfeeding/code/298-siyuan/kernel/model/export.go#L1724-L1749) |
-| .sy.zip 打包 | `exportSYZip` | [export.go:L1853-L2021](file:///d:/fz/0601/solo-dogfeeding/code/298-siyuan/kernel/model/export.go#L1853-L2021) |
-| HTML 导出 | `ExportHTML` | [export.go:L1017-L1187](file:///d:/fz/0601/solo-dogfeeding/code/298-siyuan/kernel/model/export.go#L1017-L1187) |
-| DOCX 导出 | `ExportDocx` | [export.go:L755-L840](file:///d:/fz/0601/solo-dogfeeding/code/298-siyuan/kernel/model/export.go#L755-L840) |
-| PDF 后处理 | `ProcessPDF` | [export.go:L1245-L1301](file:///d:/fz/0601/solo-dogfeeding/code/298-siyuan/kernel/model/export.go#L1245-L1301) |
-| 子文档合并 | `mergeSubDocs` | [export_merge.go:L27-L70](file:///d:/fz/0601/solo-dogfeeding/code/298-siyuan/kernel/model/export_merge.go#L27-L70) |
-| Pandoc 初始化 | `InitPandoc` | [util/pandoc.go:L109-L206](file:///d:/fz/0601/solo-dogfeeding/code/298-siyuan/kernel/util/pandoc.go#L109-L206) |
-| Pandoc 二进制校验 | `IsValidPandocBin` | [util/pandoc.go:L228-L302](file:///d:/fz/0601/solo-dogfeeding/code/298-siyuan/kernel/util/pandoc.go#L228-L302) |
-| 文档 Spec 版本校验 | `CheckSpec` | [treenode/tree.go:L139-L150](file:///d:/fz/0601/solo-dogfeeding/code/298-siyuan/kernel/treenode/tree.go#L139-L150) |
-| 导出配置定义 | `Export` 结构体 | [conf/export.go:L19-L48](file:///d:/fz/0601/solo-dogfeeding/code/298-siyuan/kernel/conf/export.go#L19-L48) |
-| API 路由注册 | `ServeAPI` | [api/router.go:L25-L486](file:///d:/fz/0601/solo-dogfeeding/code/298-siyuan/kernel/api/router.go#L25-L486) |
-| 导入 API 端点 | 4 个 handler | [api/import.go](file:///d:/fz/0601/solo-dogfeeding/code/298-siyuan/kernel/api/import.go) |
-| 导出 API 端点 | 30+ 个 handler | [api/export.go](file:///d:/fz/0601/solo-dogfeeding/code/298-siyuan/kernel/api/export.go) |
+| .sy.zip 导入 | `ImportSY` | [import.go:L110-L702](kernel/model/import.go#L110-L702) |
+| 数据全量还原 | `ImportData` | [import.go:L704-L769](kernel/model/import.go#L704-L769) |
+| Markdown 本地导入 | `ImportFromLocalPath` | [import.go:L771-L1208](kernel/model/import.go#L771-L1208) |
+| Markdown 标准解析 | `parseStdMd` | [import.go:L1210-L1222](kernel/model/import.go#L1210-L1222) |
+| Base64 图片解码 | `processBase64Img` | [import.go:L1250-L1328](kernel/model/import.go#L1250-L1328) |
+| HTML→AST 转换 | `HTML2Tree` | [import.go:L59-L108](kernel/model/import.go#L59-L108) |
+| Markdown 超链接转块引 | `convertMdHyperlinks2WikiLinks` | [import.go:L1542-L1590](kernel/model/import.go#L1542-L1590) |
+| 核心导出变换 | `exportTree` | [export.go:L2423-L2627](kernel/model/export.go#L2423-L2627) |
+| Markdown 内容导出 | `exportMarkdownContent0` | [export.go:L2282-L2421](kernel/model/export.go#L2282-L2421) |
+| Pandoc 格式批量导出 | `ExportPandocConvertZip` | [export.go:L1724-L1749](kernel/model/export.go#L1724-L1749) |
+| .sy.zip 打包 | `exportSYZip` | [export.go:L1853-L2021](kernel/model/export.go#L1853-L2021) |
+| HTML 导出 | `ExportHTML` | [export.go:L1017-L1187](kernel/model/export.go#L1017-L1187) |
+| DOCX 导出 | `ExportDocx` | [export.go:L755-L840](kernel/model/export.go#L755-L840) |
+| PDF 后处理 | `ProcessPDF` | [export.go:L1245-L1301](kernel/model/export.go#L1245-L1301) |
+| 子文档合并 | `mergeSubDocs` | [export_merge.go:L27-L70](kernel/model/export_merge.go#L27-L70) |
+| Pandoc 初始化 | `InitPandoc` | [util/pandoc.go:L109-L206](kernel/util/pandoc.go#L109-L206) |
+| Pandoc 二进制校验 | `IsValidPandocBin` | [util/pandoc.go:L228-L302](kernel/util/pandoc.go#L228-L302) |
+| 文档 Spec 版本校验 | `CheckSpec` | [treenode/tree.go:L139-L150](kernel/treenode/tree.go#L139-L150) |
+| 导出配置定义 | `Export` 结构体 | [conf/export.go:L19-L48](kernel/conf/export.go#L19-L48) |
+| API 路由注册 | `ServeAPI` | [api/router.go:L25-L486](kernel/api/router.go#L25-L486) |
+| 导入 API 端点 | 4 个 handler | [api/import.go](kernel/api/import.go) |
+| 导出 API 端点 | 30+ 个 handler | [api/export.go](kernel/api/export.go) |
+| WS 广播核心 | `BroadcastByType` | [util/websocket.go:L82-L92](kernel/util/websocket.go#L82-L92) |
+| WS 进度推送 | `PushProgress` / `PushEndlessProgress` / `ClearPushProgress` | [util/websocket.go:L292-L316](kernel/util/websocket.go#L292-L316) |
+| WS 消息推送 | `PushMsg` / `PushClearMsg` / `ContextPushMsg` | [util/websocket.go:L230-L290](kernel/util/websocket.go#L230-L290) |
+| 前端 WS 连接 | `Model` 类 | [app/src/layout/Model.ts](app/src/layout/Model.ts) |
+| 前端消息拦截 | `processMessage` | [app/src/util/processMessage.ts](app/src/util/processMessage.ts) |
+| 前端 Toast 渲染 | `showMessage` / `hideMessage` | [app/src/dialog/message.ts](app/src/dialog/message.ts) |
+| 前端进度渲染 | `progressLoading` / `progressStatus` | [app/src/dialog/processSystem.ts](app/src/dialog/processSystem.ts) |
+| 前端 HTTP 封装 | `fetchPost` / `fetchSyncPost` | [app/src/util/fetch.ts](app/src/util/fetch.ts) |
+| 前端导入调用 | `importSY` / `importStdMd` / `importZipMd` | [app/src/menus/navigation.ts](app/src/menus/navigation.ts) |
+| 移动端消息分发 | `onMessage` | [app/src/mobile/util/onMessage.ts](app/src/mobile/util/onMessage.ts) |
