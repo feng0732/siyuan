@@ -931,103 +931,225 @@ private destroyModel(model: Model) {
 
 ---
 
-## 九、异常情况下的窗口关闭处理
+## 九、窗口关闭与资源释放
 
-### 9.1 关闭保存完整链路
+> **重要修正**：主窗口和独立窗口的关闭流程是**完全不同的两条路径**，不能混为一谈。
+> - 主窗口关闭：走 `winOnClose → exportLayout → exitSiYuan` 路径，核心是**保存布局+退出应用**
+> - 独立窗口关闭：走 `closeWindow → 卸载插件 → destroy` 路径，核心是**清理插件+销毁窗口**
 
-关闭保存的完整流程涉及三层协作：
+### 9.1 统一入口：IPC 消息分发
 
-```
-用户点击关闭按钮 / 系统关闭命令
-  │
-  ├─→ Electron 主进程拦截 close 事件
-  │    │
-  │    ├─→ 主窗口 [main.js#L513-L518]
-  │    │    currentWindow.on("close", (event) => {
-  │    │        if (!isDestroyed()) {
-  │    │            send("siyuan-save-close", false);
-  │    │        }
-  │    │        event.preventDefault();  // 阻止默认关闭
-  │    │    })
-  │    │
-  │    ├─→ 独立窗口 [main.js#L1169-L1174]
-  │    │    win.on("close", (event) => {
-  │    │        if (!isDestroyed()) {
-  │    │            send("siyuan-save-close");
-  │    │        }
-  │    │        event.preventDefault();
-  │    │    })
-  │    │
-  │    └─→ 应用退出 [main.js#L1519-L1526]
-  │         app.on("before-quit", (event) => {
-  │             workspaces.forEach(item => {
-  │                 event.preventDefault();
-  │                 send("siyuan-save-close", true);
-  │             });
-  │         })
-  │
-  ├─→ 渲染进程接收 [onGetConfig.ts#L175-L181]
-  │    ipcRenderer.on("siyuan-save-close", (event, close) => {
-  │        if (isWindow()) {
-  │            closeWindow(app);    // 独立窗口
-  │        } else {
-  │            winOnClose(close);   // 主窗口
-  │        }
-  │    })
-  │
-  ├─→ 主窗口关闭处理 [onGetConfig.ts#L114-L132]
-  │    const winOnClose = (close = false) => {
-  │        exportLayout({
-  │            cb() {
-  │                if (closeButtonBehavior === 1 && !close) {
-  │                    // 最小化到托盘
-  │                } else {
-  │                    exitSiYuan();  // 真正退出
-  │                }
-  │            },
-  │            errorExit: true
-  │        });
-  │    }
-  │
-  ├─→ 独立窗口关闭处理 [closeWin.ts#L5-L13]
-  │    export const closeWindow = async (app: App) => {
-  │        // 卸载插件
-  │        for (let i = 0; i < app.plugins.length; i++) {
-  │            try {
-  │                await app.plugins[i].onunload();
-  │            } catch (e) { console.error(e); }
-  │        }
-  │        // 发送销毁命令
-  │        ipcRenderer.send(Constants.SIYUAN_CMD, "destroy");
-  │    }
-  │
-  ├─→ 布局持久化 [util.ts#L170-L209]
-  │    export const exportLayout = async (options) => {
-  │        // 1. 保存所有编辑器滚动位置
-  │        const editors = getAllModels().editor;
-  │        for (let i = 0; i < editors.length; i++) {
-  │            await saveScroll(editors[i].editor.protyle);
-  │        }
-  │        // 2. 序列化布局
-  │        layoutToJSON(window.siyuan.layout.layout, layoutJSON.layout);
-  │        // 3. 保存到后端或 sessionStorage
-  │        if (isWindow()) {
-  │            sessionStorage.setItem("layout", JSON.stringify(layoutJSON));
-  │            options.cb();
-  │        } else {
-  │            fetchPost("/api/system/setUILayout", ..., () => options.cb());
-  │        }
-  │    }
-  │
-  └─→ 主进程真正销毁 [main.js#L1046-L1051]
-       case "destroy":
-           if (!currentWindow.isDestroyed()) {
-               currentWindow.destroy();
-           }
-           break;
+所有关闭请求的统一入口在 [onGetConfig.ts#L175-L181](app/src/boot/onGetConfig.ts#L175-L181)：
+
+```typescript
+ipcRenderer.on(Constants.SIYUAN_SAVE_CLOSE, (event, close) => {
+    if (isWindow()) {
+        closeWindow(app);    // 独立窗口 → 走独立窗口关闭流程
+    } else {
+        winOnClose(close);   // 主窗口 → 走主窗口关闭流程
+    }
+});
 ```
 
-### 9.2 异常场景处理
+根据 `isWindow()` 判断当前是主窗口还是独立窗口，分发到不同的处理函数。
+
+---
+
+### 9.2 主窗口关闭流程（winOnClose）
+
+**触发时机**：
+- 用户点击主窗口关闭按钮
+- 系统退出命令（`before-quit` 事件，`close=true`）
+- 菜单退出操作
+
+**处理函数**：[onGetConfig.ts#L114-L132](app/src/boot/onGetConfig.ts#L114-L132)
+
+```typescript
+const winOnClose = (close = false) => {
+    exportLayout({
+        cb() {
+            if (window.siyuan.config.appearance.closeButtonBehavior === 1 && !close) {
+                // 最小化到托盘（仅关闭按钮触发时）
+                if ("windows" === window.siyuan.config.system.os) {
+                    ipcRenderer.send(Constants.SIYUAN_CONFIG_TRAY, {
+                        languages: window.siyuan.languages["_trayMenu"],
+                    });
+                } else {
+                    ipcRenderer.send(Constants.SIYUAN_CMD, "closeButtonBehavior");
+                }
+            } else {
+                exitSiYuan();  // 真正退出应用
+            }
+        },
+        errorExit: true
+    });
+};
+```
+
+**完整流程**：
+
+```
+用户点击主窗口关闭按钮
+  │
+  ├─→ 主进程 close 事件拦截 [main.js#L513-L518]
+  │    send("siyuan-save-close", false)
+  │    event.preventDefault()  // 阻止默认关闭
+  │
+  ├─→ winOnClose(close=false)
+  │    │
+  │    └─→ exportLayout() 保存布局 [util.ts#L170-L209]
+  │         │
+  │         ├─ 1. 保存所有编辑器滚动位置 (saveScroll)
+  │         ├─ 2. 序列化布局 JSON (layoutToJSON)
+  │         └─ 3. 调用 /api/system/setUILayout 保存到后端
+  │
+  ├─→ 保存完成后回调 cb()
+  │    │
+  │    ├─→ 如果配置了最小化到托盘且 close=false：
+  │    │    └─ 最小化到托盘（不退出应用）
+  │    │
+  │    └─→ 否则：exitSiYuan() 退出应用 [processSystem.ts#L291]
+  │         │
+  │         ├─ 调用 /api/system/exit 让后端退出
+  │         └─ 后端退出后发送 siyuan-quit 让主进程退出
+  │
+  └─→ 主进程接收 quit 命令，退出整个应用
+```
+
+**主窗口关闭的关键特征**：
+
+| 特征 | 说明 |
+|------|------|
+| 布局保存 | ✅ 调用 `exportLayout()`，保存到后端配置 |
+| 滚动位置 | ✅ 保存所有编辑器的滚动位置 |
+| 插件卸载 | ❌ **不卸载插件**（应用退出后进程销毁自动回收） |
+| 标签资源释放 | ❌ **不主动调用 destroyModel**（进程退出自动回收） |
+| 应用是否退出 | 取决于配置：可能只是最小化，也可能完全退出 |
+| destroy 命令 | ❌ 不发送 destroy，由 quit 命令退出应用 |
+
+---
+
+### 9.3 独立窗口关闭流程（closeWindow）
+
+**触发时机**：
+- 用户点击独立窗口关闭按钮
+- 拖拽标签合并回主窗口后关闭独立窗口
+
+**处理函数**：[closeWin.ts#L5-L13](app/src/window/closeWin.ts#L5-L13)
+
+```typescript
+export const closeWindow = async (app: App) => {
+    // 1. 卸载所有插件
+    for (let i = 0; i < app.plugins.length; i++) {
+        try {
+            await app.plugins[i].onunload();
+        } catch (e) {
+            console.error(e);
+        }
+    }
+    // 2. 发送销毁命令
+    ipcRenderer.send(Constants.SIYUAN_CMD, "destroy");
+};
+```
+
+**完整流程**：
+
+```
+用户点击独立窗口关闭按钮
+  │
+  ├─→ 主进程 close 事件拦截 [main.js#L1169-L1174]
+  │    send("siyuan-save-close")
+  │    event.preventDefault()  // 阻止默认关闭
+  │
+  ├─→ closeWindow(app)
+  │    │
+  │    ├─ 1. 遍历所有插件，调用 onunload() 卸载
+  │    │    （独立窗口有独立的插件实例，需要显式卸载）
+  │    │
+  │    └─ 2. 发送 "destroy" 命令给主进程
+  │
+  └─→ 主进程 destroy 命令处理 [main.js#L1046-L1051]
+       currentWindow.destroy()
+```
+
+**独立窗口关闭的关键特征**：
+
+| 特征 | 说明 |
+|------|------|
+| 布局保存 | ❌ **不调用 exportLayout()** |
+| 滚动位置 | ❌ **不主动保存**（依赖实时 saveLayout，但 saveLayout 不 saveScroll） |
+| 插件卸载 | ✅ 显式调用每个插件的 `onunload()` 方法 |
+| 标签资源释放 | ❌ **不主动调用 destroyModel**（窗口销毁后 GC 回收） |
+| 应用是否退出 | ❌ 只销毁当前窗口，不影响主窗口和后端 |
+| destroy 命令 | ✅ 发送 destroy，仅销毁当前 BrowserWindow |
+
+---
+
+### 9.4 主窗口 vs 独立窗口：关闭流程对比
+
+| 对比项 | 主窗口 (winOnClose) | 独立窗口 (closeWindow) |
+|-------|---------------------|----------------------|
+| **入口函数** | `winOnClose(close)` | `closeWindow(app)` |
+| **入口位置** | [onGetConfig.ts#L114](app/src/boot/onGetConfig.ts#L114) | [closeWin.ts#L5](app/src/window/closeWin.ts#L5) |
+| **布局保存** | ✅ exportLayout() → 后端 | ❌ 不主动保存（依赖实时 saveLayout） |
+| **滚动位置保存** | ✅ saveScroll 所有编辑器 | ❌ 不主动保存 |
+| **插件卸载** | ❌ 不卸载（进程销毁自动回收） | ✅ 遍历调用 onunload() |
+| **标签 Model 销毁** | ❌ 不主动调用 destroyModel | ❌ 不主动调用 destroyModel |
+| **WebSocket 断开** | 依赖进程退出 | 依赖窗口销毁 |
+| **最终动作** | 最小化托盘 / exitSiYuan() 退出应用 | send("destroy") 销毁窗口 |
+| **后端影响** | 退出整个后端内核 | 无影响（后端是单实例共享） |
+| **errorExit 参数** | ✅ 传 true（保存失败仍退出） | 无此概念 |
+
+---
+
+### 9.5 布局保存机制辨析
+
+独立窗口虽然关闭时不调用 `exportLayout()`，但布局数据并非完全不保存：
+
+**1. 实时保存（saveLayout）**
+- 每次布局变化（标签切换、添加、移除、分屏调整）都会触发 `saveLayout()`
+- 独立窗口的 `saveLayout()` 将布局序列化为 JSON 存入 `sessionStorage`
+- 但 `saveLayout()` **不保存滚动位置**（不调用 saveScroll）
+
+[util.ts#L157-L158](app/src/layout/util.ts#L157-L158)：
+```typescript
+if (isWindow()) {
+    sessionStorage.setItem("layout", JSON.stringify(layoutJSON));
+}
+```
+
+**2. 关闭时最终保存（exportLayout）**
+- 主窗口关闭时调用 `exportLayout()`，会先 `saveScroll` 再保存布局
+- 独立窗口关闭时**不调用** `exportLayout()`，因此最新的滚动位置可能丢失
+
+**3. 布局恢复**
+- 主窗口：从后端 `conf/uiLayout` 恢复
+- 独立窗口：从 `sessionStorage.layout` 恢复（窗口刷新时），或从 URL 参数恢复（新建时）
+
+> **注意**：独立窗口销毁后 `sessionStorage` 也随之消失，因此关闭独立窗口后再重新打开，无法恢复之前的布局状态，只能从 URL 参数创建新的布局。
+
+---
+
+### 9.6 标签资源释放机制
+
+**两种窗口都不主动释放标签 Model 资源**，原因不同：
+
+**主窗口**：
+- 整个应用都要退出，进程销毁会自动回收所有内存
+- 显式逐个释放反而可能拖慢退出速度
+- WebSocket 连接会随进程退出而断开，后端也会退出
+
+**独立窗口**：
+- 窗口销毁后，渲染进程的 JavaScript 上下文随之销毁
+- 理论上 GC 会回收所有对象
+- 但存在一些潜在问题：
+  - WebSocket 连接可能没有优雅关闭（没有发送 `closews` 消息）
+  - 插件如果有外部资源引用，可能泄漏（已通过 onunload 处理）
+  - 后端的会话清理可能依赖连接断开检测
+
+---
+
+### 9.7 异常场景处理
 
 **1. 正在上传时关闭标签**
 
@@ -1153,31 +1275,73 @@ WebSocket 重连成功后，会重新同步数据和刷新界面。
        └─ 激活标签、初始化 Model
 ```
 
-### 10.4 窗口关闭保存完整流程
+### 10.4 窗口关闭流程（两条独立路径）
+
+> **修正说明**：主窗口和独立窗口的关闭是**两条完全独立的路径**，没有统一的"关闭保存流程"。
+
+**10.4.1 主窗口关闭流程**
 
 ```
-用户触发关闭
+用户点击主窗口关闭按钮
   │
-  ├─→ 主进程 close 事件 [main.js#L513]
-  │    └─ send("siyuan-save-close")
+  ├─→ 主进程 close 事件 [main.js#L513-L518]
+  │    send("siyuan-save-close", false)
+  │    event.preventDefault()
   │
-  ├─→ 渲染进程接收 [onGetConfig.ts#L175]
-  │    ├─ 独立窗口：closeWindow(app)
-  │    └─ 主窗口：winOnClose(close)
+  ├─→ 渲染进程分发 [onGetConfig.ts#L175-L181]
+  │    isWindow() === false → winOnClose(false)
   │
-  ├─→ exportLayout() 保存布局 [util.ts#L170]
-  │    ├─ 保存所有编辑器滚动位置
-  │    ├─ 序列化布局 JSON
-  │    └─ 保存到后端 / sessionStorage
-  │
-  ├─→ 回调 cb() 执行后续动作
-  │    ├─ 最小化到托盘 / exitSiYuan()
-  │    └─ 独立窗口：卸载插件
-  │
-  └─→ ipcRenderer.send("siyuan-cmd", "destroy")
-       └─ 主进程 destroy 命令 [main.js#L1046]
-            └─ currentWindow.destroy()
+  └─→ winOnClose()  [onGetConfig.ts#L114-L132]
+       │
+       └─→ exportLayout()  [util.ts#L170-L209]
+            │
+            ├─ 1. saveScroll 所有编辑器滚动位置
+            ├─ 2. layoutToJSON 序列化布局
+            └─ 3. fetchPost("/api/system/setUILayout") 保存到后端
+                 │
+                 └─ 保存完成回调 cb()
+                      │
+                      ├─ 配置最小化托盘 且 close=false → 最小化
+                      └─ 否则 → exitSiYuan() 退出应用 [processSystem.ts#L291]
+                           │
+                           ├─ 调用 /api/system/exit 退出后端
+                           └─ 发送 siyuan-quit 退出主进程
 ```
+
+**10.4.2 独立窗口关闭流程**
+
+```
+用户点击独立窗口关闭按钮
+  │
+  ├─→ 主进程 close 事件 [main.js#L1169-L1174]
+  │    send("siyuan-save-close")
+  │    event.preventDefault()
+  │
+  ├─→ 渲染进程分发 [onGetConfig.ts#L175-L181]
+  │    isWindow() === true → closeWindow(app)
+  │
+  └─→ closeWindow()  [closeWin.ts#L5-L13]
+       │
+       ├─ 1. 遍历插件，调用 onunload() 卸载
+       │    （独立窗口有独立插件实例，必须显式卸载）
+       │
+       └─ 2. 发送 "destroy" 命令
+            │
+            └─ 主进程 destroy 命令 [main.js#L1046-L1051]
+                 currentWindow.destroy()
+```
+
+**10.4.3 两条路径的关键差异**
+
+| 环节 | 主窗口 | 独立窗口 |
+|------|-------|---------|
+| 入口函数 | `winOnClose(close)` | `closeWindow(app)` |
+| 布局保存 | `exportLayout()` → 后端 | 不主动调用，依赖 `saveLayout()` 实时保存 |
+| 滚动位置 | `saveScroll()` 所有编辑器 | 不主动保存 |
+| 插件处理 | 不卸载（进程销毁自动回收） | 显式调用 `onunload()` |
+| 标签资源 | 不主动释放 | 不主动释放 |
+| 最终动作 | 最小化 / 退出整个应用 | 仅销毁当前 BrowserWindow |
+| 后端影响 | 退出内核 | 无影响 |
 
 ---
 
@@ -1240,14 +1404,18 @@ Linux 系统下使用剪贴板管理特殊的粘贴事件拦截机制，通过 `
 1. **跨窗口标签拖拽竞态**：拖拽过程中原窗口和新窗口的标签状态同步依赖 IPC 消息时序，极端情况下可能出现状态不一致
 2. **持久化延迟**：`saveLayout()` 有重试机制（最多 10 次），如果 Model 一直未就绪，可能导致布局保存不完整
 3. **WebSocket 重连期间**：重连期间的数据变更可能丢失，需依赖重连后的全量同步
-4. **独立窗口崩溃**：独立窗口崩溃时，sessionStorage 中的布局状态丢失，下次打开无法恢复
+4. **独立窗口滚动位置丢失**：独立窗口关闭时**不调用 `saveScroll()`**，最新的滚动位置可能未保存到 localStorage，下次打开时滚动位置是上次 saveLayout 时的状态
+5. **独立窗口崩溃**：独立窗口崩溃时，sessionStorage 中的布局状态丢失，下次打开无法恢复
+6. **独立窗口布局不可恢复**：独立窗口销毁后 sessionStorage 清空，重新打开时只能从 URL 参数创建新布局，无法恢复之前的多标签/分屏状态
 
 ### 12.2 资源泄漏风险
 
-1. **Custom 模型资源**：插件提供的自定义模型如果未正确实现 `destroy()` 方法，可能导致内存泄漏
-2. **关闭标签动画期间**：200ms 的关闭动画期间标签 DOM 仍存在，可能被误操作
-3. **WebSocket 连接数**：每个标签一个 WebSocket 连接，标签数量多时连接数较多，对后端造成压力
-4. **插件卸载时机**：窗口关闭时插件 `onunload` 是异步的，如果窗口销毁太快可能导致清理不完整
+1. **独立窗口 WebSocket 未优雅关闭**：独立窗口关闭时**不调用 `destroyModel()`**，WebSocket 连接没有发送 `closews` 消息，依赖连接断开检测，可能导致后端会话清理延迟
+2. **独立窗口标签资源未显式释放**：独立窗口关闭时所有 Model 实例（Editor、Graph、Asset 等）都不会调用 `destroy()`，依赖 GC 回收，大文档场景可能内存释放不及时
+3. **Custom 模型资源**：插件提供的自定义模型如果未正确实现 `destroy()` 方法，可能导致内存泄漏（独立窗口更严重，因为窗口关闭时不主动调用）
+4. **关闭标签动画期间**：200ms 的关闭动画期间标签 DOM 仍存在，可能被误操作
+5. **WebSocket 连接数**：每个标签一个 WebSocket 连接，独立窗口越多连接数越多，对后端造成压力
+6. **插件卸载时序**：独立窗口关闭时插件 `onunload` 是异步的，如果窗口销毁太快可能导致插件清理不完整
 
 ### 12.3 异常处理风险
 
@@ -1281,6 +1449,10 @@ Linux 系统下使用剪贴板管理特殊的粘贴事件拦截机制，通过 `
 - [ ] 快速连续关闭标签的状态一致性
 - [ ] 窗口最大化/最小化/还原时布局恢复
 - [ ] 关闭按钮设置为"最小化到托盘"的行为正确性
+- [ ] 独立窗口刷新后布局恢复（sessionStorage）
+- [ ] 独立窗口关闭再重新打开后布局状态（预期：不可恢复，需重新创建）
+- [ ] 独立窗口多标签滚动位置保存与恢复
+- [ ] 独立窗口关闭时插件卸载的完整性
 
 ### 13.2 性能验证
 
@@ -1299,6 +1471,10 @@ Linux 系统下使用剪贴板管理特殊的粘贴事件拦截机制，通过 `
 - [ ] 极低内存下的标签卸载策略
 - [ ] 网络异常时关闭保存的失败处理
 - [ ] 多工作区同时关闭的时序正确性
+- [ ] 独立窗口强制关闭（任务管理器）后的后端会话清理
+- [ ] 独立窗口 WebSocket 连接异常断开后的后端状态
+- [ ] 独立窗口插件异步卸载未完成时窗口销毁的影响
+- [ ] 独立窗口大量标签关闭后的内存释放速度
 
 ### 13.4 安全验证
 
@@ -1319,8 +1495,8 @@ SiYuan 的多窗口与标签页管理系统设计体现了桌面级应用的复�
 2. **懒加载优化**：未激活标签不初始化 Model，通过 `data-initdata` 延迟加载，平衡了功能与性能
 3. **多维度持久化**：后端配置 + sessionStorage + localStorage 三层存储，兼顾主窗口和独立窗口
 4. **双路通信**：Electron IPC 用于窗口间控制（关闭、拖拽样式同步），WebSocket 用于数据同步
-5. **细粒度资源管理**：针对不同 Model 类型有专门的销毁逻辑，插件可自定义 `destroy()` 方法
-6. **完整的关闭保存链路**：主进程拦截 → 渲染进程处理 → 持久化 → 回调销毁，确保数据安全
+5. **细粒度标签资源管理**：针对不同 Model 类型有专门的销毁逻辑，插件可自定义 `destroy()` 方法
+6. **双轨关闭机制**：主窗口走"保存布局+退出应用"路径，独立窗口走"卸载插件+销毁窗口"路径，各司其职
 
 ### 三层协作模式
 
@@ -1334,37 +1510,69 @@ SiYuan 的多窗口与标签页管理系统设计体现了桌面级应用的复�
 
 该系统在功能完整性上表现出色，但在以下方面仍有改进空间：
 
-1. **状态一致性**：跨窗口拖拽的竞态条件、持久化重试机制
-2. **异常处理**：网络异常时的关闭保存失败回退、插件异步卸载的等待机制
-3. **性能优化**：增量序列化、连接池管理 WebSocket
-4. **可维护性**：统一的消息分发中心、类型安全的序列化协议
+1. **独立窗口关闭流程完善**：独立窗口关闭时应调用 `exportLayout()` 保存滚动位置，或在 `saveLayout` 中集成滚动位置保存
+2. **独立窗口资源释放**：独立窗口关闭时应主动遍历标签调用 `destroyModel()`，确保 WebSocket 优雅关闭和资源及时释放
+3. **状态一致性**：跨窗口拖拽的竞态条件、持久化重试机制
+4. **异常处理**：网络异常时的关闭保存失败回退、插件异步卸载的等待机制
+5. **性能优化**：增量序列化、连接池管理 WebSocket
+6. **可维护性**：统一的消息分发中心、类型安全的序列化协议
+7. **独立窗口布局持久化**：可考虑将独立窗口布局也保存到后端配置，支持跨会话恢复
 
-特别是在标签数量极大（>50）和多窗口密集交互的场景下，需要重点关注性能和状态一致性问题。
+特别是在标签数量极大（>50）和多窗口密集交互的场景下，需要重点关注性能、状态一致性和资源释放问题。
 
 ---
 
 ## 代码核对记录
 
-| 核对项 | 状态 | 备注 |
+### 窗口与标签管理
+
+| 核对项 | 状态 | 位置 |
 |-------|------|------|
-| Wnd 类定义行号 | ✅ | [Wnd.ts#L56](app/src/layout/Wnd.ts#L56) |
-| Wnd.switchTab 行号 | ✅ | [Wnd.ts#L467-L572](app/src/layout/Wnd.ts#L467-L572) |
-| Wnd.addTab 行号 | ✅ | [Wnd.ts#L574-L645](app/src/layout/Wnd.ts#L574-L645) |
-| Wnd.removeTab 行号 | ✅ | [Wnd.ts#L887-L903](app/src/layout/Wnd.ts#L887-L903) |
-| Wnd.removeTabAction 行号 | ✅ | [Wnd.ts#L772-L885](app/src/layout/Wnd.ts#L772-L885) |
-| Wnd.destroyModel 行号 | ✅ | [Wnd.ts#L741-L770](app/src/layout/Wnd.ts#L741-L770) |
-| Wnd.split 行号 | ✅ | [Wnd.ts#L982](app/src/layout/Wnd.ts#L982) |
-| Tab.dragstart/dragend 行号 | ✅ | [Tab.ts#L84](app/src/layout/Tab.ts#L84) / [L106](app/src/layout/Tab.ts#L106) |
-| util.saveLayout 行号 | ✅ | [util.ts#L128-L168](app/src/layout/util.ts#L128-L168) |
-| util.exportLayout 行号 | ✅ | [util.ts#L170-L209](app/src/layout/util.ts#L170-L209) |
-| util.setPanelFocus 行号 | ✅ | [util.ts#L34-L66](app/src/layout/util.ts#L34-L66) |
+| Wnd 类定义 | ✅ | [Wnd.ts#L56](app/src/layout/Wnd.ts#L56) |
+| Wnd.switchTab | ✅ | [Wnd.ts#L467-L572](app/src/layout/Wnd.ts#L467-L572) |
+| Wnd.addTab | ✅ | [Wnd.ts#L574-L645](app/src/layout/Wnd.ts#L574-L645) |
+| Wnd.removeTab | ✅ | [Wnd.ts#L887-L903](app/src/layout/Wnd.ts#L887-L903) |
+| Wnd.removeTabAction | ✅ | [Wnd.ts#L772-L885](app/src/layout/Wnd.ts#L772-L885) |
+| Wnd.destroyModel | ✅ | [Wnd.ts#L741-L770](app/src/layout/Wnd.ts#L741-L770) |
+| Wnd.split | ✅ | [Wnd.ts#L982](app/src/layout/Wnd.ts#L982) |
+| Tab.dragstart / dragend | ✅ | [Tab.ts#L84](app/src/layout/Tab.ts#L84) / [L106](app/src/layout/Tab.ts#L106) |
+
+### 布局持久化
+
+| 核对项 | 状态 | 位置 |
+|-------|------|------|
+| saveLayout | ✅ | [util.ts#L128-L168](app/src/layout/util.ts#L128-L168) |
+| exportLayout | ✅ | [util.ts#L170-L209](app/src/layout/util.ts#L170-L209) |
+| setPanelFocus | ✅ | [util.ts#L34-L66](app/src/layout/util.ts#L34-L66) |
+
+### 关闭流程（两条独立路径）
+
+| 核对项 | 状态 | 位置 |
+|-------|------|------|
 | siyuan-save-close 分发入口 | ✅ | [onGetConfig.ts#L175-L181](app/src/boot/onGetConfig.ts#L175-L181) |
-| winOnClose 主窗口关闭逻辑 | ✅ | [onGetConfig.ts#L114-L132](app/src/boot/onGetConfig.ts#L114-L132) |
-| closeWindow 独立窗口关闭 | ✅ | [closeWin.ts#L5-L13](app/src/window/closeWin.ts#L5-L13) |
-| onWindowsMsg 跨窗口消息 | ✅ | [onWindowsMsg.ts#L13-L45](app/src/window/onWindowsMsg.ts#L13-L45) |
-| 主进程 siyuan-send-windows | ✅ | [main.js#L1301-L1305](app/electron/main.js#L1301-L1305) |
-| 主进程 destroy 命令 | ✅ | [main.js#L1046-L1051](app/electron/main.js#L1046-L1051) |
+| 主窗口关闭 winOnClose | ✅ | [onGetConfig.ts#L114-L132](app/src/boot/onGetConfig.ts#L114-L132) |
+| 独立窗口关闭 closeWindow | ✅ | [closeWin.ts#L5-L13](app/src/window/closeWin.ts#L5-L13) |
 | 主窗口 close 事件拦截 | ✅ | [main.js#L513-L518](app/electron/main.js#L513-L518) |
 | 独立窗口 close 事件拦截 | ✅ | [main.js#L1169-L1174](app/electron/main.js#L1169-L1174) |
+| 主进程 destroy 命令 | ✅ | [main.js#L1046-L1051](app/electron/main.js#L1046-L1051) |
 | before-quit 事件处理 | ✅ | [main.js#L1519-L1526](app/electron/main.js#L1519-L1526) |
+| exitSiYuan 退出应用 | ✅ | [processSystem.ts#L291](app/src/dialog/processSystem.ts#L291) |
+| 独立窗口初始化 init | ✅ | [init.ts#L21-L85](app/src/window/init.ts#L21-L85) |
+
+### 跨窗口同步
+
+| 核对项 | 状态 | 位置 |
+|-------|------|------|
+| onWindowsMsg 跨窗口消息处理 | ✅ | [onWindowsMsg.ts#L13-L45](app/src/window/onWindowsMsg.ts#L13-L45) |
+| 主进程 siyuan-send-windows 广播 | ✅ | [main.js#L1301-L1305](app/electron/main.js#L1301-L1305) |
 | 锁屏事件广播 | ✅ | [main.js#L1416-L1420](app/electron/main.js#L1416-L1420) |
+
+### 关键发现
+
+| 发现 | 说明 |
+|------|------|
+| 主窗口和独立窗口关闭是两条独立路径 | ❌ 之前错误地认为是统一流程，现已纠正 |
+| 独立窗口关闭不调用 exportLayout | ✅ 确认：仅卸载插件后直接 destroy |
+| 独立窗口关闭不主动调用 destroyModel | ✅ 确认：依赖窗口销毁后 GC 回收 |
+| 主窗口关闭不卸载插件 | ✅ 确认：依赖进程退出自动回收 |
+| 独立窗口布局存 sessionStorage，不可跨会话恢复 | ✅ 确认：关闭后再打开无法恢复布局 |
