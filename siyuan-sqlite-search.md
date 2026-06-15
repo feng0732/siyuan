@@ -486,8 +486,8 @@ SiYuan 的排序体系根据 **搜索模式** 和 **orderBy 参数** 的组合�
 | 3 | 更新时间升序 | `ORDER BY updated ASC` |
 | 4 | 更新时间降序 | `ORDER BY updated DESC` |
 | 5 | 内容顺序 | **不生成 SQL**（由 Go 层内存排序处理） |
-| 6 | 相关度升序 | method=0/1 时：`ORDER BY rank DESC`；method=2/3 时：降级为 `ORDER BY sort DESC, updated DESC` |
-| 7 | 相关度降序 | method=0/1 时：`ORDER BY rank`；method=2/3 时：降级为 `ORDER BY sort ASC, updated DESC` |
+| 6 | 相关度升序（最不相关在前） | method=0/1 时：`ORDER BY rank DESC`（FTS5 BM25 值大 → 小）；method=2/3 时：降级为 `ORDER BY sort DESC, updated DESC` |
+| 7 | 相关度降序（最相关在前，默认相关度排序） | method=0/1 时：`ORDER BY rank`（FTS5 BM25 值小 → 大）；method=2/3 时：降级为 `ORDER BY sort ASC, updated DESC` |
 
 **关键发现 1**：`buildOrderBy()` 的 orderBy=0（默认）CASE 分支 **只有 4 层**，远比引用搜索的 13 层简单。它仅关注 name 和 alias 两个字段的精确/模糊匹配，不涉及 content/type/memo/fcontent 等字段。
 
@@ -514,27 +514,41 @@ SiYuan 的排序体系根据 **搜索模式** 和 **orderBy 参数** 的组合�
 - **执行层**：普通 `blocks` 表 + CTE 子查询
 - **排序子句**：对 `buildOrderBy()` 返回值做了**大幅改写**
 
-多关键词模式中，由于查询走的是 `blocks` 表而非 FTS5 表，`rank` 列不存在。代码中对 orderBy 做了如下降级和注入处理：
+多关键词模式中，由于查询走的是 `blocks` 表而非 FTS5 表，`rank` 列不存在。代码中对 orderBy 做了如下降级和注入处理（通过 `strings.Contains` 匹配 `buildOrderBy()` 的输出特征）：
 
 ```
-原始 orderBy               → 实际注入的排序
-─────────────────────────────────────────────────────────────────
-ORDER BY rank DESC (升序)   → 降级为 buildOrderBy(0,0)，即 CASE 4层
-                              注入 blockSort ASC（命中的块优先）
-ORDER BY rank (降序)        → 降级为 buildOrderBy(0,0)，即 CASE 4层
-                              注入 blockSort DESC（命中的块优先）
-含 "sort ASC" 的子句        → 在 CASE 后注入 blockSort DESC
-其他 orderBy                → 原样使用
+原始 orderBy                    → 实际注入的排序
+─────────────────────────────────────────────────────────────────────────
+"ORDER BY rank DESC"            → 降级为 buildOrderBy(query, 0, 0)，即 CASE 4 层
+  (即 orderBy=6，相关度升序)        注入 blockSort ASC（0在前 = 仅文档命中优先）
+
+"ORDER BY rank"                 → 降级为 buildOrderBy(query, 0, 0)，即 CASE 4 层
+  (即 orderBy=7，相关度降序)        注入 blockSort DESC（1在前 = 自身命中优先）
+
+含 "sort ASC" 的子句             → 在 CASE 和 sort 之间注入 blockSort DESC
+  (即 orderBy=0，默认排序)          （自身命中优先，符合默认搜索直觉）
+
+其他 orderBy                     → 原样使用，不注入 blockSort
+  (如 created/updated 时间排序)
 ```
 
-**`blockSort` 字段**的生成逻辑：
+> **反直觉点**：`orderBy=6`（相关度升序）注入 `blockSort ASC`，即自身未命中的块（blockSort=0）排在自身命中的块（blockSort=1）前面。这在技术上符合"升序"语义（不相关的排前面），但与用户"命中的应该排前面"的直觉相反。不过相关度升序本身就是一个几乎不会被用户使用的模式。
+
+**`blockSort` 字段**的精确生成逻辑：
 ```sql
 CASE WHEN (root_id IN (SELECT root_id FROM docBlocks)
-       AND (concatContent LIKE '%kw1%' AND concatContent LIKE '%kw2%'))
+       AND (content||name||alias||memo||tag LIKE '%kw1%'
+        AND content||name||alias||memo||tag LIKE '%kw2%'
+        AND ...))
      THEN 1 ELSE 0 END AS blockSort
 ```
 
-即：该块所在文档命中 **且** 该块自身也命中所有关键词 → blockSort=1；否则 blockSort=0。排序时将 blockSort 注入到 CASE 和 sort 之间，确保自身命中的块排在仅文档命中的块之前。
+| blockSort 值 | 含义 |
+|-------------|------|
+| **1** | 该块所在文档命中所有关键词 **且** 该块自身的拼接字段也命中所有关键词 |
+| **0** | 该块所在文档命中所有关键词，但该块自身的拼接字段未命中所有关键词 |
+
+排序注入位置：`CASE ... END ASC, [blockSort ASC|DESC], sort ASC, updated DESC`，即 blockSort 在 CASE 之后、sort 之前，作为二级排序依据。仅文档级的排序不受影响（文档块 type='d'，通常 content 字段命中，blockSort=1）。
 
 **CTE 第一阶段排序**（文档级）：
 ```sql
@@ -597,12 +611,13 @@ length ASC
 
 **引用搜索排序的设计逻辑**：引用场景下用户更关心语义关联度——命名精确匹配 > 文档标题匹配 > 标题块匹配 > 列表项匹配 > 内容模糊匹配。这与普通搜索的「粗粒度 name/alias 优先」形成鲜明对比。
 
-**引用搜索的 snippet 参数**：`snippet(..., 64)` —— 片段长度仅 64 字符（普通搜索为 512），因为反链面板空间有限。
+**引用搜索的 snippet 参数**：`snippet(..., 64)` —— 所有 snippet 列统一使用 64 token 限制（普通搜索 tag 列 64 token，其余列 512 token），因为反链面板空间有限。
 
 **风险**：
-1. **13 层 CASE 依赖 content 全量比较**：`content = '${keyword}'` 需要完整内容精确匹配，对长文本块几乎不可能命中；`content LIKE '%${keyword}%'` 在 B-Tree 表上无法利用索引
-2. **无 rank 可用**：引用搜索固定走 FTS5 MATCH 查结果，但排序完全由 CASE 覆盖，未利用 FTS5 的 BM25 相关度信息
-3. **LIMIT 无 OFFSET**：引用搜索使用 `Conf.Search.Limit` 做硬截断，不支持分页
+1. **CASE 精确匹配条件几乎永远不命中**：`content = '${keyword}'` 要求 content 字段与关键词完全相等（长度、每个字符完全一致），对于长文本段落几乎不可能成立；`content LIKE '%${keyword}%'` 虽然能匹配但属于 CASE 的 ELSE 之前的较低优先级层级，且未利用 FTS5 的 BM25 评分。实际效果是：绝大多数结果落入 ELSE 65535，退化为纯 sort（块类型码）+ length（内容长度）排序，13 层 CASE 的语义分层设计几乎失效
+2. **无 BM25 相关度辅助排序**：引用搜索走 FTS5 MATCH（已利用倒排索引过滤结果集），但排序完全由硬编码 CASE 覆盖，未使用 FTS5 的 `rank` 列。对于 MATCH 匹配到的数十/数百条结果，无法利用 BM25 相关度做精细化排序，仅靠 sort+length 做二级区分
+3. **LIMIT 无 OFFSET**：引用搜索使用 `Conf.Search.Limit` 做硬截断，不支持分页，超量结果被静默丢弃
+4. **fcontent 条件对非列表项块无效果**：CASE 中 `fcontent = '${keyword}' AND type = 'i'` 仅对 ListItem（`i`）块有效，对其他类型的容器块（如 SuperBlock、Blockquote）不生效，这些块的首内容无法通过此层级参与排序
 
 ### 5.5 正则搜索（method=3）排序行为
 
@@ -640,8 +655,8 @@ length ASC
 5. **文档间排序**（Root 排序）：
    - orderBy=1/2/3/4：按 created/updated 排序
    - orderBy=5：按 updated 降序（代码注释：都是文档，按更新时间降序）
-   - orderBy=6/7：已在 SQL 中处理（但 FTS rank 在分组后语义已变）
-   - 默认：不排序（代码注释：都是文档，不需要再次排序）
+   - orderBy=6/7：**仅 method=0/1 单关键词模式下有意义**（FTS5 rank 值）；多关键词模式已降级为 CASE+blockSort；method=2/3 已降级为 sort+updated
+   - 默认（orderBy=0）：不排序（代码注释：都是文档，不需要再次排序）
 
 **风险**：
 1. **AST 加载开销**：每个命中文档都要 `loadTreeByBlockTree()`，命中文档数多时内存和 CPU 开销大
@@ -650,12 +665,12 @@ length ASC
 
 ### 5.8 各模式排序汇总
 
-| 搜索模式 | orderBy=0 | orderBy=6 | orderBy=7 | 三级排序 |
+| 搜索模式 | orderBy=0 | orderBy=6（相关度升序） | orderBy=7（相关度降序） | 三级排序 |
 |---------|-----------|-----------|-----------|---------|
-| 普通-单关键词(FTS) | CASE 4层(name/alias) + sort + updated | `rank DESC` (BM25升序) | `rank` (BM25降序) | sort→updated |
-| 普通-多关键词(LIKE) | CASE 4层 + blockSort + sort + updated | 降级为CASE+blockSort ASC | 降级为CASE+blockSort DESC | blockSort→sort→updated |
-| 查询语法(FTS) | CASE 4层(query原文) + sort + updated | `rank DESC` | `rank` | sort→updated |
-| 引用搜索 | **CASE 13层**(含content/`d`/`h`/`i`类型/fcontent) + sort + length | N/A(固定CASE排序) | N/A | sort→length |
+| 普通-单关键词(FTS) | CASE 4层(name/alias) + sort + updated | `ORDER BY rank DESC`（BM25 值从大到小 = 最不相关在前） | `ORDER BY rank`（BM25 值从小到大 = 最相关在前） | sort→updated |
+| 普通-多关键词(LIKE) | CASE 4层 + **blockSort DESC**（自身命中优先） + sort + updated | 降级为CASE 4层 + **blockSort ASC**（仅文档命中优先，反直觉） + sort + updated | 降级为CASE 4层 + **blockSort DESC**（自身命中优先） + sort + updated | CASE→blockSort→sort→updated |
+| 查询语法(FTS) | CASE 4层(query原文) + sort + updated | `ORDER BY rank DESC` | `ORDER BY rank` | sort→updated |
+| 引用搜索 | **CASE 13层**(含content/`d`/`h`/`i`类型/fcontent) + sort + length（无其他 orderBy 可选） | N/A(固定CASE排序) | N/A | CASE→sort→length |
 | 正则(blocks表) | CASE 4层 + sort + updated | 降级为sort DESC,updated DESC | 降级为sort ASC,updated DESC | sort→updated |
 | SQL(自定义) | 用户SQL自带 | 用户SQL自带 | 用户SQL自带 | 由用户SQL决定 |
 
@@ -742,7 +757,7 @@ if caseSensitive {
 | **按文档分组 + 内容顺序** | groupBy=1, orderBy=5 | 需重新遍历每棵 AST 树记录 sortVal，内存开销大 |
 | **SQL 搜索（用户自定义 SQL）** | method=2 管理员模式 | 虽然有 sqlparser 注入 LIMIT，但本质允许任意 DQL |
 | **FTS5 长查询** | 单关键词过长 + snippet(512) | 高亮计算开销随片段数线性增长 |
-| **引用搜索 13 层 CASE** | 反链面板打开时 | CASE 中 `content LIKE` 对每行求值，无法利用索引 |
+| **引用搜索 13 层 CASE** | 反链面板打开时 | FTS5 MATCH 后对结果集每行做 13 层 CASE 排序判断，精确匹配条件几乎不命中，大量结果落入 ELSE 分支退化为 sort+length |
 
 ### 7.3 排序相关的一致性与语义风险
 
@@ -752,9 +767,9 @@ if caseSensitive {
 
 3. **正则/SQL 模式下相关度排序名不副实**：orderBy=6/7 在 method=2/3 时降级为 sort+updated，前端 UI 仍显示「按相关度排序」选项，但实际与「按块类型」排序几乎等效。
 
-4. **引用搜索排序独立于 `buildOrderBy()`**：引用搜索硬编码 13 层 CASE + length 三级排序，与普通搜索的 4 层 CASE + updated 三级排序完全不同。同一关键词在普通搜索和引用搜索中可能出现在不同位置。
+4. **引用搜索排序独立于 `buildOrderBy()`**：引用搜索硬编码 13 层 CASE + sort ASC + length ASC 排序，与普通搜索的 4 层 CASE + sort ASC + updated DESC 完全不同。实际使用中，由于 CASE 的 `content = 'keyword'` 等精确匹配条件对长文本几乎不可能命中，绝大多数结果落入 ELSE 65535，引用搜索实际上退化为 **sort（块类型码）升序 + length（内容长度）升序**，同一关键词在普通搜索和引用搜索中的排序差异非常明显。
 
-5. **分组后排序体系重构**：groupBy=1 时 Go 层对结果重新排序，文档根的排序逻辑与 SQL 层不一致。例如 orderBy=0 分组后文档间不排序，而 SQL 中有 CASE 排序。
+5. **多关键词相关度升序时命中标记方向反直觉**：当 orderBy=6（相关度升序）时，多关键词模式注入 `blockSort ASC`，即自身未命中的块（blockSort=0）排在自身命中的块（blockSort=1）之前。虽然这在技术上符合"相关度升序=最不相关排前面"的定义，但对于不理解升序语义的用户来说，"越匹配越靠后"的表现就是 Bug。
 
 ### 7.4 一致性边界问题
 
