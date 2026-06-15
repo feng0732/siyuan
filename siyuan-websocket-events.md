@@ -610,55 +610,98 @@ func (cmd *ping) IsRead() bool {
 
 [transaction.ts](file:///d:/fz/0601/solo-dogfeeding/code/297-siyuan/app/src/protyle/wysiwyg/transaction.ts#L1364-L1460)
 
-涉及两个独立的时间参数，需严格区分：
+涉及两个独立的时间机制，需严格按代码实际表达式理解：
 
-| 参数名 | 值 | 用途 | 代码位置 |
-|--------|-----|------|----------|
-| `TIMEOUT_INPUT` | 256ms | **合并判断窗口**：两次输入时间间隔小于此值才可能合并 | L1387: `protyle.transactionTime - time < Constants.TIMEOUT_INPUT` |
-| `TIMEOUT_INPUT * 2` | 512ms | **防抖提交延时**：最后一次输入后等待多久提交 HTTP | L1449-1451: `setTimeout(promiseTransaction, Constants.TIMEOUT_INPUT * 2)` |
+| 机制 | 实际代码 | 说明 |
+|------|----------|------|
+| **`transactionTime` 设置** | 正常输入：`protyle.transactionTime = time` <br> 折叠操作：`protyle.transactionTime = time + TIMEOUT_INPUT * 2` | L1448 vs L1407 |
+| **合并判断** | `protyle.transactionTime - time < TIMEOUT_INPUT` (256) | L1387：**旧时间减当前时间**，不是时间差的绝对值 |
+| **防抖提交延时** | `setTimeout(promiseTransaction, TIMEOUT_INPUT * 2)` (512ms) | L1449-1451：最后一次输入后等待 512ms 提交 |
 
-#### 5.2.1 合并判断条件（256ms 窗口）
+#### 5.2.1 合并判断表达式的真实语义
+
+[transaction.ts L1384-L1389](file:///d:/fz/0601/solo-dogfeeding/code/297-siyuan/app/src/protyle/wysiwyg/transaction.ts#L1384-L1389)
 
 ```typescript
-public static readonly TIMEOUT_INPUT = 256;  // constants.ts L302
-
-let needDebounce = false;
+const time = new Date().getTime();
 if (lastTransaction && 
     lastTransaction.doOperations.length === 1 && 
     lastTransaction.doOperations[0].action === "update" &&
     doOperations.length === 1 && 
     doOperations[0].action === "update" &&
     lastTransaction.doOperations[0].id === doOperations[0].id &&
-    protyle.transactionTime - time < Constants.TIMEOUT_INPUT  // < 256ms
+    protyle.transactionTime - time < Constants.TIMEOUT_INPUT  // 256ms
 ) {
     needDebounce = true;
 }
 ```
 
-**5 个条件必须同时满足**才能合并：
-1. 上一个事务存在
-2. 上一个事务只有 1 个 operation 且是 `update` 类型
-3. 当前事务也只有 1 个 operation 且是 `update` 类型
-4. 两次操作的 **块 ID 相同**（同一块连续编辑）
-5. 时间间隔 < **256ms**
+**关键修正**：表达式是 `protyle.transactionTime（旧值）- time（当前值）< 256`，**不是** `|Δt| < 256ms` 也不是 `time - transactionTime < 256ms`。
+
+分三种场景推导：
+
+**场景 A：正常连续输入（transactionTime = 上次输入时的 time）**
+
+| 输入间隔 Δt | `transactionTime` | `time` | 表达式值 `transactionTime - time` | `< 256` | 结果 |
+|-------------|-------------------|--------|----------------------------------|---------|------|
+| 100ms | t₀ | t₀ + 100 | -100 | ✅ 是 | 合并 |
+| 256ms | t₀ | t₀ + 256 | -256 | ✅ 是 | 合并 |
+| 1000ms | t₀ | t₀ + 1000 | -1000 | ✅ 是 | 合并 |
+| 任意正数 Δt | t₀ | t₀ + Δt | -Δt < 0 < 256 | ✅ 恒成立 | 合并 |
+
+> **结论 A：正常输入场景下，该时间判断恒为 true。合并由前 4 个条件（单 operation、都是 update、同一块 ID）决定，时间条件不阻止任何合并。**
+
+**场景 B：折叠/属性视图等即时操作后紧接着输入（transactionTime = time_fold + 512ms，设为未来时间）**
+
+| 折叠后 Δt 才输入 | `transactionTime` | `time` | 表达式值 | `< 256` | 结果 |
+|------------------|-------------------|--------|----------|---------|------|
+| 100ms | t_fold + 512 | t_fold + 100 | 512 - 100 = **412** | ❌ 否 | **不合并** ✓ |
+| 256ms | t_fold + 512 | t_fold + 256 | 512 - 256 = **256** | ❌ 否（256 不小于 256） | **不合并** ✓ |
+| 300ms | t_fold + 512 | t_fold + 300 | 512 - 300 = **212** | ✅ 是 | 合并 |
+| 600ms | t_fold + 512 | t_fold + 600 | 512 - 600 = **-88** | ✅ 是 | 合并 |
+
+> **结论 B：该时间判断的真实用途是 —— 即时操作（折叠/设属性）后 **256ms 内** 的输入禁止合并，因为即时操作已直接走 HTTP 提交了，不能和后续输入合并到同一个事务。**
+
+**场景 C：即时操作的"自毁保险"**
+
+```typescript
+// L1406-1407: 折叠等即时操作
+protyle.transactionTime = time + Constants.TIMEOUT_INPUT * 2;  // 设为未来 512ms
+fetchPost("/api/transactions", ...);  // 直接 HTTP 提交，不走防抖队列
+return;
+```
+
+设置 `time + 512` 而不是 `time + 256` 的原因：留了 256ms 的"安全窗口"。只要折叠后 256ms 内有输入，就会被阻止合并。超过 256ms 才允许合并（此时折叠操作已完成，后续输入作为新事务开始）。
+
+#### 5.2.2 合并条件总览（修正版）
+
+`needDebounce = true` **当且仅当**以下 5 条 **全部** 成立：
+
+| # | 条件 | 代码位置 | 真实意图 |
+|---|------|----------|----------|
+| 1 | `lastTransaction` 存在 | L1384 | 队列中有待合并的上一个事务 |
+| 2 | 上一个事务有且只有 1 个 `update` operation | L1384 | 只能合并同类型的简单字符更新 |
+| 3 | 当前事务有且只有 1 个 `update` operation | L1385 | 同上 |
+| 4 | 两次操作的 `id`（块 ID）相同 | L1386 | 必须是同一块的连续编辑 |
+| 5 | `protyle.transactionTime - time < 256` | L1387 | 若上一步是折叠等即时操作（设了未来时间），**256ms 内不合并**；正常输入恒成立 |
 
 满足条件时，**原地替换** `window.siyuan.transactions` 数组中最后一个元素的 `doOperations`，不新增条目。
 
-#### 5.2.2 防抖提交流程（512ms 延时）
+#### 5.2.3 防抖提交流程（512ms 延时）
 
 ```
 t=0ms   用户输入字符 'a'
         → transaction() 被调用
-        → lastTransaction 不存在，needDebounce=false
+        → 前4条件+时间条件均满足→needDebounce=false(无lastTx)
         → transactions.push({doOperations: [{action:'update', id:'xxx', data:'a'}]})
-        → protyle.transactionTime = time
+        → protyle.transactionTime = 0  (设为当前时间)
         → transactionsTimeout = setTimeout(promiseTransaction, 512ms)
 
 t=100ms 用户输入字符 'b'
-        → transaction() 被调用
-        → 5个条件都满足（间隔 100ms < 256ms），needDebounce=true
+        → lastTransaction 存在，5条件全部满足（时间: 0-100=-100<256）
+        → needDebounce=true
         → 原地替换：transactions[last].doOperations = [{action:'update', id:'xxx', data:'ab'}]
-        → protyle.transactionTime = time
+        → protyle.transactionTime = 100  (更新为当前时间)
         → clearTimeout(transactionsTimeout)
         → transactionsTimeout = setTimeout(promiseTransaction, 512ms)
         (防抖重置：再等 512ms)
@@ -666,15 +709,16 @@ t=100ms 用户输入字符 'b'
 t=612ms 定时器触发（t=100ms + 512ms）
         → promiseTransaction() 执行
         → 取出 transactions[0] 发送 HTTP 请求
-        → transactions.splice(0, 1)
+        → transactions.splice(0, 1)  (立即出队，不等 HTTP 返回)
 ```
 
 **关键点**：
-- 两次输入的合并窗口是 **256ms**（判断是否为同一块的连续编辑）
-- 每次输入后重置的防抖延时是 **512ms**（等待多久确认不再输入才提交）
+- 正常输入时，时间条件恒成立，合并的真正门槛是前 4 个条件（同一块、都是单 update）
+- `transactionTime` 设未来时间 + 256ms 阈值是专门用于**阻止折叠/属性操作与后续输入合并**的
+- 每次输入后重置防抖延时为 512ms（debounce trailing 模式）
 - `transactions` 数组是 **FIFO 队列**，`promiseTransaction` 按顺序逐个提交
 
-#### 5.2.3 promiseTransaction 串行提交
+#### 5.2.4 promiseTransaction 串行提交
 
 [transaction.ts](file:///d:/fz/0601/solo-dogfeeding/code/297-siyuan/app/src/protyle/wysiwyg/transaction.ts#L64-L140)
 
@@ -709,7 +753,7 @@ const promiseTransaction = () => {
 - 当前请求返回后才发送下一个
 - 队列中积压的事务依次顺序提交
 
-#### 5.2.4 旁路：直接提交（不防抖）
+#### 5.2.5 旁路：直接提交（不防抖）
 
 以下操作 **跳过防抖**，直接发送 HTTP 请求：
 
