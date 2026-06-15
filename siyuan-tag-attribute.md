@@ -8,12 +8,12 @@ SiYuan 的标签与属性管理体系遵循「前端交互 → API 层 → 业�
 
 | 层级 | 模块路径 | 核心职责 |
 |------|---------|---------|
-| **前端 UI 层** | [app/src/layout/dock/Tag.ts](file:///d:/fz/0601/solo-dogfeeding/code/300-siyuan/app/src/layout/dock/Tag.ts)、[app/src/menus/tag.ts](file:///d:/fz/0601/solo-dogfeeding/code/300-siyuan/app/src/menus/tag.ts) | 标签面板渲染、右键菜单、事件监听、实时刷新 |
-| **API 路由层** | [kernel/api/tag.go](file:///d:/fz/0601/solo-dogfeeding/code/300-siyuan/kernel/api/tag.go)、[kernel/api/attr.go](file:///d:/fz/0601/solo-dogfeeding/code/300-siyuan/kernel/api/attr.go) | HTTP 接口定义、参数校验、权限控制 |
-| **业务模型层** | [kernel/model/tag.go](file:///d:/fz/0601/solo-dogfeeding/code/300-siyuan/kernel/model/tag.go)、[kernel/model/blockial.go](file:///d:/fz/0601/solo-dogfeeding/code/300-siyuan/kernel/model/blockial.go)、[kernel/model/transaction.go](file:///d:/fz/0601/solo-dogfeeding/code/300-siyuan/kernel/model/transaction.go) | 核心业务逻辑：标签 CRUD、属性读写、事务处理、批量操作 |
-| **内存缓存层** | [kernel/cache/ial.go](file:///d:/fz/0601/solo-dogfeeding/code/300-siyuan/kernel/cache/ial.go) | 基于 Ristretto 的块属性/文档属性缓存（200MB 上限） |
-| **SQL 索引层** | [kernel/sql/span.go](file:///d:/fz/0601/solo-dogfeeding/code/300-siyuan/kernel/sql/span.go)、[kernel/sql/upsert.go](file:///d:/fz/0601/solo-dogfeeding/code/300-siyuan/kernel/sql/upsert.go)、[kernel/sql/queue.go](file:///d:/fz/0601/solo-dogfeeding/code/300-siyuan/kernel/sql/queue.go)、[kernel/sql/attribute.go](file:///d:/fz/0601/solo-dogfeeding/code/300-siyuan/kernel/sql/attribute.go) | 数据库表结构、异步索引队列、标签 Span 提取、属性行存储 |
-| **索引构建层** | [kernel/model/index.go](file:///d:/fz/0601/solo-dogfeeding/code/300-siyuan/kernel/model/index.go)、[kernel/model/tree.go](file:///d:/fz/0601/solo-dogfeeding/code/300-siyuan/kernel/model/tree.go) | 文档树加载、全量/增量索引调度、BlockTree 索引 |
+| **前端 UI 层** | `app/src/layout/dock/Tag.ts`、`app/src/menus/tag.ts` | 标签面板渲染、右键菜单、事件监听、实时刷新 |
+| **API 路由层** | `kernel/api/tag.go`、`kernel/api/attr.go` | HTTP 接口定义、参数校验、权限控制 |
+| **业务模型层** | `kernel/model/tag.go`、`kernel/model/blockial.go`、`kernel/model/transaction.go` | 核心业务逻辑：标签 CRUD、属性读写、事务处理、批量操作 |
+| **内存缓存层** | `kernel/cache/ial.go` | 基于 Ristretto 的块属性/文档属性缓存（200MB 上限） |
+| **SQL 索引层** | `kernel/sql/span.go`、`kernel/sql/upsert.go`、`kernel/sql/queue.go`、`kernel/sql/attribute.go` | 数据库表结构、异步索引队列、标签 Span 提取、属性行存储 |
+| **索引构建层** | `kernel/model/index.go`、`kernel/model/tree.go` | 文档树加载、全量/增量索引调度、BlockTree 索引 |
 | **持久化层** | `filesys/*.go`（文件系统） | `.sy` JSON 文档持久化、文件锁 |
 
 ---
@@ -29,7 +29,7 @@ SiYuan 中的标签以**两种互相关联的形态**存在，对应不同的存
 - **存储位置**：嵌入在文档树的块内容内，随块一起序列化为 JSON 存储到 `.sy` 文件
 - **索引提取**：在 SQL 索引阶段通过 `ast.Walk` 遍历提取到 `spans` 表
 
-核心提取代码位于 [kernel/sql/database.go#L913-L944](file:///d:/fz/0601/solo-dogfeeding/code/300-siyuan/kernel/sql/database.go#L913-L944)：
+核心提取代码位于 `kernel/sql/database.go` 的 `tagFromNode` 函数（约 L913-L944）：
 
 ```go
 func tagFromNode(node *ast.Node) (ret string) {
@@ -58,11 +58,11 @@ func tagFromNode(node *ast.Node) (ret string) {
 #### 形态二：文档标签（Document Tag，IAL 属性）
 - **解析时机**：在块属性面板中设置，或通过 API `/api/attr/setBlockAttrs` 对文档根节点设置 `tags` 属性
 - **存储位置**：存储在文档根节点的 IAL（Inline Attribute List）中，格式为逗号分隔字符串，如 `tags="工作,重要"`
-- **特殊处理**：在 [kernel/model/blockial.go#L229-L244](file:///d:/fz/0601/solo-dogfeeding/code/300-siyuan/kernel/model/blockial.go#L229-L244) 对 `tags` 属性做去重和规范化处理
+- **特殊处理**：在 `kernel/model/blockial.go` 的 `setNodeAttrs0` 中对 `tags` 属性做去重和规范化处理
 
 ### 2.2 标签的树形层级解析
 
-标签支持层级结构（如 `项目/后端/API`），在 [kernel/model/tag.go#L415-L432](file:///d:/fz/0601/solo-dogfeeding/code/300-siyuan/kernel/model/tag.go#L415-L432) 的 `buildTags` 函数中按 `/` 分隔符递归构建层级树：
+标签支持层级结构（如 `项目/后端/API`），在 `kernel/model/tag.go` 的 `buildTags` 函数中按 `/` 分隔符递归构建层级树：
 
 ```go
 func buildTags(root Tags, labels []string, depth int) Tags {
@@ -85,19 +85,19 @@ func buildTags(root Tags, labels []string, depth int) Tags {
 
 ### 3.1 属性命名规则与验证
 
-属性名在 [kernel/model/blockial.go#L314-L357](file:///d:/fz/0601/solo-dogfeeding/code/300-siyuan/kernel/model/blockial.go#L314-L357) 中有严格的验证逻辑 `isValidAttrName`：
+属性名在 `kernel/model/blockial.go` 中有严格的验证逻辑 `isValidAttrName`：
 
 | 规则 | 说明 |
 |------|------|
 | 首字符 | 必须为小写字母 `a-z` |
 | 后续字符 | 小写字母 `a-z`、数字 `0-9`、连字符 `-` |
 | 自定义属性 | 必须使用 `custom-` 前缀，前缀后首字符仍需为小写字母 |
-| 大小写 | 属性名统一转为小写存储，防止重复（见 [setNodeAttrs0#L261](file:///d:/fz/0601/solo-dogfeeding/code/300-siyuan/kernel/model/blockial.go#L261)） |
+| 大小写 | 属性名统一转为小写存储，防止重复 |
 | 受保护属性 | `data-task` 不允许通过通用接口修改 |
 
 ### 3.2 属性写入的标准流程（setNodeAttrs0）
 
-[setNodeAttrs0](file:///d:/fz/0601/solo-dogfeeding/code/300-siyuan/kernel/model/blockial.go#L210-L271) 是所有属性修改的底层入口，执行以下关键步骤：
+`setNodeAttrs0` 是所有属性修改的底层入口，执行以下关键步骤：
 
 1. **提取旧属性**：通过 `parse.IAL2Map` 和 `parse.IAL2MapUnEsc` 分别获取转义和未转义版本
 2. **属性值清理**：`RemoveInvalidRetainCtrl` 移除非法控制字符，`TrimSpace` 去除首尾空白
@@ -118,7 +118,7 @@ func buildTags(root Tags, labels []string, depth int) Tags {
 
 ### 3.4 属性的逐行展开索引
 
-在 [kernel/sql/database.go#L568-L615](file:///d:/fz/0601/solo-dogfeeding/code/300-siyuan/kernel/sql/database.go#L568-L615) 的 `buildAttributeFromNode` 中，属性从 IAL 中筛选并逐行写入 `attributes` 表，`isAttr` 函数定义了需要被索引的属性白名单：
+在 `kernel/sql/database.go` 的 `buildAttributeFromNode` 中，属性从 IAL 中筛选并逐行写入 `attributes` 表，`isAttr` 函数定义了需要被索引的属性白名单：
 
 ```go
 func isAttr(name string) bool {
@@ -136,14 +136,14 @@ func isAttr(name string) bool {
 
 ### 4.1 索引队列与异步刷新
 
-索引更新采用**异步批量队列机制**，核心实现在 [kernel/sql/queue.go](file:///d:/fz/0601/solo-dogfeeding/code/300-siyuan/kernel/sql/queue.go)。
+索引更新采用**异步批量队列机制**，核心实现在 `kernel/sql/queue.go`。
 
 #### 队列操作类型
 
 | action | 触发场景 | 说明 |
 |--------|---------|------|
 | `index` | 首次构建索引 / Box.Index() | 完全重建文档下所有索引表 |
-| `upsert` | 编辑后保存 / 属性修改 | **Hash 对比增量更新**，仅重写变化的块 |
+| `upsert` | 编辑后保存 / 属性修改 | **blocks 表 Hash 增量 + 子表全量重建** |
 | `delete` | 删除文档/目录 | 按路径前缀批量删除 |
 | `delete_id` | 删除单个文档 | 按 root_id 删除 |
 | `rename` | 文档重命名 | 更新 hpath 和文档标题 |
@@ -153,14 +153,14 @@ func isAttr(name string) bool {
 
 #### 队列去重优化
 
-同一文档的同类型操作会被覆盖合并，避免重复索引。例如在 [UpsertTreeQueue](file:///d:/fz/0601/solo-dogfeeding/code/300-siyuan/kernel/sql/queue.go#L335-L347)：
+同一文档的同类型操作会被覆盖合并，避免重复索引。例如 `UpsertTreeQueue`：
 
 ```go
 func UpsertTreeQueue(tree *parse.Tree) {
     newOp := &dbQueueOperation{upsertTree: tree, action: "upsert"}
     for i, op := range operationQueue {
         if "upsert" == op.action && op.upsertTree.ID == tree.ID {
-            operationQueue[i] = newOp  // 直接覆盖
+            operationQueue[i] = newOp  // 直接覆盖（Last Write Wins）
             return
         }
     }
@@ -168,17 +168,78 @@ func UpsertTreeQueue(tree *parse.Tree) {
 }
 ```
 
-### 4.2 Upsert 增量索引的 Hash 对比机制
+### 4.2 Upsert 增量索引的真实机制（修正版）
 
-在 [upsertTree](file:///d:/fz/0601/solo-dogfeeding/code/300-siyuan/kernel/sql/upsert.go#L399-L453) 中，通过块内容 Hash 对比实现增量更新：
+> ⚠️ **重要修正**：之前对 upsert 增量更新的理解存在偏差。实际上，**只有 `blocks` 主表做了 Hash 对比的增量更新，而 `spans`、`assets`、`attributes`、`refs` 等子表全部是按文档粒度全量删除后重新插入**。
 
-1. 查询旧块 Hash：`queryBlockHashes(tx, tree.ID)`
-2. 计算新块 Hash：遍历 `fromTree` 结果，`treenode.NodeHash`
-3. 生成「未变化集合」unChanges：新旧 Hash 相同的块 ID
-4. 生成「待删除列表」toRemoves：旧 Hash 中有但新 Hash 中没有，或 Hash 改变的
-5. 先删后插：`deleteBlocksByIDs` → 重建 spans/assets/attributes/refs → `insertTree0`
+在 `kernel/sql/upsert.go` 的 `upsertTree` 函数中，完整执行流程如下：
 
-> **关键效率保障**：Hash 未变化的块完全跳过数据库操作，大大降低编辑保存时的 IO 开销。
+#### 步骤 1：计算 blocks 表的增量（仅 blocks 表）
+
+```go
+oldBlockHashes := queryBlockHashes(tx, tree.ID)   // 查询旧块 Hash
+blocks, spans, assets, attributes := fromTree(tree.Root, tree)  // 从新树提取全量数据
+
+// 计算未变化的块（Hash 相同）
+unChanges := hashset.New()
+var toRemoves []string
+for id, hash := range oldBlockHashes {
+    if newHash, ok := newBlockHashes[id]; ok {
+        if newHash == hash {
+            unChanges.Add(id)  // 未变化，跳过
+        }
+    } else {
+        toRemoves = append(toRemoves, id)  // 旧有新无：需要删除
+    }
+}
+
+// 过滤 blocks：只保留有变化的块用于插入
+tmp := blocks[:0]
+for _, b := range blocks {
+    if !unChanges.Contains(b.ID) {
+        tmp = append(tmp, b)
+    }
+}
+blocks = tmp
+
+// 有变化的块也加入 toRemoves（先删后插）
+for _, b := range blocks {
+    toRemoves = append(toRemoves, b.ID)
+}
+```
+
+#### 步骤 2：删除操作（分层策略）
+
+| 表 | 删除范围 | 删除粒度 |
+|-----|---------|---------|
+| `blocks` | `deleteBlocksByIDs(tx, toRemoves)` | 仅删除 Hash 变化的 + 旧有新无的块（**增量删除**） |
+| `spans` | `deleteSpansByRootID(tx, tree.ID)` | 整文档所有 spans 全部删除（**全量删除**） |
+| `assets` | `deleteAssetsByRootID(tx, tree.ID)` | 整文档所有 assets 全部删除（**全量删除**） |
+| `attributes` | `deleteAttributesByRootID(tx, tree.ID)` | 整文档所有 attributes 全部删除（**全量删除**） |
+| `refs` | `deleteRefsByPathTx(tx, tree.Box, tree.Path)` | 整文档所有 refs 全部删除（**全量删除**） |
+| `file_annotation_refs` | `deleteFileAnnotationRefsByPathTx(tx, tree.Box, tree.Path)` | 整文档全部删除（**全量删除**） |
+
+#### 步骤 3：插入操作
+
+```go
+refs, fileAnnotationRefs := refsFromTree(tree)
+insertTree0(tx, tree, context, blocks, spans, assets, attributes, refs, fileAnnotationRefs)
+```
+
+在 `insertTree0` 中还有一个额外细节：**spans 插入前会再删一次**（`deleteSpansByRootID(tx, tree.Root.ID)`），注释说是「移除文档标签，否则会重复添加」（对应 issue #3723），相当于双保险。
+
+#### 各表更新策略汇总
+
+| 表 | 更新策略 | 粒度 | 设计原因 |
+|-----|---------|------|---------|
+| **blocks** | Hash 增量对比，先删后插 | 块级 | 主表数据量大，块级 Hash 易计算，增量收益最高 |
+| **spans** | 全量删除 + 全量插入 | 文档级 | 单文档内 span 数量有限，全量重建实现简单、不易出错 |
+| **assets** | 全量删除 + 全量插入 | 文档级 | 同上 |
+| **attributes** | 全量删除 + 全量插入 | 文档级 | 同上，且属性逐行展开后 diff 逻辑复杂 |
+| **refs** | 全量删除 + 全量插入 | 文档级（按 path） | 引用关系整体重建更可靠 |
+| **file_annotation_refs** | 全量删除 + 全量插入 | 文档级（按 path） | 同上 |
+
+> **设计权衡**：只有主表 blocks 做增量，子表全部全量重建。这种「主表精细化 + 子表简单化」的设计，在保证主要性能收益的同时，大大降低了子表增量 diff 的实现复杂度和出错概率。
 
 ### 4.3 标签索引的两级结构
 
@@ -194,6 +255,7 @@ func UpsertTreeQueue(tree *parse.Tree) {
 - 关键字段：`block_id`、`root_id`、`box`、`path`、`content`（标签名）、`type`（含 tag 标识）
 - 查询函数：`QueryTagSpansByLabel`、`QueryTagSpansByKeyword`、`QueryTagSpans`
 - 作用：标签面板构建、精确标签搜索、标签统计计数
+- **更新方式**：随 spans 表整文档全量重建
 
 ### 4.4 索引更新触发链路
 
@@ -212,7 +274,9 @@ setBlockAttrs API
         → sql.UpsertTreeQueue(tree)        [加入 SQL 异步队列]
       → cache.PutBlockIAL(id, attrs)       [更新缓存]
       → pushBlockAttrs(oldAttrs, node)     [通过 transactions 事件广播到前端]
-      → sql.FlushQueue()                   [异步落库]
+      → sql.FlushQueue()                   [异步落库：
+                                              blocks 表 Hash 增量更新
+                                              spans/assets/attributes/refs 全量重建]
       → refreshDynamicRefText()            [刷新动态引用锚文本]
 ```
 
@@ -222,7 +286,7 @@ setBlockAttrs API
 
 ### 5.1 标签面板（Tag Dock Panel）
 
-前端 [Tag.ts](file:///d:/fz/0601/solo-dogfeeding/code/300-siyuan/app/src/layout/dock/Tag.ts) 实现标签树的完整展示：
+前端 `app/src/layout/dock/Tag.ts` 实现标签树的完整展示：
 
 #### 初始化与数据加载
 1. 构造函数创建 Tree 组件，配置 `click`、`rightClick` 回调
@@ -242,7 +306,7 @@ setBlockAttrs API
 
 #### 排序模式支持（6 种）
 
-前端排序菜单与后端 `Conf.Tag.Sort` 同步，对应 [sortTags](file:///d:/fz/0601/solo-dogfeeding/code/300-siyuan/kernel/model/tag.go#L285-L312)：
+前端排序菜单与后端 `Conf.Tag.Sort` 同步，对应 `kernel/model/tag.go` 中的 `sortTags`：
 
 | 排序值 | 模式 | 实现 |
 |--------|------|------|
@@ -255,7 +319,7 @@ setBlockAttrs API
 
 ### 5.2 标签右键菜单
 
-[openTagMenu](file:///d:/fz/0601/solo-dogfeeding/code/300-siyuan/app/src/menus/tag.ts) 提供两项操作：
+`app/src/menus/tag.ts` 的 `openTagMenu` 提供两项操作：
 - **重命名标签**：`renameTag()` → `/api/tag/renameTag`
 - **删除标签**：`confirmDialog` 二次确认 → `/api/tag/removeTag`
 
@@ -267,8 +331,8 @@ setBlockAttrs API
 
 #### 路径一：标签面板内关键词过滤（SearchTags）
 - 入口：标签树顶部搜索框
-- 实现：[SearchTags](file:///d:/fz/0601/solo-dogfeeding/code/300-siyuan/kernel/model/tag.go#L314-L332) → `labelBlocksByKeyword`
-- SQL 逻辑：[QueryTagSpansByKeyword](file:///d:/fz/0601/solo-dogfeeding/code/300-siyuan/kernel/sql/span.go#L117-L143)
+- 实现：`kernel/model/tag.go` 的 `SearchTags` → `labelBlocksByKeyword`
+- SQL 逻辑：`kernel/sql/span.go` 的 `QueryTagSpansByKeyword`
   - 空格分隔的多关键词使用 `LIKE ? AND LIKE ?` 连接（全部命中）
   - `GROUP BY markdown` 去重
   - `LIMIT` 控制结果数量（`Conf.Search.Limit`）
@@ -277,7 +341,7 @@ setBlockAttrs API
 #### 路径二：全局搜索中的标签语法 `#tag#`
 - 入口：全局搜索面板输入 `#工作#`
 - 底层：利用 FTS 索引（`blocks_fts` / `blocks_fts_case_insensitive`）的 tag 列
-- 替换逻辑：在搜索替换流程中（[kernel/model/search.go#L977-L996](file:///d:/fz/0601/solo-dogfeeding/code/300-siyuan/kernel/model/search.go#L977-L996)），标签 TextMark 会被转换为纯文本再做替换
+- 替换逻辑：在搜索替换流程中（`kernel/model/search.go`），标签 TextMark 会被转换为纯文本再做替换
 
 ### 6.2 标签点击跳转
 
@@ -289,7 +353,7 @@ setBlockAttrs API
 
 ### 7.1 标签批量重命名（RenameTag）
 
-[RenameTag](file:///d:/fz/0601/solo-dogfeeding/code/300-siyuan/kernel/model/tag.go#L126-L229) 实现完整的批量标签重命名流程：
+`kernel/model/tag.go` 的 `RenameTag` 实现完整的批量标签重命名流程：
 
 #### 步骤详解
 
@@ -323,13 +387,13 @@ setBlockAttrs API
 
 ### 7.2 标签批量删除（RemoveTag）
 
-[RemoveTag](file:///d:/fz/0601/solo-dogfeeding/code/300-siyuan/kernel/model/tag.go#L35-L124) 与重命名流程高度相似，差异在于：
+`kernel/model/tag.go` 的 `RemoveTag` 与重命名流程高度相似，差异在于：
 - 文档节点：从 tags 逗号分隔字符串中移除匹配项
 - 普通块：`n.Unlink()` 直接移除 TextMark 节点（而非修改内容）
 
 ### 7.3 批量属性设置（BatchSetBlockAttrs）
 
-[BatchSetBlockAttrs](file:///d:/fz/0601/solo-dogfeeding/code/300-siyuan/kernel/model/blockial.go#L101-L147) 实现跨块属性批量设置：
+`kernel/model/blockial.go` 的 `BatchSetBlockAttrs` 实现跨块属性批量设置：
 
 1. **批量加载文档树**：`filesys.LoadTrees(blockIDs)` 一次加载所有涉及的文档
 2. **节点定位与属性设置**：逐块调用 `setNodeAttrs0`
@@ -344,7 +408,7 @@ setBlockAttrs API
 
 #### 事务队列（txQueue）架构
 
-[kernel/model/transaction.go](file:///d:/fz/0601/solo-dogfeeding/code/300-siyuan/kernel/model/transaction.go) 中定义了核心事务机制：
+`kernel/model/transaction.go` 中定义了核心事务机制：
 
 ```
 前端 transactions 消息
@@ -380,7 +444,7 @@ setBlockAttrs API
 
 ### 8.1 队列级冲突：同文档操作覆盖
 
-SQL 索引队列（[queue.go](file:///d:/fz/0601/solo-dogfeeding/code/300-siyuan/kernel/sql/queue.go)）中，**同一 tree.ID 的同类操作会被新操作覆盖**，这是一种「最终写入者胜」（Last Write Wins）的冲突消解策略：
+SQL 索引队列（`kernel/sql/queue.go`）中，**同一 tree.ID 的同类操作会被新操作覆盖**，这是一种「最终写入者胜」（Last Write Wins）的冲突消解策略：
 - 避免了短时间内对同一文档多次重复索引
 - 缺点是如果两次 upsert 之间有查询，可能读到中间状态（但由于数据库事务串行，最终一致）
 
@@ -409,7 +473,7 @@ SQL 索引队列（[queue.go](file:///d:/fz/0601/solo-dogfeeding/code/300-siyuan
 | **索引判断** | `isAttr(name)` 返回 true → 写入 attributes 表 | `strings.HasPrefix(name, "custom-")` |
 | **类型标记** | attributes.type: `"b"`（块级）/ `"s"`（行级 span 级） | `buildAttributeFromNode` |
 | **缓存同步** | 属性修改后同步写入 `blockIALCache` | `cache.PutBlockIAL` |
-| **搜索索引** | 随 blocks.ial / blocks_fts 全文可搜 | `upsertTree` |
+| **搜索索引** | 随 blocks.ial / blocks_fts 全文可搜 | `upsertTree`（blocks 增量 + attributes 全量） |
 
 ### 9.2 扩展字段在属性视图（Attribute View）中的深度集成
 
@@ -468,12 +532,12 @@ SQL 索引队列（[queue.go](file:///d:/fz/0601/solo-dogfeeding/code/300-siyuan
 │  └─────┼───────┼───────┼───────┼─────────┼──────────────────────────────┘     │
 │        ▼       ▼       ▼       ▼         ▼                                    │
 │  ┌──────────────────────────────────────────────────────────────────────┐     │
-│  │ FlushQueue → execOp → upsertTree（Hash增量对比）                     │     │
-│  │   → fromTree（提取 blocks/spans/assets/attributes）                  │     │
-│  │     ├─ blocks 表: tag 列、ial 列、FTS 全文索引                        │     │
-│  │     ├─ spans 表:  type='tag' 的标签行（标签面板/搜索）                 │     │
-│  │     ├─ attributes 表: custom-* 和内置属性逐行存储                     │     │
-│  │     └─ refs/blocks_fts 等辅助索引                                     │     │
+│  │ FlushQueue → execOp → upsertTree                                     │     │
+│  │   ├─ blocks 表：Hash 增量对比（仅变化的块先删后插）                    │     │
+│  │   ├─ spans 表： 整文档全量删 + 全量插（标签/链接/图片等行内元素）       │     │
+│  │   ├─ assets 表：整文档全量删 + 全量插                                  │     │
+│  │   ├─ attributes 表：整文档全量删 + 全量插（custom-* + 内置属性逐行）    │     │
+│  │   └─ refs / file_annotation_refs：整文档全量删 + 全量插                │     │
 │  └──────────────────────────────────────────────────────────────────────┘     │
 └──────────────────────────────────────────────────────────────────────────────┘
                                                            │
@@ -505,9 +569,10 @@ SQL 索引队列（[queue.go](file:///d:/fz/0601/solo-dogfeeding/code/300-siyuan
 | 风险点 | 严重程度 | 说明 |
 |--------|---------|------|
 | **大标签重命名 O(N×M)** | 高 | 标签使用量极大时，RenameTag 会遍历 `treeBlocks` 加载每棵文档树，涉及大量文件 IO + 解析 + 重写 |
-| **upsert 全 spans 重建** | 中 | `upsertTree` 中无论块是否变化，都会 `deleteSpansByRootID` + `insertSpans`，如果文档含大量标签/链接，spans 表重建开销不可忽略 |
+| **子表全量重建开销** | 中 | `upsertTree` 中 spans/assets/attributes/refs 全部全量删除后重插。如果文档含大量标签、链接、图片或 custom 属性，子表重建开销不可忽略，即使只改了一个块 |
 | **标签构建全量扫描** | 中 | `BuildTags` 每次都调用 `QueryTagSpans("")` 全表扫描 spans，标签数量巨大时可能影响面板刷新 |
 | **随机休眠策略** | 低 | RenameTag/RemoveTag 中的 `RandomSleep` 在大量文档时会显著拉长操作时间，但避免了 UI 线程阻塞 |
+| **spans 双删除冗余** | 低 | `insertTree0` 中 spans 插入前会再删一次（双保险），存在冗余删除操作，但单次删除性能影响可忽略 |
 
 ### 11.3 正确性风险
 
@@ -516,6 +581,7 @@ SQL 索引队列（[queue.go](file:///d:/fz/0601/solo-dogfeeding/code/300-siyuan
 | **标签前缀误替换** | 中 | RenameTag 使用 `strings.Replace(docTag, oldLabel, newLabel, 1)`，若标签名是另一个标签名的子串（如 `a/b` 与 `aa/b`）且未用 `/` 边界严格校验，可能误替换（虽然有 `HasPrefix(oldLabel+"/")` 判断，但 `Replace` 本身不保证位置） |
 | **属性大小写敏感丢失** | 中 | 强制属性名小写可能破坏用户对大小写区分的预期，尤其是通过 API 导入的外部数据 |
 | **custom 属性未验证值类型** | 低 | 属性值统一为 string，由调用方自行负责 JSON/数字/日期的序列化与解析 |
+| **子表重建丢失增量** | 低 | 子表全量重建意味着每次保存都要删插所有 attribute/span 记录，理论上存在事务失败导致索引残缺的风险，但 SQLite 事务原子性保证了要么全成要么全败 |
 
 ### 11.4 安全风险
 
@@ -539,7 +605,7 @@ SQL 索引队列（[queue.go](file:///d:/fz/0601/solo-dogfeeding/code/300-siyuan
 | V-05 | 删除带属性的块 | 给块设置多个 custom 属性后删除该块 | attributes 表对应行被同步删除，无残留 |
 | V-06 | 标签面板增量刷新 | 编辑文档添加 `#新标签#`，观察标签面板 | 面板自动刷新，新标签出现且计数正确 |
 | V-07 | 重命名后属性视图同步 | 属性视图使用某 custom 属性过滤，重命名属性关联块的标签后 | 属性视图中的标签文本/块内容同步更新 |
-| V-08 | upsert Hash 正确性 | 仅修改块的 custom 属性（不改内容），执行保存 | 对应块被判定为 Hash 变化，属性索引同步更新 |
+| V-08 | upsert 增量正确性 | 文档有 100 个块，仅修改 1 个块的内容后保存 | blocks 表仅变化 1 块的 Hash，spans/assets/attributes 全部重建 |
 | V-09 | 标签嵌套计数准确性 | 标签 `a/b/c` 有 2 个块，`a/b` 有 1 个块，`a` 有 1 个块 | 标签树中：a.Count=4，a/b.Count=3，a/b/c.Count=2 |
 | V-10 | 只读模式属性保护 | 以只读角色登录，调用 setBlockAttrs API | 被拒绝，无任何修改 |
 
@@ -551,7 +617,8 @@ SQL 索引队列（[queue.go](file:///d:/fz/0601/solo-dogfeeding/code/300-siyuan
 | P-02 | 属性高频写入 | 1000 次/s 频率调用 setBlockAttrs 修改同一块属性 | 队列无堆积，最终值一致，无内存泄漏 |
 | P-03 | 标签树构建性能 | spans 表 10 万行 tag 记录，BuildTags 单次调用 | 耗时 < 500ms |
 | P-04 | 跨文档批量属性设置 | 1000 个不同文档的各 1 个块，BatchSetBlockAttrs | 耗时 < 10s，所有 blocks/attributes 表正确更新 |
-| P-05 | 重启后索引完整性 | 批量修改过程中强制 kill 进程，重启后重建索引 | 索引一致性校验通过，无 orphan 行 |
+| P-05 | 大文档子表重建开销 | 文档含 1000 个 spans、500 个 attributes，仅修改 1 个块后保存 | 测试子表全量重建的耗时占比 |
+| P-06 | 重启后索引完整性 | 批量修改过程中强制 kill 进程，重启后重建索引 | 索引一致性校验通过，无 orphan 行 |
 
 ### 12.3 异常与边界测试
 
@@ -564,30 +631,32 @@ SQL 索引队列（[queue.go](file:///d:/fz/0601/solo-dogfeeding/code/300-siyuan
 | E-05 | 递归标签路径 | `a/a/a/.../a`（深度 50） | 正常显示，渲染无栈溢出 |
 | E-06 | 属性值超长 | custom 属性值 100KB 字符串 | 正常存储、搜索不崩溃 |
 | E-07 | 删除不存在的标签 | removeTag 传入从未使用过的标签名 | 静默成功，无副作用 |
+| E-08 | upsert 事务中断 | 在 upsertTree 执行到一半时模拟崩溃 | 重启后数据完整，无半写状态 |
 
 ---
 
 ## 13. 关键文件索引
 
-| 文件 | 核心内容 | 关键行 |
-|------|---------|-------|
-| [tag.go](file:///d:/fz/0601/solo-dogfeeding/code/300-siyuan/kernel/model/tag.go) | 标签业务逻辑核心：RenameTag、RemoveTag、BuildTags、SearchTags | L35-L432 |
-| [blockial.go](file:///d:/fz/0601/solo-dogfeeding/code/300-siyuan/kernel/model/blockial.go) | 属性读写：SetBlockAttrs、BatchSetBlockAttrs、setNodeAttrs0、isValidAttrName | L38-L372 |
-| [transaction.go](file:///d:/fz/0601/solo-dogfeeding/code/300-siyuan/kernel/model/transaction.go) | 事务处理：flushTx、performTx、doLargeInsert、doSetAttrs | L57-L1709 |
-| [index.go](file:///d:/fz/0601/solo-dogfeeding/code/300-siyuan/kernel/model/index.go) | 全量/增量索引调度、Box.Index、嵌入块索引 | L49-L442 |
-| [queue.go](file:///d:/fz/0601/solo-dogfeeding/code/300-siyuan/kernel/sql/queue.go) | SQL 异步队列、操作去重合并、FlushQueue | L37-L437 |
-| [upsert.go](file:///d:/fz/0601/solo-dogfeeding/code/300-siyuan/kernel/sql/upsert.go) | 增量 upsert 实现、Hash 对比、批量插入 | L39-L541 |
-| [span.go](file:///d:/fz/0601/solo-dogfeeding/code/300-siyuan/kernel/sql/span.go) | 标签 Span 查询：QueryTagSpans* 系列函数 | L40-L173 |
-| [database.go](file:///d:/fz/0601/solo-dogfeeding/code/300-siyuan/kernel/sql/database.go) | fromTree、tagFromNode、buildAttributeFromNode、isAttr | L520-L615, L913-L944 |
-| [attribute.go](file:///d:/fz/0601/solo-dogfeeding/code/300-siyuan/kernel/sql/attribute.go) | Attribute 结构体定义 | L19-L28 |
-| [ial.go](file:///d:/fz/0601/solo-dogfeeding/code/300-siyuan/kernel/cache/ial.go) | Ristretto 缓存实现 | L25-L79 |
-| [Tag.ts](file:///d:/fz/0601/solo-dogfeeding/code/300-siyuan/app/src/layout/dock/Tag.ts) | 前端标签面板：Tree 渲染、事件订阅、排序、刷新 | L15-L204 |
-| [tag.ts](file:///d:/fz/0601/solo-dogfeeding/code/300-siyuan/app/src/menus/tag.ts) | 标签右键菜单：重命名、删除 | L10-L42 |
-| [tag.go (API)](file:///d:/fz/0601/solo-dogfeeding/code/300-siyuan/kernel/api/tag.go) | 标签 HTTP 接口：getTag/renameTag/removeTag | L28-L110 |
-| [attr.go (API)](file:///d:/fz/0601/solo-dogfeeding/code/300-siyuan/kernel/api/attr.go) | 属性 HTTP 接口：setBlockAttrs/batchSetBlockAttrs 等 | L31-L196 |
-| [file.go](file:///d:/fz/0601/solo-dogfeeding/code/300-siyuan/kernel/model/file.go) | writeTreeUpsertQueue、indexWriteTreeUpsertQueue 关键链路函数 | L944-L994 |
+| 文件 | 核心内容 | 关键行（约） |
+|------|---------|-------------|
+| `kernel/model/tag.go` | 标签业务逻辑核心：RenameTag、RemoveTag、BuildTags、SearchTags | L35-L432 |
+| `kernel/model/blockial.go` | 属性读写：SetBlockAttrs、BatchSetBlockAttrs、setNodeAttrs0、isValidAttrName | L38-L372 |
+| `kernel/model/transaction.go` | 事务处理：flushTx、performTx、doLargeInsert、doSetAttrs | L57-L1709 |
+| `kernel/model/index.go` | 全量/增量索引调度、Box.Index、嵌入块索引 | L49-L442 |
+| `kernel/model/file.go` | writeTreeUpsertQueue、indexWriteTreeUpsertQueue 关键链路函数 | L944-L994 |
+| `kernel/sql/queue.go` | SQL 异步队列、操作去重合并、FlushQueue | L37-L437 |
+| `kernel/sql/upsert.go` | upsertTree 核心实现、blocks Hash 增量、子表全量重建 | L399-L493 |
+| `kernel/sql/span.go` | 标签 Span 查询：QueryTagSpans* 系列函数 | L40-L173 |
+| `kernel/sql/database.go` | fromTree、tagFromNode、buildAttributeFromNode、isAttr、各表删除函数 | L520-L615, L968-L1140 |
+| `kernel/sql/attribute.go` | Attribute 结构体定义 | L19-L28 |
+| `kernel/cache/ial.go` | Ristretto 缓存实现：blockIALCache、docIALCache | L25-L79 |
+| `kernel/api/tag.go` | 标签 HTTP 接口：getTag/renameTag/removeTag | L28-L110 |
+| `kernel/api/attr.go` | 属性 HTTP 接口：setBlockAttrs/batchSetBlockAttrs 等 | L31-L196 |
+| `app/src/layout/dock/Tag.ts` | 前端标签面板：Tree 渲染、事件订阅、排序、刷新 | L15-L204 |
+| `app/src/menus/tag.ts` | 标签右键菜单：重命名、删除 | L10-L42 |
 
 ---
 
 **文档生成时间**：2026-06-15
 **分析范围**：SiYuan kernel（Go）+ app（TypeScript）核心源码
+**修正记录**：v2 - 修正 upsertTree 增量更新理解：仅 blocks 表做 Hash 增量，spans/assets/attributes/refs 均为整文档全量重建
