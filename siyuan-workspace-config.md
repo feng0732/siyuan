@@ -46,22 +46,22 @@ SiYuan 采用 **前后端分离** 的单体架构：
 
 ### 2.1 Kernel 启动全链路
 
-启动入口在 [kernel/main.go#L30-L59](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/kernel/main.go#L30-L59)，执行顺序严格依赖：
+启动入口在 [kernel/main.go#L30-L59](kernel/main.go#L30-L59)，执行顺序严格依赖：
 
 | 步骤 | 函数 | 核心职责 | 关键代码位置 |
 |------|------|----------|-------------|
-| 1 | `util.Boot()` | 解析命令行参数、初始化工作空间路径、加锁 | [util/working.go#L84-L172](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/kernel/util/working.go#L84-L172) |
-| 2 | `model.InitConf()` | 加载 conf.json、合并默认值、语言初始化 | [model/conf.go#L123-L625](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/kernel/model/conf.go#L123-L625) |
-| 3 | `server.Serve()` | 启动 HTTP+WebSocket 服务、写入 port.json | [server/serve.go#L133-L273](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/kernel/server/serve.go#L133-L273) |
+| 1 | `util.Boot()` | 解析命令行参数、初始化工作空间路径、加锁 | [util/working.go#L84-L172](kernel/util/working.go#L84-L172) |
+| 2 | `model.InitConf()` | 加载 conf.json、合并默认值、语言初始化 | [model/conf.go#L123-L625](kernel/model/conf.go#L123-L625) |
+| 3 | `server.Serve()` | 启动 HTTP+WebSocket 服务、写入 port.json | [server/serve.go#L133-L273](kernel/server/serve.go#L133-L273) |
 | 4 | `model.InitAppearance()` | 主题/图标初始化 | — |
 | 5 | `sql.Init*Database()` | SQLite 数据库初始化（主库/历史/资源内容/块树） | — |
-| 6 | `model.BootSyncData()` | 启动数据同步引擎（先获取云端增量→本地索引→再落盘） | [model/sync.go#L124-L158](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/kernel/model/sync.go#L124-L158) |
-| 7 | `model.InitBoxes()` | 加载所有笔记本（Box）配置 | [model/conf.go#L1001-L1013](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/kernel/model/conf.go#L1001-L1013) |
+| 6 | `model.BootSyncData()` | 启动数据同步引擎（先获取云端增量→本地索引→再落盘） | [model/sync.go#L124-L158](kernel/model/sync.go#L124-L158) |
+| 7 | `model.InitBoxes()` | 加载所有笔记本（Box）配置 | [model/conf.go#L1001-L1013](kernel/model/conf.go#L1001-L1013) |
 | 8 | `util.SetBooted()` | 标记启动完成，清理进度遮罩 | — |
 
 ### 2.2 工作空间路径决策
 
-路径决策逻辑在 [util/working.go#L246-L322](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/kernel/util/working.go#L246-L322)，优先级如下：
+路径决策逻辑在 [util/working.go#L246-L322](kernel/util/working.go#L246-L322)，优先级如下：
 
 1. **命令行参数** `--workspace` > 环境变量 `SIYUAN_WORKSPACE_PATH`
 2. **workspace.json** 最后一条记录（最近使用），位于 `~/.config/siyuan/workspace.json`
@@ -81,11 +81,11 @@ ok, err := WorkspaceLock.TryLock()   // 非阻塞尝试加锁
 if !ok { os.Exit(ExitCodeWorkspaceLocked) }
 ```
 
-退出时通过 [util/working.go#L537-L551](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/kernel/util/working.go#L537-L551) `UnlockWorkspace` 释放锁并删除 `.lock` 文件。
+退出时通过 [util/working.go#L537-L551](kernel/util/working.go#L537-L551) `UnlockWorkspace` 释放锁并删除 `.lock` 文件。
 
 ### 2.4 前端启动与配置获取
 
-前端在 [app/src/index.ts#L217-L242](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/app/src/index.ts#L217-L242) 中按以下链路初始化：
+前端在 [app/src/index.ts#L217-L242](app/src/index.ts#L217-L242) 中按以下链路初始化：
 
 ```
 fetchPost(/api/system/getConf)
@@ -104,8 +104,8 @@ fetchPost(/api/system/getConf)
 
 | 层级 | 位置 | 文件名 | 结构定义 | 保存时机 |
 |------|------|--------|----------|---------|
-| **全局应用级** | `{workspace}/conf/` | `conf.json` | [model/conf.go#L52-L89](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/kernel/model/conf.go#L52-L89) `AppConf` | `Save()` 调用 + `InitConf()` 合并默认值后 |
-| **笔记本级** | `{workspace}/data/{boxID}/.siyuan/` | `conf.json` | [conf/box.go#L22-L34](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/kernel/conf/box.go#L22-L34) `BoxConf` | 笔记本设置变更 API |
+| **全局应用级** | `{workspace}/conf/` | `conf.json` | [model/conf.go#L52-L89](kernel/model/conf.go#L52-L89) `AppConf` | `Save()` 调用 + `InitConf()` 合并默认值后 |
+| **笔记本级** | `{workspace}/data/{boxID}/.siyuan/` | `conf.json` | [conf/box.go#L22-L34](kernel/conf/box.go#L22-L34) `BoxConf` | 笔记本设置变更 API |
 | **用户家目录级** | `~/.config/siyuan/` | `workspace.json`/`port.json`/`cookie.key` | — | 工作空间切换、端口分配、首次启动 |
 
 ### 3.2 AppConf 核心字段
@@ -158,7 +158,7 @@ fetchPost(/api/system/getConf)
 
 ### 4.1 配置变更的标准流程
 
-所有配置变更遵循 **「内存修改 → 条件落盘 → 广播通知」** 三步曲。以设置编辑器只读状态为例，参见 [api/setting.go#L33-L52](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/kernel/api/setting.go#L33-L52)：
+所有配置变更遵循 **「内存修改 → 条件落盘 → 广播通知」** 三步曲。以设置编辑器只读状态为例，参见 [api/setting.go#L33-L52](kernel/api/setting.go#L33-L52)：
 
 ```
 1. 修改内存：   model.Conf.Editor.ReadOnly = readOnly
@@ -169,7 +169,7 @@ fetchPost(/api/system/getConf)
 
 ### 4.2 Save() 保存机制的原子性与字节对比
 
-[model/conf.go#L870-L891](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/kernel/model/conf.go#L870-L891) 实现了 **读-对比-写** 流程：
+[model/conf.go#L870-L891](kernel/model/conf.go#L870-L891) 实现了 **读-对比-写** 流程：
 
 ```go
 func (conf *AppConf) Save() {
@@ -204,15 +204,15 @@ func (conf *AppConf) Save() {
 ### 4.4 UILayout 布局保存的特殊路径
 
 **主窗口布局** 保存路径与普通配置不同：
-- 前端主动触发：[app/src/layout/util.ts#L128-L168](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/app/src/layout/util.ts#L128-L168) `saveLayout()`
+- 前端主动触发：[app/src/layout/util.ts#L128-L168](app/src/layout/util.ts#L128-L168) `saveLayout()`
 - 调用 API：`POST /api/system/setUILayout`
-- 后端处理：[api/system.go#L570-L599](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/kernel/api/system.go#L570-L599) → `model.Conf.SetUILayout()` → `Save()`
+- 后端处理：[api/system.go#L570-L599](kernel/api/system.go#L570-L599) → `model.Conf.SetUILayout()` → `Save()`
 
 **子窗口布局** 保存在 `sessionStorage`（仅当前窗口生命周期），不落盘。
 
 ### 4.5 退出时的屏障顺序（已核实）
 
-[model/conf.go#L738-L832](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/kernel/model/conf.go#L738-L832) `Close(force, setCurrentWorkspace, execInstallPkg)` 执行顺序为 **15 步严格编排**：
+[model/conf.go#L738-L832](kernel/model/conf.go#L738-L832) `Close(force, setCurrentWorkspace, execInstallPkg)` 执行顺序为 **15 步严格编排**：
 
 | 序号 | 代码位置 | 动作 | 说明 |
 |------|---------|------|------|
@@ -240,7 +240,7 @@ func (conf *AppConf) Save() {
 
 ### 5.1 WebSocket 会话分组
 
-内核通过两级 `sync.Map` 管理所有前端连接，定义于 [util/websocket.go#L30-L36](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/kernel/util/websocket.go#L30-L36)：
+内核通过两级 `sync.Map` 管理所有前端连接，定义于 [util/websocket.go#L30-L36](kernel/util/websocket.go#L30-L36)：
 
 ```go
 sessions     = sync.Map{}  // {appId, {sessionId, *melody.Session}}
@@ -257,7 +257,7 @@ authSessions = sync.Map{}  // 授权页单独存储
 
 ### 5.2 六种广播模式（已核实）
 
-[util/result.go#L27-L32](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/kernel/util/result.go#L27-L32) 定义了六种 PushMode 常量：
+[util/result.go#L27-L32](kernel/util/result.go#L27-L32) 定义了六种 PushMode 常量：
 
 | 常量 | 值 | 语义 | 分发函数 | 典型场景 |
 |------|---|------|---------|---------|
@@ -268,13 +268,13 @@ authSessions = sync.Map{}  // 授权页单独存储
 | `PushModeBroadcastApp` | 5 | 同一 App 内所有会话 | `broadcastApp()` | 单窗口内多面板同步（如 main→protyle） |
 | `PushModeBroadcastMainExcludeSelfApp` | 6 | 排除当前 App 外所有 main 频道 | `broadcastOtherAppMains()` | 跨窗口布局变更通知 |
 
-六种模式在 [util/websocket.go#L383-L400](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/kernel/util/websocket.go#L383-L400) `PushEvent()` 中通过 `switch mode` 分发。
+六种模式在 [util/websocket.go#L383-L400](kernel/util/websocket.go#L383-L400) `PushEvent()` 中通过 `switch mode` 分发。
 
 **注意**：`PushMode` 值 **3 不存在**（0/1/2/4/5/6），是历史兼容跳过的编号。
 
 ### 5.3 BroadcastChannel 频道机制
 
-除主 WebSocket 外，还有独立的 [api/broadcast.go](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/kernel/api/broadcast.go) 通道系统，支持：
+除主 WebSocket 外，还有独立的 [api/broadcast.go](kernel/api/broadcast.go) 通道系统，支持：
 - WebSocket + SSE（Server-Sent Events）双协议
 - 按频道名隔离订阅者（`sync.Map` 引用计数）
 - `Destroy(force)`：无订阅者 + 非强制时延迟销毁
@@ -282,16 +282,16 @@ authSessions = sync.Map{}  // 授权页单独存储
 ### 5.4 Electron 多窗口间的 IPC 桥
 
 桌面端额外通过 Electron IPC 实现窗口间通信：
-- **主窗口 → 子窗口**：`Constants.SIYUAN_SEND_WINDOWS` → [app/src/window/onWindowsMsg.ts](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/app/src/window/onWindowsMsg.ts)
-- **子窗口创建**：[app/src/window/openNewWindow.ts](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/app/src/window/openNewWindow.ts) 将当前 Tab 的布局 JSON 通过 URL 参数 `?layout=` 传给新窗口
+- **主窗口 → 子窗口**：`Constants.SIYUAN_SEND_WINDOWS` → [app/src/window/onWindowsMsg.ts](app/src/window/onWindowsMsg.ts)
+- **子窗口创建**：[app/src/window/openNewWindow.ts](app/src/window/openNewWindow.ts) 将当前 Tab 的布局 JSON 通过 URL 参数 `?layout=` 传给新窗口
 - 子窗口仅在 `sessionStorage` 中保存自己的局部布局（`saveLayout` → `window.sessionStorage.layout`），不调用后端 API
 
 ### 5.5 前端消息分发链路
 
 所有 WebSocket 消息到达前端后经过两级分发：
 
-1. **[app/src/util/processMessage.ts#L10-L77](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/app/src/util/processMessage.ts#L10-L77)**：处理通用消息（msg、进度条、reloadui）
-2. **[app/src/index.ts#L73-L211](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/app/src/index.ts#L73-L211)** ws-main 回调：处理 30+ 种业务消息（setConf、reloaddoc、readonly、syncing、exit 等）
+1. **[app/src/util/processMessage.ts#L10-L77](app/src/util/processMessage.ts#L10-L77)**：处理通用消息（msg、进度条、reloadui）
+2. **[app/src/index.ts#L73-L211](app/src/index.ts#L73-L211)** ws-main 回调：处理 30+ 种业务消息（setConf、reloaddoc、readonly、syncing、exit 等）
 
 ---
 
@@ -303,7 +303,7 @@ authSessions = sync.Map{}  // 授权页单独存储
 
 ### 6.2 指针区分「未设置」与「设置为零」
 
-对于需要区分「用户未设置该字段」和「用户显式设置为 0」的场景，使用指针类型。参见 [model/conf.go#L257-L300](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/kernel/model/conf.go#L257-L300)：
+对于需要区分「用户未设置该字段」和「用户显式设置为 0」的场景，使用指针类型。参见 [model/conf.go#L257-L300](kernel/model/conf.go#L257-L300)：
 
 ```go
 // 新增字段的默认值，使用指针类型来区分字段不存在（nil）和用户设置为 0（非 nil）
@@ -324,12 +324,12 @@ if nil == Conf.Editor.FloatWindowDelay {
 
 | 配置项 | 范围 | 代码位置 |
 |--------|------|---------|
-| `Editor.FontSize` | [9, 72] | [model/conf.go#L274](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/kernel/model/conf.go#L274) |
-| `FileTree.MaxOpenTabCount` | [8, 32] | [model/conf.go#L222-L227](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/kernel/model/conf.go#L222-L227) |
-| `Sync.Interval` | [30s, 12h] | [model/sync.go#L394-L404](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/kernel/model/sync.go#L394-L404) |
-| `Editor.HistoryRetentionDays` | [30, 3650] | [model/conf.go#L289-L294](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/kernel/model/conf.go#L289-L294) |
-| `AI.OpenAI.APITemperature` | (0, 2] | [model/conf.go#L560-L562](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/kernel/model/conf.go#L560-L562) |
-| `Flashcard.Weights` | 长度=19 且均为合法数字 | [model/conf.go#L514-L540](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/kernel/model/conf.go#L514-L540) |
+| `Editor.FontSize` | [9, 72] | [model/conf.go#L274](kernel/model/conf.go#L274) |
+| `FileTree.MaxOpenTabCount` | [8, 32] | [model/conf.go#L222-L227](kernel/model/conf.go#L222-L227) |
+| `Sync.Interval` | [30s, 12h] | [model/sync.go#L394-L404](kernel/model/sync.go#L394-L404) |
+| `Editor.HistoryRetentionDays` | [30, 3650] | [model/conf.go#L289-L294](kernel/model/conf.go#L289-L294) |
+| `AI.OpenAI.APITemperature` | (0, 2] | [model/conf.go#L560-L562](kernel/model/conf.go#L560-L562) |
+| `Flashcard.Weights` | 长度=19 且均为合法数字 | [model/conf.go#L514-L540](kernel/model/conf.go#L514-L540) |
 
 ### 6.4 废弃字段自动迁移
 
@@ -349,7 +349,7 @@ if "" != Conf.Export.DocxTemplate {
 
 ### 6.5 语言缺失项兜底
 
-多语言配置文件采用「目标语言 + en_US 合并」策略，参见 [server/serve.go#L468-L506](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/kernel/server/serve.go#L468-L506)：
+多语言配置文件采用「目标语言 + en_US 合并」策略，参见 [server/serve.go#L468-L506](kernel/server/serve.go#L468-L506)：
 - 加载目标语言 JSON
 - 遍历 en_US.json 的所有 key
 - 目标语言缺失的 key 自动用 en_US 值填充
@@ -360,7 +360,7 @@ if "" != Conf.Export.DocxTemplate {
 
 ### 7.1 全局 conf.json 损坏
 
-在 [model/conf.go#L127-L138](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/kernel/model/conf.go#L127-L138)：
+在 [model/conf.go#L127-L138](kernel/model/conf.go#L127-L138)：
 
 ```go
 confPath := filepath.Join(util.ConfDir, "conf.json")
@@ -378,7 +378,7 @@ if gulu.File.IsExist(confPath) {
 
 ### 7.2 笔记本 conf.json 损坏
 
-在 [model/box.go#L110-L132](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/kernel/model/box.go#L110-L132) `ListNotebooks()` 中：
+在 [model/box.go#L110-L132](kernel/model/box.go#L110-L132) `ListNotebooks()` 中：
 
 ```go
 boxConfPath := filepath.Join(boxDirPath, ".siyuan", "conf.json")
@@ -401,14 +401,14 @@ if !isExistConf {
 
 ### 7.3 用户指南笔记本自动清理
 
-[model/conf.go#L1200-L1273](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/kernel/model/conf.go#L1200-L1273) `closeUserGuide()` 在退出时执行：
+[model/conf.go#L1200-L1273](kernel/model/conf.go#L1200-L1273) `closeUserGuide()` 在退出时执行：
 - 检测用户指南笔记本的 conf.json 是否损坏
 - 损坏时自动删除整个笔记本目录
 - 新用户启动时通过 `NewUserGuide()` 重新生成
 
 ### 7.4 FSRS 闪卡权重损坏
 
-对 FSRS 算法权重的双重校验（[model/conf.go#L514-L540](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/kernel/model/conf.go#L514-L540)）：
+对 FSRS 算法权重的双重校验（[model/conf.go#L514-L540](kernel/model/conf.go#L514-L540)）：
 1. 长度校验：必须恰好 19 个逗号分隔值
 2. 数字校验：每个值必须是合法浮点数
 3. 任一校验失败 → 重置为默认权重 + `BroadcastByType("main", "msg", ...)` 推送用户通知
@@ -425,7 +425,7 @@ if !isExistConf {
 
 ### 8.1 容器类型与路径适配
 
-SiYuan 支持五种容器类型，定义于 [util/working.go#L395-L404](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/kernel/util/working.go#L395-L404)：
+SiYuan 支持五种容器类型，定义于 [util/working.go#L395-L404](kernel/util/working.go#L395-L404)：
 
 | 容器 | 常量值 | 主要差异 |
 |------|--------|---------|
@@ -435,7 +435,7 @@ SiYuan 支持五种容器类型，定义于 [util/working.go#L395-L404](file:///
 
 ### 8.2 iOS 沙箱路径适配
 
-[util/working.go#L324-L361](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/kernel/util/working.go#L324-L361) `ReadWorkspacePaths()` 对 iOS 进行特殊处理：
+[util/working.go#L324-L361](kernel/util/working.go#L324-L361) `ReadWorkspacePaths()` 对 iOS 进行特殊处理：
 
 ```go
 if ContainerIOS == Container && strings.Contains(d, "/Documents/") {
@@ -447,19 +447,19 @@ if ContainerIOS == Container && strings.Contains(d, "/Documents/") {
 
 ### 8.3 同步 Provider 与四种触发时机
 
-`Sync` 配置支持四种 Provider（[conf/sync.go#L73-L78](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/kernel/conf/sync.go#L73-L78)）：
+`Sync` 配置支持四种 Provider（[conf/sync.go#L73-L78](kernel/conf/sync.go#L73-L78)）：
 1. **`ProviderSiYuan = 0`**：SiYuan 官方云（需订阅 Pro）
 2. **`ProviderS3 = 2`**：S3 兼容对象存储
 3. **`ProviderWebDAV = 3`**：WebDAV 协议
 4. **`ProviderLocal = 4`**：本地目录路径（局域网/NAS 场景）
 
-四种同步触发时机由 `Sync.Mode` 控制（[conf/sync.go#L23](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/kernel/conf/sync.go#L23)）：
+四种同步触发时机由 `Sync.Mode` 控制（[conf/sync.go#L23](kernel/conf/sync.go#L23)）：
 - `Mode = 0`：兼容旧配置，`InitConf` 中自动转换为 1
 - **`Mode = 1` 自动**：启动、退出、`SyncInterval` 定时、感知 WS 通知、手动触发
 - **`Mode = 2` 手动（启动+退出）**：仅启动和退出时同步
 - **`Mode = 3` 完全手动**：仅用户点击「同步」按钮时同步
 
-此外连续 8 次自动同步失败 → 推迟 64 分钟再同步（[model/sync.go#L265-L270](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/kernel/model/sync.go#L265-L270)）。
+此外连续 8 次自动同步失败 → 推迟 64 分钟再同步（[model/sync.go#L265-L270](kernel/model/sync.go#L265-L270)）。
 
 ### 8.4 同步主流程（syncRepo）
 
@@ -472,7 +472,7 @@ if ContainerIOS == Container && strings.Contains(d, "/Documents/") {
 | `BootSyncData()` | `bootSyncRepo()` → `repo.GetCloudLatest()` + `repo.GetSyncCloudFiles()` + 本地索引 | 启动同步（并行执行索引与拉取元数据） |
 | **`SyncData()` / `syncData()`** | **`repo.Sync(syncContext)`** | **常规同步与退出前同步：先 Download 再 Upload 的统一流程** |
 
-常规同步核心流程位于 [model/repository.go#L1510-L1606](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/kernel/model/repository.go#L1510-L1606) `syncRepo()`：
+常规同步核心流程位于 [model/repository.go#L1510-L1606](kernel/model/repository.go#L1510-L1606) `syncRepo()`：
 
 ```
 1. indexRepoBeforeCloudSync(repo)   // 本地构建快照索引（beforeIndex, afterIndex）
@@ -490,7 +490,7 @@ dataChanged = nil == beforeIndex || beforeIndex.ID != afterIndex.ID || mergeResu
 
 ### 8.5 冲突处理策略（已核实代码证据）
 
-冲突处理的核心在 [model/repository.go#L1632-L1681](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/kernel/model/repository.go#L1632-L1681) `processSyncMergeResult()`：
+冲突处理的核心在 [model/repository.go#L1632-L1681](kernel/model/repository.go#L1632-L1681) `processSyncMergeResult()`：
 
 **dejavu 库的 MergeResult 包含三类文件集合：**
 ```go
@@ -501,7 +501,7 @@ mergeResult.Removes     // 需要删除的文件列表
 
 **实际处理逻辑（两种模式）：**
 
-1. **默认模式**（`Sync.GenerateConflictDoc = false`，[conf/sync.go#L40](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/kernel/conf/sync.go#L40)）：
+1. **默认模式**（`Sync.GenerateConflictDoc = false`，[conf/sync.go#L40](kernel/conf/sync.go#L40)）：
    - `mergeResult.Conflicts` 中的文件 **直接接受 dejavu 库内部的合并结果**（具体策略由 dejavu 外部库决定，内核源码中无法直接查看）
    - 不生成任何冲突副本
    - 用户无法感知发生了冲突
@@ -532,7 +532,7 @@ mergeResult.Removes     // 需要删除的文件列表
 - 浏览器书签无需更新
 - TLS 证书绑定固定端口
 
-实现于 [server/proxy/](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/kernel/server/proxy/) 包。
+实现于 [server/proxy/](kernel/server/proxy/) 包。
 
 ---
 
@@ -542,23 +542,23 @@ mergeResult.Removes     // 需要删除的文件列表
 
 | 风险 | 等级 | 说明 | 证据位置 |
 |------|------|------|---------|
-| **conf.json 损坏不可逆** | ⚠️ 中高 | 损坏后仅 `NewAppConf()` + 默认值覆盖，**无版本历史或备份文件机制**，用户所有全局自定义配置（主题、快捷键、AI 密钥等）完全丢失 | [model/conf.go#L127-L138](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/kernel/model/conf.go#L127-L138) |
-| **同步冲突静默丢失** | ⚠️ 中高 | `GenerateConflictDoc=false`（默认）时，两端同时修改同一 `.sy` 文件 → dejavu 算法判定的冲突文件版本直接覆盖本地副本，**无用户通知、无历史对比** | [model/repository.go#L1642-L1681](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/kernel/model/repository.go#L1642-L1681) + [conf/sync.go#L40](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/kernel/conf/sync.go#L40) |
-| **Save() 的 TOCTOU 窗口** | ⚠️ 中 | `Conf.m.Lock()` 仅保护内存，`filelock.ReadFile` → `bytes.Equal` → `filelock.WriteFile` 之间没有文件级锁，极端并发（多内核进程/外部脚本写 conf.json）下可能丢失写 | [model/conf.go#L870-L891](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/kernel/model/conf.go#L870-L891) |
-| **工作空间锁崩溃残留** | ⚠️ 中 | 进程崩溃（蓝屏、`kill -9`、断电）后 `.lock` 文件残留，`flock.TryLock()` 直接拒绝启动，需用户手动删除 | [util/working.go:tryLockWorkspace](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/kernel/util/working.go) |
+| **conf.json 损坏不可逆** | ⚠️ 中高 | 损坏后仅 `NewAppConf()` + 默认值覆盖，**无版本历史或备份文件机制**，用户所有全局自定义配置（主题、快捷键、AI 密钥等）完全丢失 | [model/conf.go#L127-L138](kernel/model/conf.go#L127-L138) |
+| **同步冲突静默丢失** | ⚠️ 中高 | `GenerateConflictDoc=false`（默认）时，两端同时修改同一 `.sy` 文件 → dejavu 算法判定的冲突文件版本直接覆盖本地副本，**无用户通知、无历史对比** | [model/repository.go#L1642-L1681](kernel/model/repository.go#L1642-L1681) + [conf/sync.go#L40](kernel/conf/sync.go#L40) |
+| **Save() 的 TOCTOU 窗口** | ⚠️ 中 | `Conf.m.Lock()` 仅保护内存，`filelock.ReadFile` → `bytes.Equal` → `filelock.WriteFile` 之间没有文件级锁，极端并发（多内核进程/外部脚本写 conf.json）下可能丢失写 | [model/conf.go#L870-L891](kernel/model/conf.go#L870-L891) |
+| **工作空间锁崩溃残留** | ⚠️ 中 | 进程崩溃（蓝屏、`kill -9`、断电）后 `.lock` 文件残留，`flock.TryLock()` 直接拒绝启动，需用户手动删除 | [util/working.go:tryLockWorkspace](kernel/util/working.go) |
 
 ### 9.2 中风险项
 
 | 风险 | 说明 | 证据位置 |
 |------|------|---------|
 | **UILayout 超大 JSON** | 布局配置无大小限制，大量 Tab/Dock 打开时 conf.json 膨胀到数 MB，启动反序列化变慢 | 无显式大小限制，任意 SetUILayout 直接写入 |
-| **笔记本 conf.json 删除后重建延迟** | 检测到 parse 失败时 `filelock.Remove()` 但未写回新值，每次 `ListNotebooks()` 都会重走删除路径 | [model/box.go#L110-L132](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/kernel/model/box.go#L110-L132) |
+| **笔记本 conf.json 删除后重建延迟** | 检测到 parse 失败时 `filelock.Remove()` 但未写回新值，每次 `ListNotebooks()` 都会重走删除路径 | [model/box.go#L110-L132](kernel/model/box.go#L110-L132) |
 | **跨端路径大小写敏感** | Windows 不区分大小写，macOS 默认 APFS 可配置，Linux 区分。跨设备同步可能产生同名重复文件 | 无显式大小写归一化逻辑 |
-| **FSRS 权重默认值静默重置** | 格式校验失败时直接替换为 19 个默认值，可能导致闪卡学习曲线突变 | [model/conf.go#L514-L540](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/kernel/model/conf.go#L514-L540) |
-| **iOS 沙箱路径误判** | 硬编码 `strings.Contains(d, "/Documents/")`，若工作空间目录名恰好为 `Documents` 可能误切 | [util/working.go#L324-L361](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/kernel/util/working.go#L324-L361) |
+| **FSRS 权重默认值静默重置** | 格式校验失败时直接替换为 19 个默认值，可能导致闪卡学习曲线突变 | [model/conf.go#L514-L540](kernel/model/conf.go#L514-L540) |
+| **iOS 沙箱路径误判** | 硬编码 `strings.Contains(d, "/Documents/")`，若工作空间目录名恰好为 `Documents` 可能误切 | [util/working.go#L324-L361](kernel/util/working.go#L324-L361) |
 | **Docker 强制 bypass 环境变量** | `SIYUAN_ACCESS_AUTH_CODE_BYPASS=true` 可跳过访问授权码检查，部署时需警惕 | 路由层 `checkAuth` 中间件 |
-| **BroadcastChannel 引用计数清理延迟** | `Destroy(false)` 无订阅者时不立即清理，高频创建/销毁场景可能有短时 goroutine 堆积 | [api/broadcast.go:Destroy](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/kernel/api/broadcast.go) |
-| **SaveAssetsTexts 在 sql.CloseDatabase 之后** | `SaveAssetsTexts()`（L782）执行于 `sql.CloseDatabase()`（L781）**之后**，若 OCR 文本仍有 DB 写入则会失败 | [model/conf.go#L780-L783](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/kernel/model/conf.go#L780-L783) |
+| **BroadcastChannel 引用计数清理延迟** | `Destroy(false)` 无订阅者时不立即清理，高频创建/销毁场景可能有短时 goroutine 堆积 | [api/broadcast.go:Destroy](kernel/api/broadcast.go) |
+| **SaveAssetsTexts 在 sql.CloseDatabase 之后** | `SaveAssetsTexts()`（L782）执行于 `sql.CloseDatabase()`（L781）**之后**，若 OCR 文本仍有 DB 写入则会失败 | [model/conf.go#L780-L783](kernel/model/conf.go#L780-L783) |
 
 ### 9.3 低风险项
 
@@ -662,33 +662,33 @@ mergeResult.Removes     // 需要删除的文件列表
 
 | 模块 | 文件 | 核心职责 |
 |------|------|----------|
-| **全局配置管理** | [model/conf.go](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/kernel/model/conf.go) | InitConf / Save / Close（15 步编排）/ GetMaskedConf / SetUILayout |
-| **工作空间路径与锁** | [util/working.go](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/kernel/util/working.go) | initWorkspaceDir、flock 加解锁、workspace.json 读写、iOS 沙箱转换 |
-| **HTTP/WS 服务** | [server/serve.go](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/kernel/server/serve.go) | 路由注册、port.json、CORS、`checkAuth` 中间件、语言文件合并 |
-| **WS 广播分发** | [util/websocket.go](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/kernel/util/websocket.go) | 6 种 PushMode 分发、Broadcast\* 系列工具函数、会话两级 sync.Map 管理 |
-| **WS 消息结构** | [util/result.go](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/kernel/util/result.go) | Result 结构体、6 个 PushMode 常量、NewCmdResult |
-| **广播通道（WS+SSE）** | [api/broadcast.go](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/kernel/api/broadcast.go) | BroadcastChannel 结构体、Subscribe/Destroy、SSE、引用计数 |
-| **子设置 API** | [api/setting.go](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/kernel/api/setting.go) | 20+ 个字段 setter（ReadOnly / Keymap / Appearance 等），每 setter 三步曲 |
-| **系统 API** | [api/system.go](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/kernel/api/system.go) | getConf / setUILayout / getEmojiConf / bootProgress |
-| **工作空间 API** | [api/workspace.go](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/kernel/api/workspace.go) | switchWorkspace / getWorkspacesPath |
-| **笔记本 API 与模型** | [api/notebook.go](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/kernel/api/notebook.go) + [model/box.go](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/kernel/model/box.go) | setNotebookConf / ListNotebooks（含损坏笔记本检测） |
-| **同步主流程** | [model/sync.go](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/kernel/model/sync.go) | SyncData / BootSyncData / syncData / checkSync / SetSyncProvider\* |
-| **同步冲突处理与仓库** | [model/repository.go](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/kernel/model/repository.go) | syncRepo / bootSyncRepo / processSyncMergeResult / newRepository / syncRepoDownload / syncRepoUpload |
-| **配置结构体定义** | [conf/\*.go](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/kernel/conf/) | 20+ 子配置结构体 + New\*() 默认值构造函数（含 Sync.BoxConf.Layout 等） |
-| **CMD 异步命令框架** | [cmd/cmd.go](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/kernel/cmd/cmd.go) | Cmd 接口、`Exec()` goroutine 异步执行框架 |
-| **启动入口** | [main.go](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/kernel/main.go) | 8 步启动全流程编排（util.Boot → util.SetBooted） |
+| **全局配置管理** | [model/conf.go](kernel/model/conf.go) | InitConf / Save / Close（15 步编排）/ GetMaskedConf / SetUILayout |
+| **工作空间路径与锁** | [util/working.go](kernel/util/working.go) | initWorkspaceDir、flock 加解锁、workspace.json 读写、iOS 沙箱转换 |
+| **HTTP/WS 服务** | [server/serve.go](kernel/server/serve.go) | 路由注册、port.json、CORS、`checkAuth` 中间件、语言文件合并 |
+| **WS 广播分发** | [util/websocket.go](kernel/util/websocket.go) | 6 种 PushMode 分发、Broadcast\* 系列工具函数、会话两级 sync.Map 管理 |
+| **WS 消息结构** | [util/result.go](kernel/util/result.go) | Result 结构体、6 个 PushMode 常量、NewCmdResult |
+| **广播通道（WS+SSE）** | [api/broadcast.go](kernel/api/broadcast.go) | BroadcastChannel 结构体、Subscribe/Destroy、SSE、引用计数 |
+| **子设置 API** | [api/setting.go](kernel/api/setting.go) | 20+ 个字段 setter（ReadOnly / Keymap / Appearance 等），每 setter 三步曲 |
+| **系统 API** | [api/system.go](kernel/api/system.go) | getConf / setUILayout / getEmojiConf / bootProgress |
+| **工作空间 API** | [api/workspace.go](kernel/api/workspace.go) | switchWorkspace / getWorkspacesPath |
+| **笔记本 API 与模型** | [api/notebook.go](kernel/api/notebook.go) + [model/box.go](kernel/model/box.go) | setNotebookConf / ListNotebooks（含损坏笔记本检测） |
+| **同步主流程** | [model/sync.go](kernel/model/sync.go) | SyncData / BootSyncData / syncData / checkSync / SetSyncProvider\* |
+| **同步冲突处理与仓库** | [model/repository.go](kernel/model/repository.go) | syncRepo / bootSyncRepo / processSyncMergeResult / newRepository / syncRepoDownload / syncRepoUpload |
+| **配置结构体定义** | [conf/\*.go](kernel/conf/) | 20+ 子配置结构体 + New\*() 默认值构造函数（含 Sync.BoxConf.Layout 等） |
+| **CMD 异步命令框架** | [cmd/cmd.go](kernel/cmd/cmd.go) | Cmd 接口、`Exec()` goroutine 异步执行框架 |
+| **启动入口** | [main.go](kernel/main.go) | 8 步启动全流程编排（util.Boot → util.SetBooted） |
 
 ### 前端（app/src/）
 
 | 模块 | 文件 | 核心职责 |
 |------|------|----------|
-| **应用入口与 ws-main 分发** | [index.ts](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/app/src/index.ts) | fetchPost getConf、ws-main 消息 30+ 种业务 case 分发 |
-| **配置获取后初始化** | [boot/onGetConfig.ts](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/app/src/boot/onGetConfig.ts) | JSONToLayout、外观应用、窗口事件初始化、WS 连接建立 |
-| **布局持久化** | [layout/util.ts](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/app/src/layout/util.ts) | saveLayout / exportLayout / resetLayout / layoutToJSON |
-| **通用 WS 消息处理** | [util/processMessage.ts](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/app/src/util/processMessage.ts) | msg、reloadui、进度条、窗口滚动重置 |
-| **Electron 新窗口** | [window/openNewWindow.ts](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/app/src/window/openNewWindow.ts) | Tab→layout→URL 参数、Electron BrowserWindow 创建、IPC |
-| **Electron 窗口间 IPC** | [window/onWindowsMsg.ts](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/app/src/window/onWindowsMsg.ts) | 监听 SIYUAN_SEND_WINDOWS 消息、跨窗口 focus |
-| **前端配置面板** | [config/\*.ts](file:///d:/fz/0601/solo-dogfeeding/code/299-siyuan/app/src/config/) | 各子设置面板的表单逻辑与 API 调用 |
+| **应用入口与 ws-main 分发** | [index.ts](app/src/index.ts) | fetchPost getConf、ws-main 消息 30+ 种业务 case 分发 |
+| **配置获取后初始化** | [boot/onGetConfig.ts](app/src/boot/onGetConfig.ts) | JSONToLayout、外观应用、窗口事件初始化、WS 连接建立 |
+| **布局持久化** | [layout/util.ts](app/src/layout/util.ts) | saveLayout / exportLayout / resetLayout / layoutToJSON |
+| **通用 WS 消息处理** | [util/processMessage.ts](app/src/util/processMessage.ts) | msg、reloadui、进度条、窗口滚动重置 |
+| **Electron 新窗口** | [window/openNewWindow.ts](app/src/window/openNewWindow.ts) | Tab→layout→URL 参数、Electron BrowserWindow 创建、IPC |
+| **Electron 窗口间 IPC** | [window/onWindowsMsg.ts](app/src/window/onWindowsMsg.ts) | 监听 SIYUAN_SEND_WINDOWS 消息、跨窗口 focus |
+| **前端配置面板** | [config/\*.ts](app/src/config/) | 各子设置面板的表单逻辑与 API 调用 |
 
 ---
 
