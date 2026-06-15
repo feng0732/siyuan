@@ -786,9 +786,395 @@ Response / WebSocket Message
 
 ---
 
-## 7. 各机制独立性与调用关系汇总
+## 7. 前端 WebSocket 消息分发链路职责划分
 
-### 7.1 独立关系矩阵
+SiYuan 构建了**分层清晰的 WebSocket 消息分发体系**，从后端推送、前端接收到业务处理，各层职责明确、边界清晰。本章从代码层面梳理完整的消息链路。
+
+### 7.1 整体架构：三层分发模型
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        后端推送层 (Go)                                        │
+│  ┌──────────────┐   ┌────────────────┐   ┌────────────────┐                 │
+│  │ API Handler  │ → │  Push* 函数    │ → │ Broadcast* 函数 │ → WebSocket →  │
+│  │  业务逻辑    │   │  封装推送事件   │   │  按会话过滤发送 │                 │
+│  └──────────────┘   └────────────────┘   └────────────────┘                 │
+└───────────────────────────────────────────┬─────────────────────────────────┘
+                                            │
+┌───────────────────────────────────────────▼─────────────────────────────────┐
+│                        前端接收层 (TypeScript)                              │
+│  ┌────────────────┐                                                        │
+│  │ ws.onmessage   │  原始消息接收 + JSON 解析                                │
+│  │ Model.ts#L57   │                                                        │
+│  └───────┬────────┘                                                        │
+│          ▼                                                                 │
+│  ┌────────────────┐                                                        │
+│  │ processMessage │  通用消息处理（6 类）+ 错误码处理                        │
+│  │  第 1 层分发   │  processMessage.ts#L10-L77                              │
+│  └───────┬────────┘                                                        │
+│          ▼                                                                 │
+│  ┌────────────────┐                                                        │
+│  │ msgCallback    │  业务消息分发（30+ case）                                │
+│  │  第 2 层分发   │  index.ts#L73-L213                                      │
+│  └───────┬────────┘                                                        │
+│          ▼                                                                 │
+│  ┌────────────────┐                                                        │
+│  │  业务处理函数  │  具体 UI 更新、状态变更                                  │
+│  │  第 3 层实现   │  processSystem.ts 等                                    │
+│  └────────────────┘                                                        │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 7.2 消息处理入口：双层回调结构
+
+WebSocket 消息处理入口位于 [Model.ts#L57-L64](file:///d:/fz/0601/solo-dogfeeding/code/303-siyuan/app/src/layout/Model.ts#L57-L64)，采用**先通用处理、后业务分发**的双层回调结构：
+
+```typescript
+ws.onmessage = (event) => {
+    if (options.msgCallback && window.siyuan.config) {
+        // 第一层：通用消息预处理
+        const data = processMessage(JSON.parse(event.data));
+        // 第二层：业务消息分发
+        options.msgCallback.call(this, data);
+    }
+};
+```
+
+**调用顺序（代码验证）：**
+1. ✅ 先调用 `processMessage()` 处理通用消息
+2. ✅ 再将 `processMessage()` 的返回值传给 `msgCallback`
+3. ❌ 不是并行处理，也不是先业务后通用
+
+### 7.3 processMessage：第一层通用分发
+
+[processMessage.ts#L10-L77](file:///d:/fz/0601/solo-dogfeeding/code/303-siyuan/app/src/util/processMessage.ts#L10-L77) 负责处理**跨业务的通用消息类型**，共 6 类 + 1 个错误码分支：
+
+| cmd | 处理逻辑 | 返回值 | 后续处理 |
+|-----|---------|--------|---------|
+| `msg` | 调用 `showMessage()` 显示消息 | `false` | msgCallback 接收 `false`，通常不继续处理 |
+| `cmsg` | 调用 `hideMessage()` 隐藏消息 | `false` | 同上 |
+| `cprogress` | 移除 `#progress` 元素 | `false` | 同上 |
+| `reloadui` | 保存布局后调用 `window.location.reload()` | `false` | 同上 |
+| `closepublishpage` | 调用 `handlePublishServiceClosed()` | `false` | 同上 |
+| `code < 0` | `code=-1` 显示错误，`code=-2` 显示提示 | `false` | 同上 |
+| 其他 | 不匹配任何分支 | `response` | msgCallback 接收原始数据继续分发 |
+
+> **重要职责边界**：`processMessage()` 只处理**通用 UI 交互**，不涉及任何业务逻辑。业务相关的 cmd（如 `setLocalStorageVal`、`backgroundtask`）全部透传给下一层。
+
+### 7.4 msgCallback：第二层业务分发
+
+主回调位于 [index.ts#L73-L213](file:///d:/fz/0601/solo-dogfeeding/code/303-siyuan/app/src/index.ts#L73-L213)，处理 30+ 种业务消息类型。核心 case 分支分类：
+
+#### 7.4.1 状态与配置类
+
+| cmd | 处理逻辑 | 代码位置 |
+|-----|---------|---------|
+| `logoutAuth` | `redirectToCheckAuth()` 跳转登录 | L79-L81 |
+| `setAppearance` | `updateAppearance(data.data)` 更新外观 | L82-L84 |
+| `setSnippet` | 更新 `window.siyuan.config.snippet` + `renderSnippet()` | L85-L88 |
+| `setConf` | `window.siyuan.config = data.data` | L121-L123 |
+| `setPublish` | 更新 `window.siyuan.config.publish` | L124-L135 |
+| `readonly` | 更新 `window.siyuan.config.editor.readOnly` | L117-L120 |
+
+#### 7.4.2 存储与同步类
+
+| cmd | 处理逻辑 | 代码位置 |
+|-----|---------|---------|
+| `setLocalStorageVal` | `window.siyuan.storage[key] = val` | L139-L141 |
+| `syncing` | `processSync(data, plugins)` 同步状态 | L191-L193 |
+| `syncMergeResult` | `reloadSync(this, data.data)` 同步合并 | L111-L113 |
+
+#### 7.4.3 任务与进度类
+
+| cmd | 处理逻辑 | 代码位置 |
+|-----|---------|---------|
+| `progress` | `progressLoading(data)` 显示进度条 | L136-L138 |
+| `statusbar` | `progressStatus(data)` 更新状态栏 | L182-L184 |
+| `backgroundtask` | `progressBackgroundTask(tasks)` 后台任务 | L194-L196 |
+| `downloadProgress` | `downloadProgress(data.data)` 下载进度 | L185-L187 |
+
+#### 7.4.4 文档与标签类
+
+| cmd | 处理逻辑 | 代码位置 |
+|-----|---------|---------|
+| `reloaddoc` | `reloadSync()` 刷新单文档 | L114-L116 |
+| `rename` | 遍历 tabs 更新标题 | L142-L154 |
+| `removeDoc` / `closeBox` / `removeBox` | 关闭相关 tab | L155-L181 |
+| `reloadTag` | `Tag.update()` 刷新标签面板 | L92-L96 |
+
+#### 7.4.5 引用与插件类
+
+| cmd | 处理逻辑 | 代码位置 |
+|-----|---------|---------|
+| `setDefRefCount` | `setDefRefCount(data)` 更新引用计数 | L89-L91 |
+| `setRefDynamicText` | `setRefDynamicText(data)` 更新锚文本 | L102-L104 |
+| `reloadPlugin` | `reloadPlugin(this, data.data)` 重载插件 | L105-L107 |
+| `reloadEmojiConf` | `reloadEmoji()` 重载表情 | L108-L110 |
+
+#### 7.4.6 其他类
+
+| cmd | 处理逻辑 | 代码位置 |
+|-----|---------|---------|
+| `refreshtheme` | 动态更新主题样式表 href | L197-L203 |
+| `openFileById` | `openFileById()` 打开指定文档 | L204-L206 |
+| `txerr` | `transactionError(msg)` 事务错误 | L188-L190 |
+| `exit` | 浏览器端跳转 `about:blank` | L207-L211 |
+| `setLocalShorthandCount` | 浏览器端更新速记计数 | L98-L100 |
+
+### 7.5 本地存储推送的完整调用链路
+
+#### 7.5.1 后端推送链路（5 步）
+
+**步骤 1：API Handler 执行业务逻辑**  
+[storage.go#L150-L156](file:///d:/fz/0601/solo-dogfeeding/code/303-siyuan/kernel/api/storage.go#L150-L156)
+```go
+val := arg["val"].(any)
+err := model.SetLocalStorageVal(key, val)  // 写入 local.json
+if err != nil {
+    ret.Code = -1
+    ret.Msg = err.Error()
+    return
+}
+```
+
+**步骤 2：封装推送事件**  
+[storage.go#L158-L162](file:///d:/fz/0601\solo-dogfeeding\code\303-siyuan\kernel\api\storage.go#L158-L162)
+```go
+app := arg["app"].(string)
+evt := util.NewCmdResult("setLocalStorageVal", 0, util.PushModeBroadcastMainExcludeSelfApp)
+evt.AppId = app
+evt.Data = map[string]any{"key": key, "val": val}
+```
+
+**步骤 3：调用推送入口**  
+```go
+util.PushEvent(evt)  // websocket.go#L383
+```
+
+**步骤 4：按 PushMode 分发**  
+[websocket.go#L383-L400](file:///d:/fz/0601/solo-dogfeeding/code/303-siyuan/kernel/util/websocket.go#L383-L400)
+```go
+switch mode {
+case PushModeBroadcastMainExcludeSelfApp:
+    broadcastOtherAppMains(msg, event.AppId)  // 排除当前 app，推送给其他 app 的 main 会话
+}
+```
+
+**步骤 5：实际发送**  
+[websocket.go#L447-L465](file:///d:/fz/0601/solo-dogfeeding/code/303-siyuan/kernel/util/websocket.go#L447-L465)
+```go
+func broadcastOtherAppMains(msg []byte, excludeApp string) {
+    sessions.Range(func(key, value any) bool {
+        if app == excludeApp { return true }           // 排除当前 app
+        if typ != "main" { return true }               // 仅 main 类型会话
+        session.Write(msg)                              // 发送
+        return true
+    })
+}
+```
+
+#### 7.5.2 前端接收链路（4 步）
+
+**步骤 1：WebSocket 接收**  
+[Model.ts#L57-L64](file:///d:/fz/0601/solo-dogfeeding/code/303-siyuan/app/src/layout/Model.ts#L57-L64)
+```typescript
+ws.onmessage = (event) => {
+    const data = processMessage(JSON.parse(event.data));  // 先通用处理
+    options.msgCallback.call(this, data);                // 后业务分发
+};
+```
+
+**步骤 2：processMessage 透传**  
+`cmd = "setLocalStorageVal"` 不匹配任何通用分支，直接返回原始 `response`。
+
+**步骤 3：msgCallback 分发**  
+[index.ts#L139-L141](file:///d:/fz/0601/solo-dogfeeding/code/303-siyuan/app/src/index.ts#L139-L141)
+```typescript
+case "setLocalStorageVal":
+    window.siyuan.storage[data.data.key] = data.data.val;
+    break;
+```
+
+**步骤 4：完成**  
+`window.siyuan.storage` 已更新，依赖该存储的组件通过响应式机制自动更新。
+
+#### 7.5.3 调用链全景图
+
+```
+后端 HTTP API /api/storage/setLocalStorageVal
+    │
+    ▼
+model.SetLocalStorageVal(key, val)  ── 写入磁盘
+    │
+    ▼
+util.NewCmdResult("setLocalStorageVal", PushModeBroadcastMainExcludeSelfApp)
+    │
+    ▼
+util.PushEvent(evt)
+    │
+    ▼
+broadcastOtherAppMains()  ── 排除当前 app，仅推送给其他 app 的 main 会话
+    │
+    ▼
+─────────────────────────────── WebSocket ───────────────────────────────
+    │
+    ▼
+前端其他窗口 ws.onmessage
+    │
+    ▼
+processMessage()  ── 透传（不匹配任何通用分支）
+    │
+    ▼
+msgCallback case "setLocalStorageVal"
+    │
+    ▼
+window.siyuan.storage[key] = val  ── 更新内存存储
+```
+
+### 7.6 后台任务推送的完整调用链路
+
+#### 7.6.1 后端推送链路（5 步）
+
+**步骤 1：定时任务触发 StatusJob**  
+`StatusJob()` 由定时器定期调用，收集任务队列状态。
+
+**步骤 2：收集任务状态**  
+[queue.go#L260-L303](file:///d:/fz/0601/solo-dogfeeding/code/303-siyuan/kernel/task/queue.go#L260-L303)
+```go
+func StatusJob() {
+    for _, task := range taskQueue {
+        if skipPushTaskAction(action) { continue }  // 跳过配置禁用的任务
+        items = append(items, map[string]any{"action": action})
+    }
+    // 追加当前正在执行的任务
+    if nil != currentTask && !skipPushTaskAction(currentTask.Action) {
+        items = append([]map[string]any{{"action": label}}, items...)
+    }
+    data["tasks"] = items
+}
+```
+
+**步骤 3：调用推送函数**  
+[queue.go#L304](file:///d:/fz/0601/solo-dogfeeding/code/303-siyuan/kernel/task/queue.go#L304)
+```go
+util.PushBackgroundTask(data)
+```
+
+**步骤 4：推送封装**  
+[websocket.go#L257-L259](file:///d:/fz/0601/solo-dogfeeding/code/303-siyuan/kernel/util/websocket.go#L257-L259)
+```go
+func PushBackgroundTask(data map[string]any) {
+    BroadcastByType("main", "backgroundtask", 0, "", data)
+}
+```
+
+**步骤 5：按 type 广播**  
+[websocket.go#L82-L92](file:///d:/fz/0601/solo-dogfeeding/code/303-siyuan/kernel/util/websocket.go#L82-L92)
+```go
+func BroadcastByType(typ, cmd string, code int, msg string, data any) {
+    typeSessions := SessionsByType(typ)  // 收集所有 type=main 的会话
+    for _, sess := range typeSessions {
+        event := NewResult()
+        event.Cmd = cmd
+        event.Data = data
+        sess.Write(event.Bytes())
+    }
+}
+```
+
+#### 7.6.2 前端接收链路（4 步）
+
+**步骤 1：WebSocket 接收**  
+与本地存储推送相同，经过 `Model.ts#L57-L64`。
+
+**步骤 2：processMessage 透传**  
+`cmd = "backgroundtask"` 不匹配任何通用分支，直接返回原始 `response`。
+
+**步骤 3：msgCallback 分发**  
+[index.ts#L194-L196](file:///d:/fz/0601/solo-dogfeeding/code/303-siyuan/app/src/index.ts#L194-L196)
+```typescript
+case "backgroundtask":
+    progressBackgroundTask(data.data.tasks);
+    break;
+```
+
+**步骤 4：UI 更新**  
+[processSystem.ts#L471-L487](file:///d:/fz/0601/solo-dogfeeding/code/303-siyuan/app/src/dialog/processSystem.ts#L471-L487)
+```typescript
+export const progressBackgroundTask = (tasks: { action: string }[]) => {
+    const backgroundTaskElement = document.querySelector(".status__backgroundtask");
+    if (tasks.length === 0) {
+        backgroundTaskElement.classList.add("fn__none");  // 隐藏指示器
+    } else {
+        backgroundTaskElement.classList.remove("fn__none");  // 显示指示器
+        backgroundTaskElement.innerHTML = tasks[0].action + '<div class="fn__progress"><div></div></div>';
+    }
+};
+```
+
+#### 7.6.3 调用链全景图
+
+```
+后端定时器 → StatusJob()
+    │
+    ▼
+遍历 taskQueue + currentTask，过滤 skipPushTaskAction
+    │
+    ▼
+封装 data["tasks"] = items
+    │
+    ▼
+util.PushBackgroundTask(data)
+    │
+    ▼
+BroadcastByType("main", "backgroundtask", ...)  ── 推送给所有 type=main 的会话
+    │
+    ▼
+─────────────────────────────── WebSocket ───────────────────────────────
+    │
+    ▼
+前端所有 main 窗口 ws.onmessage
+    │
+    ▼
+processMessage()  ── 透传（不匹配任何通用分支）
+    │
+    ▼
+msgCallback case "backgroundtask"
+    │
+    ▼
+progressBackgroundTask(tasks)
+    │
+    ▼
+更新 .status__backgroundtask 元素的显示与内容
+```
+
+### 7.7 各层职责边界总结
+
+| 层级 | 模块 | 核心职责 | 设计原则 | 代码位置 |
+|------|------|---------|---------|---------|
+| **1** | 后端 API Handler | 执行业务逻辑，决定是否推送、推送什么 | 业务逻辑与推送逻辑解耦 | `kernel/api/*.go` |
+| **2** | 后端 Push* 函数 | 封装 `Result` 对象，设置 `Cmd`/`PushMode`/`Data` | 推送参数标准化 | `kernel/util/websocket.go` Push* 系列 |
+| **3** | 后端 Broadcast* 函数 | 根据 `PushMode` 过滤目标会话，执行 `session.Write()` | 推送范围精确控制 | `kernel/util/websocket.go` Broadcast* / broadcast* 系列 |
+| **4** | 前端 `ws.onmessage` | 原始消息接收、JSON 解析、配置加载检查 | 传输层与业务层隔离 | `app/src/layout/Model.ts#L57-L64` |
+| **5** | 前端 `processMessage` | 处理 6 类通用 UI 消息 + 错误码 | 通用逻辑下沉，避免重复代码 | `app/src/util/processMessage.ts#L10-L77` |
+| **6** | 前端 `msgCallback` | 30+ 种业务消息按 `cmd` 分发 | 业务逻辑集中管理 | `app/src/index.ts#L73-L213` |
+| **7** | 前端业务处理函数 | 具体 UI 更新、状态变更 | 单一职责 | `app/src/dialog/processSystem.ts` 等 |
+
+### 7.8 设计特征与亮点
+
+1. **两层分发的职责隔离**：`processMessage` 处理通用交互，`msgCallback` 处理业务逻辑。修改通用消息处理不会影响业务代码，新增业务 cmd 也不会干扰通用逻辑。
+
+2. **推送范围的精确控制**：6 种 `PushMode` 覆盖了从"全量广播"到"单会话单播"的所有场景，配合 `BroadcastByType` 可进一步按会话类型过滤。
+
+3. **同步调用链路清晰**：从后端 API 到前端 UI 更新的每一步都有明确的代码位置，没有隐式的事件总线或全局钩子，便于调试追踪。
+
+4. **向后兼容保障**：`processMessage` 返回 `false` 阻止后续处理的设计，确保新增通用消息类型时不会意外触发业务分支。
+
+---
+
+## 8. 各机制独立性与调用关系汇总
+
+### 8.1 独立关系矩阵
 
 下表明确标记各机制之间是否存在直接的代码调用关系：
 
@@ -818,7 +1204,7 @@ Response / WebSocket Message
 
 8. **错误处理 → processMessage**：HTTP 响应到达前端后，`fetchPost()` 调用 `processMessage()` 处理 `code<0` 的情况，这是直接调用关系。
 
-### 7.2 真实调用链路图
+### 8.2 真实调用链路图
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────────┐
@@ -985,6 +1371,8 @@ SiYuan 内核 HTTP API 路由层体现了**清晰的分层隔离设计**，各�
 
 3. **任务执行 → WebSocket 推送**：长任务通过推送 cmd=progress/backgroundtask 反馈状态，保持 UI 响应性。
 
+4. **WebSocket 消息 → 双层分发**：`ws.onmessage` → `processMessage` → `msgCallback` 的链式调用，是 WebSocket 消息处理的标准路径。
+
 ### 设计哲学
 
 SiYuan 的兼容性和前端交互设计遵循以下原则：
@@ -995,5 +1383,7 @@ SiYuan 的兼容性和前端交互设计遵循以下原则：
 | **分层独立原则** | 前端竞态、后端去重、错误处理各自运行在独立层级，便于单独演进和测试 |
 | **统一入口原则** | processMessage() 作为 HTTP+WebSocket 的共同消息处理入口，保证用户体验一致 |
 | **向后兼容原则** | 废弃字段保留 JSON tag 以解析历史数据，迁移时间窗口统一设定为 1 年（2026-06-30） |
+| **职责隔离原则** | WebSocket 消息分发采用"通用层+业务层"双层架构，processMessage 只处理通用 UI 交互，业务逻辑全部下沉到 msgCallback |
+| **精确推送原则** | 6 种 PushMode + BroadcastByType 过滤机制，实现从全量广播到单会话单播的精确控制 |
 
 这种架构在桌面应用场景下表现优秀，通过明确的机制边界降低了系统复杂度，也为后续演进提供了清晰的修改面。
