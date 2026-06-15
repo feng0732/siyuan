@@ -305,31 +305,10 @@ func getLimitClause(parsedStmt sqlparser.Statement, limit int) (ret *sqlparser.L
 | sqlparser SELECT/UNION | 无 `\|\|` + 解析成功 | SELECT / UNION | 用户 LIMIT 优先，否则默认 1024 | 低 |
 | `queryRawStmt` | **两个解析器都失败** 或 **非 SELECT** | ❌ **无类型检查** | `containsLimitClause` 检查 | **高** |
 
-#### 3.2.4 `queryRawStmt` 回退路径的隐患
+#### 3.2.4 `containsLimitClause` 的真实行为与绕过可能性（精确代码级分析）
 
 ```go
-// kernel/sql/block_query.go，函数 queryRawStmt（约 L504–L545）
-func queryRawStmt(stmt string, limit int) (ret []map[string]any, err error) {
-    rows, err := query(stmt)  // 直接执行，无类型检查！
-    // ...
-    noLimit := !containsLimitClause(stmt)
-    var count int
-    for rows.Next() {
-        // ... scan ...
-        ret = append(ret, m)
-        count++
-        if noLimit && limit < count {  // ⚠️ 仅在 noLimit 时才限行
-            break
-        }
-    }
-    return
-}
-```
-
-`containsLimitClause` 实现：
-
-```go
-// kernel/sql/block_query.go（约 L945–L949）
+// kernel/sql/block_query.go，函数 containsLimitClause（L945–L949，精确）
 func containsLimitClause(stmt string) bool {
     return strings.Contains(strings.ToLower(stmt), " limit ") ||
         strings.Contains(strings.ToLower(stmt), "\nlimit ") ||
@@ -337,10 +316,197 @@ func containsLimitClause(stmt string) bool {
 }
 ```
 
-**`queryRawStmt` 的双重隐患**：
+**精确行为分析**：
 
-1. **无类型检查**：DML/DDL 语句（DELETE/DROP/INSERT 等）在两个解析器都失败时会**直接执行**，因为 `queryRawStmt` 没有 SELECT 类型断言。
-2. **LIMIT 检测可绕过**：`containsLimitClause` 仅做字符串匹配（`" limit "` / `\nlimit ` / `\tlimit `），攻击者可通过注释符（`SELECT...FROM...WHERE 1=1/**/LIMIT 99999`）、无空格拼接（`...LIMIT`）等方式绕过，使 `noLimit=true` 判定为 `false`，从而跳过计数限行。
+| 检测模式 | 匹配条件 | 不匹配条件 |
+|---------|---------|-----------|
+| `" limit "` | 空格 + limit + 空格（大小写不敏感） | 无空格 `...limit999`、无后空格 `...limit `、双空格 `...limit  `、注释分隔 `.../**/limit...` |
+| `"\nlimit "` | 换行符 + limit + 空格 | 其他空白符 `\rlimit `、`\flimit ` |
+| `"\tlimit "` | 制表符 + limit + 空格 | 制表符 + limit + 制表符 `\tlimit\t` |
+
+**已知绕过方式**：
+
+| 绕过方式 | SQL 示例 | 结果 |
+|---------|---------|------|
+| 子查询包含 LIMIT | `SELECT * FROM blocks WHERE id IN (SELECT id FROM blocks LIMIT 100)` | ✅ `containsLimitClause` 返回 true，`noLimit=false`，**计数限行完全不生效** |
+| 注释符分隔 | `SELECT * FROM blocks WHERE 1=1/**/LIMIT 99999` | ❌ 不匹配 `" limit "`，返回 false，`noLimit=true`，**计数限行生效** |
+| 无空格 LIMIT | `SELECT * FROM blocks LIMIT99999` | ❌ 不匹配，返回 false，`noLimit=true` |
+| 回车符分隔 | `SELECT * FROM blocks \rLIMIT 99999` | ❌ 不匹配，返回 false，`noLimit=true` |
+| 换页符分隔 | `SELECT * FROM blocks \fLIMIT 99999` | ❌ 不匹配，返回 false，`noLimit=true` |
+
+> **最危险的绕过**：**子查询包含 LIMIT**。外层查询无 LIMIT，但子查询有 LIMIT，此时 `containsLimitClause` 错误返回 true，导致 `noLimit=false`，Go 层计数限行**完全失效**，外层查询可能返回全部数据。
+
+---
+
+#### 3.2.5 `queryRawStmt` 的真实行为与计数限行逻辑（精确代码级分析）
+
+```go
+// kernel/sql/block_query.go，函数 queryRawStmt（L504–L545，精确）
+func queryRawStmt(stmt string, limit int) (ret []map[string]any, err error) {
+    rows, err := query(stmt)  // ➊ 直接执行，无任何类型检查！
+    if err != nil {
+        if strings.Contains(err.Error(), "syntax error") {
+            return  // 语法错误静默返回
+        }
+        return
+    }
+    defer rows.Close()
+
+    cols, err := rows.Columns()
+    if err != nil || nil == cols {
+        return
+    }
+
+    noLimit := !containsLimitClause(stmt)  // ➋ 判定是否需要计数限行
+    var count int
+    for rows.Next() {
+        // ... scan 每一行到 columns ...
+        m := make(map[string]any)
+        for i, colName := range cols {
+            val := columnPointers[i].(*any)
+            m[colName] = *val
+        }
+        ret = append(ret, m)
+        count++
+        if noLimit && limit < count {  // ➌ 关键：仅在 noLimit=true 时才限行！
+            break
+        }
+    }
+    return
+}
+```
+
+**计数限行的精确触发条件（真值表）**：
+
+| `containsLimitClause(stmt)` | `noLimit` | `limit < count` | 实际行为 |
+|-----------------------------|-----------|-----------------|---------|
+| `true`（检测到 LIMIT 字样） | `false` | 任意 | ❌ **不限行**，循环继续直到 `rows.Next()` 返回 false |
+| `false`（未检测到 LIMIT） | `true` | `true`（count 超过 limit） | ✅ **break**，停止返回更多行 |
+| `false`（未检测到 LIMIT） | `true` | `false`（count 未超 limit） | 继续循环 |
+
+**关键结论**：
+
+- **L519**：`noLimit := !containsLimitClause(stmt)` —— 只有当 SQL 中**完全不包含** `" limit "` / `"\nlimit "` / `"\tlimit "` 时，`noLimit` 才为 `true`。
+- **L540**：`if noLimit && limit < count { break }` —— 限行逻辑有双重条件，**`noLimit` 是前提条件**。
+- 只要 `containsLimitClause` 返回 `true`（无论是否是真正的外层 LIMIT），`noLimit` 即为 `false`，**计数限行完全不生效**。
+
+---
+
+#### 3.2.6 `selectBlocksRawStmt` 的计数限行逻辑（精确代码级分析）
+
+```go
+// kernel/sql/block_query.go，函数 selectBlocksRawStmt（L698–L724，精确）
+func selectBlocksRawStmt(stmt string, limit int) (ret []*Block) {
+    rows, err := query(stmt)  // ➊ 直接执行，无任何类型检查！
+    if err != nil {
+        if strings.Contains(err.Error(), "syntax error") {
+            return
+        }
+        return
+    }
+    defer rows.Close()
+
+    noLimit := !containsLimitClause(stmt)  // ➋ 同样的判定逻辑
+    var count, errCount int
+    for rows.Next() {
+        count++
+        if block := scanBlockRows(rows); nil != block {
+            ret = append(ret, block)
+        } else {
+            logging.LogWarnf("raw sql query [%s] failed", stmt)
+            errCount++
+        }
+
+        if (noLimit && limit < count) || 0 < errCount {  // ➌ 额外 errCount 条件
+            break
+        }
+    }
+    return
+}
+```
+
+**与 `queryRawStmt` 的差异**：
+
+| 差异点 | `queryRawStmt` | `selectBlocksRawStmt` |
+|--------|---------------|----------------------|
+| **L719 额外条件** | 仅 `noLimit && limit < count` | `(noLimit && limit < count) \|\| 0 < errCount` |
+| **含义** | 只有 LIMIT 检测失败才限行 | 除了 LIMIT 检测，**任意扫描错误也会终止循环** |
+| **返回类型** | `[]map[string]any`（动态列） | `[]*Block`（强类型，scanBlockRows 可能失败） |
+| **errCount 触发** | 无 | scan 失败（如列数不匹配、类型转换失败）时 errCount++ |
+
+**`errCount` 额外终止条件的含义**：当 SQL 不是标准的 `SELECT * FROM blocks`（列数/顺序不匹配 `scanBlockRows` 期望的 21 列）时，会不断产生 scan 错误，`errCount > 0`，**无论 LIMIT 检测结果如何都会立即 break**。这对 DML 语句有一定防护作用（DML 通常返回 0 列，`rows.Columns()` 返回 nil 或空，直接返回空），但不是确定性防护。
+
+---
+
+#### 3.2.7 缺少 SELECT/UNION 类型断言的风险边界（精确分析）
+
+当代码进入 `queryRawStmt` / `selectBlocksRawStmt` 回退路径时，**没有任何类型检查**，直接调用底层 `query` 函数：
+
+```go
+// kernel/sql/database.go，函数 query（L1359–L1369，精确）
+func query(query string, args ...any) (*sql.Rows, error) {
+    query = strings.TrimSpace(query)
+    if "" == query {
+        return nil, errors.New("statement is empty")
+    }
+    if nil == db {
+        return nil, errors.New("database is nil")
+    }
+    return db.Query(query, args...)  // ⚠️ Go 标准库 sql.DB.Query，可执行任意 SQL！
+}
+```
+
+**风险边界分析**：
+
+| 语句类型 | `db.Query` 执行结果 | `queryRawStmt` 后续行为 | 实际风险 |
+|---------|-------------------|----------------------|---------|
+| **SELECT** | 返回 `*sql.Rows`，含结果集 | 正常 scan，受计数限行逻辑约束（可能被绕过） | ✅ 预期行为，但 LIMIT 可能失效 |
+| **DELETE** | 执行语句（删除数据），返回 `*sql.Rows` | `rows.Next()` 立即返回 false，`ret = []`，无数据返回 | ⚠️ **数据已删除！** 但返回空，攻击者无反馈 |
+| **UPDATE** | 执行语句（更新数据），返回 `*sql.Rows` | 同上，`ret = []` | ⚠️ **数据已更新！** 无反馈 |
+| **INSERT** | 执行语句（插入数据），返回 `*sql.Rows` | 同上，`ret = []` | ⚠️ **数据已插入！** 无反馈 |
+| **DROP TABLE** | 执行语句（删除表），返回 `*sql.Rows` | 同上，`ret = []` | 🔥 **表已删除！** 无反馈，盲攻击 |
+| **CREATE TABLE** | 执行语句（创建表），返回 `*sql.Rows` | 同上，`ret = []` | 🔥 **表已创建！** 无反馈 |
+| **PRAGMA** | 执行语句（修改配置），返回 `*sql.Rows` | 可能有结果集，正常 scan 返回 | 🔥 **数据库配置被修改！** |
+| **ATTACH DATABASE** | 执行语句（附加数据库），返回 `*sql.Rows` | `ret = []` | 🔥 **外部数据库被附加！** |
+
+**关键发现**：
+
+1. **`db.Query` 可以执行任何 SQL 语句**：Go 标准库 `sql.DB.Query` 不做语句类型检查，只要语法正确就会执行。
+2. **DML/DDL 语句无反馈但已执行**：DELETE/UPDATE/INSERT/DROP 等语句执行后，`rows.Next()` 立即返回 false，`ret` 为空，攻击者**没有直接反馈**，但**数据/结构已被修改**——这是典型的**盲攻击**场景。
+3. **PRAGMA 语句有反馈**：`PRAGMA table_info(blocks)` 等语句会返回结果集，可被 `queryRawStmt` 正常 scan 返回，攻击者**可获取结构信息**。
+4. **回退路径的触发条件**：`queryRawStmt` 仅在**两个解析器（sqlparser2 和 sqlparser）都失败**或**非 SELECT 类型**时才被调用。因此攻击者需要构造**能绕过两个解析器但 SQLite 仍能执行**的 SQL。
+
+**构造能绕过解析器的 DML 语句示例**：
+
+```
+-- SQLite 支持但 sqlparser 可能解析失败的语法
+DELETE FROM blocks WHERE 1=1 LIMIT 1;
+
+-- 带注释的复杂语法可能绕过解析器
+DROP TABLE IF EXISTS blocks /* strange comment */;
+
+-- SQLite 特殊语法
+PRAGMA journal_mode = WAL;
+```
+
+但需要注意：大多数标准 DML 语法（如 `DELETE FROM ...`）**能被 sqlparser 成功解析**，此时会进入类型断言分支（`default:` → `return queryRawStmt`），而非直接拒绝。对于 `DELETE`，sqlparser 解析为 `*sqlparser.Delete`，属于 `default` 分支，**仍然会进入 `queryRawStmt` 回退路径**！
+
+**类型断言完整行为**（在 `Query` 函数中）：
+
+```go
+// kernel/sql/block_query.go，Query 函数内（约 L381–L395）
+switch parsedStmt.(type) {
+case *sqlparser.Select:
+    // ... 注入 LIMIT ...
+case *sqlparser.Union:
+    // ... 注入 LIMIT ...
+default:
+    // ⚠️ DELETE / UPDATE / INSERT / DROP / CREATE 等所有其他类型都进入这里！
+    return queryRawStmt(stmt, limit)  // 直接回退，无类型拒绝！
+}
+```
+
+这是**最严重的设计缺陷**：类型断言的 `default` 分支不是返回空，而是**调用 `queryRawStmt` 直接执行**！这意味着 DELETE/UPDATE/INSERT/DROP/CREATE 等语句只要能被 sqlparser 成功解析（大多数标准语法都可以），就会**绕过 SELECT 限制，被直接执行**！
 
 ### 3.3 `querySQL` 无参数替换的设计含义
 
@@ -736,90 +902,297 @@ if err != nil {
 
 ## 10. 潜在问题与风险
 
-### 10.1 SQL LIMIT 默认值可被用户覆盖
+### 10.1 SQL LIMIT 多重绕过风险（精确分析）
 
-**这是本次分析发现的最关键问题**：
+**这是最复杂也最关键的问题**。512/1024 限制在**三层防御**中都可被绕过：
 
-三个 SQL 模板函数的 512/1024 限制仅是**无 LIMIT 子句时的默认注入值**，并非硬性上限。当模板 SQL 中包含 `LIMIT N` 时：
+| 防御层 | 绕过方式 | 代码位置 | 影响 |
+|--------|---------|---------|------|
+| **AST 层（默认注入）** | SQL 自带 `LIMIT 99999` | `SelectBlocksRawStmt` [L560-L587](file:///d:/fz/0601/solo-dogfeeding/code/293-siyuan/kernel/sql/block_query.go#L560-L587) | 用户值覆盖默认值 |
+| **Go 层（计数限行）** | SQL 含 `" limit "` 字样（如子查询 LIMIT） | `queryRawStmt` [L519](file:///d:/fz/0601/solo-dogfeeding/code/293-siyuan/kernel/sql/block_query.go#L519) | `noLimit=false`，计数限行完全失效 |
+| **Go 层（计数限行）** | 子查询包含 LIMIT | `containsLimitClause` [L945-L949](file:///d:/fz/0601/solo-dogfeeding/code/293-siyuan/kernel/sql/block_query.go#L945-L949) | 误判为有 LIMIT，外层查询无限制 |
 
-- `SelectBlocksRawStmt`：读取用户值并使用（仅防护零值/负值，改为 32）
-- `SelectSpansRawStmt`：保留用户值，完全不覆盖
-- `Query` / `getLimitClause`：保留用户值，完全不覆盖
-- `queryRawStmt`（回退路径）：若 SQL 含 `LIMIT` 字样则跳过计数限行
-
-**风险场景**：
+**最危险场景**：
 
 ```
-.action{ range queryBlocks "SELECT * FROM blocks LIMIT 99999" }
+.action{ range querySQL "SELECT * FROM blocks WHERE id IN (SELECT id FROM blocks LIMIT 100)" }
 .action{   .Content }
 .action{ end }
 ```
 
-此模板将绕过 512 默认限制，一次返回最多 99999 条 Block 记录。
+此模板中，子查询的 `LIMIT 100` 会让 `containsLimitClause` 返回 `true`，导致 `noLimit=false`，**计数限行完全不生效**，外层查询可能返回 `blocks` 表的**全部记录**。
 
-### 10.2 `querySQL` 的 `queryRawStmt` 回退路径无类型检查
+---
 
-当 `sqlparser2` 和 `sqlparser` 均解析失败时，`Query` 函数回退到 `queryRawStmt`，后者：
-- 无 SELECT/UNION 类型断言
-- 直接调用 `query(stmt)` 执行任意 SQL
-- LIMIT 仅通过 `containsLimitClause` 字符串匹配检测
+### 10.2 类型断言 `default` 分支直接执行 SQL（最严重设计缺陷）
 
-### 10.3 SQL 伪参数化
+在 `Query` 函数中，类型断言的 `default` 分支**不是返回空，而是调用 `queryRawStmt` 直接执行**：
 
-`queryBlocks` / `querySpans` 的 `strings.Replace` 无转义是持续的隐患。
+```go
+// kernel/sql/block_query.go，Query 函数（约 L381–L395）
+switch parsedStmt.(type) {
+case *sqlparser.Select:
+    // ... 注入 LIMIT ...
+case *sqlparser.Union:
+    // ... 注入 LIMIT ...
+default:
+    // ⚠️ DELETE / UPDATE / INSERT / DROP / CREATE 等所有其他类型
+    return queryRawStmt(stmt, limit)  // 直接执行，无拒绝！
+}
+```
 
-### 10.4 `querySQL` 返回 `map[string]any` 字段不可控
+**风险边界**：
+- ✅ **能被解析的 SELECT/UNION** → 正常处理，注入 LIMIT
+- ❌ **能被解析的 DELETE/UPDATE/INSERT/DROP/CREATE** → 进入 `default` → **直接执行**
+- ❌ **不能被解析的任何语句** → 两个解析器都失败 → 进入 `queryRawStmt` → **直接执行**
+
+**这意味着类型断言完全没有起到防护 DML/DDL 的作用**，只是"优化"了 SELECT/UNION 的 LIMIT 注入。DELETE/DROP 等语句只要语法正确，就会被执行。
+
+---
+
+### 10.3 `containsLimitClause` 脆弱的字符串匹配
+
+```go
+// kernel/sql/block_query.go（L945–L949，精确）
+func containsLimitClause(stmt string) bool {
+    return strings.Contains(strings.ToLower(stmt), " limit ") ||
+        strings.Contains(strings.ToLower(stmt), "\nlimit ") ||
+        strings.Contains(strings.ToLower(stmt), "\tlimit ")
+}
+```
+
+**问题**：
+- 仅匹配 3 种空白符模式，可通过 `\r`、`\f`、注释符等绕过
+- **子查询包含 LIMIT 会导致误判**（最危险）
+- 没有语法分析，只是字符串匹配
+
+---
+
+### 10.4 `queryRawStmt` 计数限行的双重条件陷阱
+
+```go
+// kernel/sql/block_query.go（L519, L540，精确）
+noLimit := !containsLimitClause(stmt)
+// ...
+if noLimit && limit < count {  // ⚠️ noLimit 是前提条件
+    break
+}
+```
+
+**真值表**：
+
+| `containsLimitClause` | `noLimit` | `limit < count` | 是否 break |
+|-----------------------|-----------|-----------------|-----------|
+| `true`（任何含 ` limit ` 的情况） | `false` | 任意 | ❌ **不 break** |
+| `false`（完全不含 ` limit `） | `true` | `true` | ✅ break |
+| `false`（完全不含 ` limit `） | `true` | `false` | 继续 |
+
+**关键**：`noLimit` 是 `&&` 的左操作数，**只要 `noLimit=false`，无论 `count` 多大都不会 break**。
+
+---
+
+### 10.5 SQL 伪参数化
+
+`queryBlocks` / `querySpans` 的 `strings.Replace(stmt, "?", arg, 1)` 无转义是持续的隐患。
+
+---
+
+### 10.6 `querySQL` 返回 `map[string]any` 字段不可控
 
 模板作者可通过 `querySQL` 查询任意表、访问任意列，包括敏感字段。
 
-### 10.5 代码片段权限
+---
+
+### 10.7 代码片段权限
 
 - `/getSnippet` 仅需 CheckAuth，Editor/Reader 可读取全部未屏蔽片段
 - 读取操作无审计日志
 
-### 10.6 性能问题
+---
+
+### 10.8 性能问题
 
 1. 每次渲染都重新 Parse 模板，无编译缓存
 2. SQL 无执行超时，复杂子查询可阻塞 Go 协程
 3. `querySQL` 的 1024 行 × 动态列数可能导致模板渲染输出膨胀
+4. **LIMIT 被绕过后，单次查询可能返回数万行数据**，严重影响性能
 
 ---
 
 ## 11. 后续研究方向
 
-### 11.1 安全性增强
+### 11.1 安全性增强（按优先级排序）
 
-1. **将 LIMIT 默认值改为硬性上限**：
-   ```go
-   // 建议修改：在 SelectBlocksRawStmt / SelectSpansRawStmt / Query 中
-   // 读取用户 LIMIT 后，与硬性上限取较小值
-   if userLimit > hardCap {
-       userLimit = hardCap  // 硬性封顶
-   }
-   ```
+#### P0：修复类型断言 `default` 分支直接执行的严重缺陷
 
-2. **统一 SQL 限制常量**：
-   ```go
-   const (
-       TemplateQueryBlocksLimit = 512
-       TemplateQuerySpansLimit  = 512
-       TemplateQuerySQLLimit    = 1024
-   )
-   ```
+**当前代码**（`Query` 函数）：
+```go
+default:
+    return queryRawStmt(stmt, limit)  // ⚠️ 直接执行
+```
 
-3. **真实参数化查询**：将 `strings.Replace` 改为 `db.Query(stmt, args...)`。
+**修复建议**：
+```go
+default:
+    // 非 SELECT/UNION 直接拒绝，不进入回退路径
+    logging.LogWarnf("blocked non-SELECT statement in template query: %s", stmt)
+    return nil, errors.New("only SELECT/UNION statements are allowed")
+```
 
-4. **queryRawStmt 增加类型检查**：在回退路径中增加正则检测，拒绝非 SELECT 语句。
+**同步修复 `SelectBlocksRawStmt`**：
+```go
+default:
+    return  // 目前是正确的，直接返回空
+```
 
-5. **querySQL 返回字段白名单**：对 `map[string]any` 的 key 做白名单过滤。
+---
 
-6. **代码片段审计日志**：为 `/getSnippet` 增加操作日志。
+#### P0：将 LIMIT 从默认值改为硬性上限（三层防御）
+
+**1. AST 层（`SelectBlocksRawStmt`）**：
+```go
+// 当前代码（约 L570-L573）
+if 0 >= limit {
+    limit = 32
+}
+// 修改为：
+const maxQueryBlocksLimit = 512
+if limit > maxQueryBlocksLimit {
+    limit = maxQueryBlocksLimit  // 硬性封顶
+} else if 0 >= limit {
+    limit = 32
+}
+```
+
+**2. AST 层（`Query` / `getLimitClause`）**：
+```go
+// 当前代码（约 L493-L499）
+if nil == ret || nil == ret.Rowcount {
+    ret = &sqlparser.Limit{...}
+}
+// 修改为：在返回前增加硬性上限
+const maxQuerySQLLimit = 1024
+userLimit, _ := strconv.Atoi(string(ret.Rowcount.Val))
+if userLimit > maxQuerySQLLimit {
+    ret.Rowcount.Val = []byte(strconv.Itoa(maxQuerySQLLimit))
+}
+```
+
+**3. Go 层（`queryRawStmt` / `selectBlocksRawStmt`）**：
+```go
+// 当前代码（L540）
+if noLimit && limit < count { break }
+// 修改为：删除 noLimit 条件，始终强制执行上限
+if limit < count { break }  // 无论是否检测到 LIMIT，都限行
+```
+
+**4. 修复 `containsLimitClause` 的子查询误判问题**：
+```go
+// 建议替换为基于 AST 的检测（在解析成功的路径中已做）
+// 或使用正则匹配最外层的 LIMIT
+// 或简单地删除 noLimit 条件，始终强制执行上限
+```
+
+---
+
+#### P0：修复 `queryRawStmt` 计数限行的双重条件陷阱
+
+**当前代码**（`queryRawStmt` [L519, L540](file:///d:/fz/0601/solo-dogfeeding/code/293-siyuan/kernel/sql/block_query.go#L519-L540)）：
+```go
+noLimit := !containsLimitClause(stmt)
+// ...
+if noLimit && limit < count {  // ⚠️ noLimit 是前提条件
+    break
+}
+```
+
+**修复建议**（删除 `noLimit` 条件，始终强制执行上限）：
+```go
+// 删除 noLimit 变量和 containsLimitClause 调用
+// ...
+if limit < count {  // 无论 SQL 是否包含 LIMIT，都强制执行上限
+    break
+}
+```
+
+同样修复 `selectBlocksRawStmt` [L708, L719](file:///d:/fz/0601/solo-dogfeeding/code/293-siyuan/kernel/sql/block_query.go#L708-L719)：
+```go
+// 删除 noLimit 变量
+if limit < count || 0 < errCount {  // 始终强制执行上限
+    break
+}
+```
+
+---
+
+#### P1：统一 SQL 限制常量
+
+```go
+// kernel/sql/block_query.go 新增
+const (
+    MaxQueryBlocksLimit = 512
+    MaxQuerySpansLimit  = 512
+    MaxQuerySQLLimit    = 1024
+)
+```
+
+在所有调用点使用这些常量，消除硬编码的魔法数字。
+
+---
+
+#### P1：真实参数化查询
+
+将 `queryBlocks` / `querySpans` 的 `strings.Replace` 改为真实的参数化查询：
+
+```go
+// 当前代码
+for _, arg := range args {
+    stmt = strings.Replace(stmt, "?", arg, 1)  // ⚠️ 无转义
+}
+retBlocks = SelectBlocksRawStmt(stmt, 1, 512)
+
+// 修改为
+// 需要修改 SelectBlocksRawStmt 签名，支持 args 参数
+// retBlocks = SelectBlocksRawStmt(stmt, 1, 512, convertToAny(args)...)
+```
+
+---
+
+#### P1：`queryRawStmt` 增加 SELECT 语句类型检查
+
+在 `queryRawStmt` 开头增加轻量级检查：
+```go
+func queryRawStmt(stmt string, limit int) (ret []map[string]any, err error) {
+    // 新增：轻量级语句类型检查
+    trimmed := strings.TrimSpace(strings.ToLower(stmt))
+    if !strings.HasPrefix(trimmed, "select") && !strings.HasPrefix(trimmed, "pragma") {
+        logging.LogWarnf("blocked non-SELECT statement in queryRawStmt: %s", stmt)
+        return nil, errors.New("only SELECT statements are allowed")
+    }
+    // ... 原有逻辑
+}
+```
+
+---
+
+#### P2：`querySQL` 返回字段白名单
+
+对 `map[string]any` 的 key 做白名单过滤，只允许访问 `blocks` 表的公开字段。
+
+---
+
+#### P2：`/getSnippet` 增加审计日志
+
+记录 IP、角色、筛选条件等信息。
+
+---
 
 ### 11.2 性能优化
 
 1. 模板编译缓存（LRU）
 2. SQL 执行超时（`context.WithTimeout`）
 3. 代码片段增量传输（ETag + 304）
+4. LIMIT 硬性上限防止全表查询导致的性能问题
 
 ### 11.3 功能扩展
 
@@ -884,35 +1257,122 @@ if err != nil {
 
 ## 13. 总结
 
-### 13.1 核心发现
+### 13.1 核心发现（按严重程度排序）
 
-1. **512 和 1024 是默认值而非硬性上限**：三个 SQL 模板函数在 SQL 无 LIMIT 子句时注入默认限制值（512/1024），但当 SQL 中自带 LIMIT 时，解析器会**尊重用户指定的值**，默认限制形同虚设。这是本次分析最重要的发现。
+#### 🔥 P0：类型断言 `default` 分支直接执行 SQL
 
-2. **三个函数的限制机制完全不同**：
-   - `queryBlocks`：sqlparser AST 注入 + `selectBlocksRawStmt` Go 计数回退
-   - `querySpans`：sqlparser AST 注入，解析失败直接返回空
-   - `querySQL`：双解析器三重回退，最终 `queryRawStmt` **无类型检查**
+在 `Query` 函数（`querySQL` 底层）中，类型断言的 `default` 分支**不是返回空，而是调用 `queryRawStmt` 直接执行**：
 
-3. **querySQL 不接受 args 参数**：这实际上是更安全的设计——消除了运行时变量通过 `strings.Replace` 注入 SQL 的攻击面。但返回 `map[string]any` 的动态列特性增加了下游风险。
+```go
+// kernel/sql/block_query.go（约 L381–L395）
+switch parsedStmt.(type) {
+case *sqlparser.Select:
+    // ... 注入 LIMIT ...
+case *sqlparser.Union:
+    // ... 注入 LIMIT ...
+default:
+    // ⚠️ DELETE / UPDATE / INSERT / DROP / CREATE 等所有其他类型
+    return queryRawStmt(stmt, limit)  // 直接执行，无拒绝！
+}
+```
 
-4. **queryRawStmt 是最危险的回退路径**：当两个解析器都失败时，SQL 直接执行且无类型检查，DML 语句可能被执行。`containsLimitClause` 的字符串匹配也可被绕过。
+**后果**：类型断言完全没有起到防护 DML/DDL 的作用。DELETE/DROP 等语句只要语法正确，就会被执行。
 
-### 13.2 512 vs 1024 对三阶段链路的影响汇总
+---
 
-| 阶段 | 512 限制的影响 | 1024 限制的影响（querySQL） | 用户自定义 LIMIT 的风险 |
-|------|--------------|---------------------------|---------------------|
-| 变量替换 | 不影响替换过程 | 不影响替换过程 | 不影响替换过程 |
-| 上下文注入 | ≤512 次循环，输出量中等 | ≤1024 次循环，输出量翻倍 | ⚠️ 无上限，可能产生 MB 级输出 |
-| 内容插入 | DOM 节点数可控 | DOM 节点数翻倍，性能压力增大 | ⚠️ 可能产生数万 DOM 节点 |
+#### 🔥 P0：`queryRawStmt` 计数限行的双重条件陷阱
 
-### 13.3 优先级排序的建议行动项
+```go
+// kernel/sql/block_query.go（L519, L540，精确）
+noLimit := !containsLimitClause(stmt)
+// ...
+if noLimit && limit < count {  // ⚠️ noLimit 是前提条件
+    break
+}
+```
 
-| 优先级 | 行动项 | 说明 |
-|--------|--------|------|
-| P0 | **将 LIMIT 从默认值改为硬性上限** | 在 `SelectBlocksRawStmt` / `SelectSpansRawStmt` / `Query` 中，读取用户 LIMIT 后与硬性上限取 `min` |
-| P0 | **queryRawStmt 增加类型检查** | 在回退路径中拒绝非 SELECT 语句，或改为直接返回空 |
-| P1 | 真实参数化查询 | 将 `strings.Replace` 改为 `db.Query(stmt, args...)` |
-| P1 | 统一 SQL 限制常量 | 定义 `TemplateQueryBlocksLimit` 等常量，消除硬编码 |
-| P2 | querySQL 返回字段白名单 | 对 `map[string]any` 的 key 做过滤 |
-| P2 | `/getSnippet` 增加审计日志 | 记录 IP、角色、筛选条件 |
-| P3 | 模板编译缓存评估 | 基于 LRU 缓存 `*template.Template` |
+**真值表**：
+
+| `containsLimitClause` | `noLimit` | `limit < count` | 是否 break |
+|-----------------------|-----------|-----------------|-----------|
+| `true`（任何含 ` limit ` 的情况） | `false` | 任意 | ❌ **不 break** |
+| `false`（完全不含 ` limit `） | `true` | `true` | ✅ break |
+
+**关键**：只要 SQL 中包含 `" limit "` 字样（即使是在子查询中），`noLimit` 即为 `false`，**计数限行完全失效**。
+
+---
+
+#### 🔥 P0：`containsLimitClause` 子查询误判
+
+```go
+// kernel/sql/block_query.go（L945–L949，精确）
+func containsLimitClause(stmt string) bool {
+    return strings.Contains(strings.ToLower(stmt), " limit ") ||
+        strings.Contains(strings.ToLower(stmt), "\nlimit ") ||
+        strings.Contains(strings.ToLower(stmt), "\tlimit ")
+}
+```
+
+**最危险场景**：子查询包含 LIMIT，外层查询无 LIMIT。此时 `containsLimitClause` 错误返回 `true`，`noLimit=false`，**外层查询可能返回全部数据**。
+
+---
+
+#### ⚠️ P1：512 和 1024 是默认值而非硬性上限
+
+三个 SQL 模板函数的 512/1024 限制仅是**无 LIMIT 子句时的默认注入值**，并非硬性上限。当 SQL 中自带 `LIMIT N` 时，解析器会**尊重用户指定的值**。
+
+---
+
+#### ⚠️ P1：三个函数的限制机制完全不同
+
+| 函数 | 解析器 | 回退路径 | LIMIT 控制 |
+|------|--------|---------|-----------|
+| `queryBlocks` | sqlparser | `selectBlocksRawStmt`（含 errCount 终止） | AST 注入 + Go 计数 |
+| `querySpans` | sqlparser | 直接返回空 | AST 注入 |
+| `querySQL` | sqlparser2 → sqlparser | `queryRawStmt`（无类型检查） | AST 注入 + Go 计数（脆弱） |
+
+---
+
+### 13.2 回退路径完整风险模型
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                    SQL 模板函数入口                               │
+│  queryBlocks / querySpans / querySQL                              │
+└───────────────────────┬──────────────────────────────────────────┘
+                        │
+                        ▼
+┌──────────────────────────────────────────────────────────────────┐
+│              解析器层（第一层防御）                                │
+│  sqlparser / sqlparser2 解析成功？                                 │
+│  ├─ 是 → 类型断言（SELECT/UNION？）                                │
+│  │    ├─ 是 → 注入 LIMIT（用户值优先，默认 512/1024）→ 执行       │
+│  │    └─ 否 → 进入回退路径（⚠️ 直接执行）                           │
+│  └─ 否 → 进入回退路径（⚠️ 直接执行）                               │
+└───────────────────────┬──────────────────────────────────────────┘
+                        ▼
+┌──────────────────────────────────────────────────────────────────┐
+│             回退路径（第二层防御，最脆弱）                         │
+│  queryRawStmt / selectBlocksRawStmt                                │
+│  ├─ 无类型检查 → 直接执行 db.Query(stmt)                           │
+│  ├─ containsLimitClause 检测（脆弱的字符串匹配）                    │
+│  │    ├─ 检测到 limit → noLimit=false → ❌ 不限行                   │
+│  │    └─ 未检测到 limit → noLimit=true → 计数限行                  │
+│  └─ rows.Scan（selectBlocksRawStmt 有 errCount 额外终止）          │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+### 13.3 优先级排序的建议行动项（更新）
+
+| 优先级 | 行动项 | 关联代码位置 |
+|--------|--------|-------------|
+| **P0** | **修复 `Query` 类型断言 `default` 分支，拒绝非 SELECT/UNION** | [block_query.go L393-L394](file:///d:/fz/0601/solo-dogfeeding/code/293-siyuan/kernel/sql/block_query.go#L393-L394) |
+| **P0** | **删除 `queryRawStmt` 的 `noLimit` 条件，始终强制执行上限** | [block_query.go L519, L540](file:///d:/fz/0601/solo-dogfeeding/code/293-siyuan/kernel/sql/block_query.go#L519-L540) |
+| **P0** | **删除 `selectBlocksRawStmt` 的 `noLimit` 条件，始终强制执行上限** | [block_query.go L708, L719](file:///d:/fz/0601/solo-dogfeeding/code/293-siyuan/kernel/sql/block_query.go#L708-L719) |
+| **P0** | **将 LIMIT 从默认值改为硬性上限**（`min(userLimit, hardCap)`） | `SelectBlocksRawStmt` / `SelectSpansRawStmt` / `Query` |
+| **P1** | **统一 SQL 限制常量**，消除硬编码的 512/1024 | `kernel/sql/block_query.go` |
+| **P1** | **真实参数化查询**，将 `strings.Replace` 改为 `db.Query(stmt, args...)` | `SQLTemplateFuncs` |
+| **P1** | **`queryRawStmt` 增加 SELECT 前缀检查** | `queryRawStmt` 开头 |
+| **P2** | **`querySQL` 返回字段白名单** | `Query` 函数 scan 阶段 |
+| **P2** | **`/getSnippet` 增加审计日志** | `getSnippet` API |
+| **P3** | **模板编译缓存评估**（LRU） | `RenderTemplate` / `RenderGoTemplate` |
