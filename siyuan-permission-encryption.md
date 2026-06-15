@@ -9,15 +9,16 @@
 1. [系统架构总览](#1-系统架构总览)
 2. [访问控制体系](#2-访问控制体系)
 3. [密钥与口令状态管理](#3-密钥与口令状态管理)
-4. [解锁流程详解](#4-解锁流程详解)
-5. [内容读写与访问控制联动](#5-内容读写与访问控制联动)
-6. [界面提示联动机制](#6-界面提示联动机制)
-7. [错误处理机制](#7-错误处理机制)
-8. [备份恢复与数据仓库](#8-备份恢复与数据仓库)
-9. [安全边界分析](#9-安全边界分析)
-10. [协作模块关系图](#10-协作模块关系图)
-11. [潜在风险分析](#11-潜在风险分析)
-12. [后续验证清单](#12-后续验证清单)
+4. [同步服务配置加密](#4-同步服务配置加密)
+5. [解锁流程详解](#5-解锁流程详解)
+6. [内容读写与访问控制联动](#6-内容读写与访问控制联动)
+7. [界面提示联动机制](#7-界面提示联动机制)
+8. [错误处理机制](#8-错误处理机制)
+9. [备份恢复与数据仓库](#9-备份恢复与数据仓库)
+10. [安全边界分析](#10-安全边界分析)
+11. [协作模块关系图](#11-协作模块关系图)
+12. [潜在风险分析](#12-潜在风险分析)
+13. [后续验证清单](#13-后续验证清单)
 
 ---
 
@@ -27,27 +28,31 @@ SiYuan 的权限与加密体系由 **三层防护** 构成：
 
 | 层级 | 功能 | 核心模块 |
 |------|------|---------|
-| **网络接入层** | HTTP 请求鉴权、来源校验、跨域防护 | [router.go](file:///d:/fz/0601/solo-dogfeeding/code/296-siyuan/kernel/api/router.go), [session.go](file:///d:/fz/0601/solo-dogfeeding/code/296-siyuan/kernel/model/session.go) |
-| **业务逻辑层** | 角色权限控制、只读模式、发布访问过滤 | [role.go](file:///d:/fz/0601/solo-dogfeeding/code/296-siyuan/kernel/model/role.go), [publish_access.go](file:///d:/fz/0601/solo-dogfeeding/code/296-siyuan/kernel/model/publish_access.go) |
-| **数据存储层** | 数据仓库加密、快照备份、云端同步加密 | [crypt.go](file:///d:/fz/0601/solo-dogfeeding/code/296-siyuan/kernel/util/crypt.go), [repository.go](file:///d:/fz/0601/solo-dogfeeding/code/296-siyuan/kernel/model/repository.go), [repo.go](file:///d:/fz/0601/solo-dogfeeding/code/296-siyuan/kernel/conf/repo.go) |
+| **网络接入层** | HTTP 请求鉴权、来源校验、跨域防护 | [kernel/api/router.go](kernel/api/router.go), [kernel/model/session.go](kernel/model/session.go) |
+| **业务逻辑层** | 角色权限控制、只读模式、发布访问过滤 | [kernel/model/role.go](kernel/model/role.go), [kernel/model/publish_access.go](kernel/model/publish_access.go) |
+| **数据存储层** | 数据仓库加密、快照备份、云端同步加密 | [kernel/util/crypt.go](kernel/util/crypt.go), [kernel/model/repository.go](kernel/model/repository.go), [kernel/conf/repo.go](kernel/conf/repo.go) |
 
 ### 1.1 核心代码文件清单
 
 | 文件路径 | 主要职责 |
 |----------|---------|
-| [kernel/util/crypt.go](file:///d:/fz/0601/solo-dogfeeding/code/296-siyuan/kernel/util/crypt.go) | AES 加密解密、SHA256 哈希 |
-| [kernel/model/auth.go](file:///d:/fz/0601/solo-dogfeeding/code/296-siyuan/kernel/model/auth.go) | JWT 认证、发布服务账户、Basic Auth |
-| [kernel/model/session.go](file:///d:/fz/0601/solo-dogfeeding/code/296-siyuan/kernel/model/session.go) | 访问授权码登录、验证码、登出、角色权限检查中间件 |
-| [kernel/util/session.go](file:///d:/fz/0601/solo-dogfeeding/code/296-siyuan/kernel/util/session.go) | Session 数据结构、验证码计数 |
-| [kernel/model/role.go](file:///d:/fz/0601/solo-dogfeeding/code/296-siyuan/kernel/model/role.go) | 角色定义（Admin/Editor/Reader/Visitor）、角色校验函数 |
-| [kernel/model/repository.go](file:///d:/fz/0601/solo-dogfeeding/code/296-siyuan/kernel/model/repository.go) | 数据仓库密钥管理、快照索引、回滚、云端同步 |
-| [kernel/model/publish_access.go](file:///d:/fz/0601/solo-dogfeeding/code/296-siyuan/kernel/model/publish_access.go) | 发布访问控制（可见性/密码/禁止）、内容过滤 |
-| [kernel/conf/repo.go](file:///d:/fz/0601/solo-dogfeeding/code/296-siyuan/kernel/conf/repo.go) | 数据仓库配置结构（密钥/保留策略） |
-| [kernel/api/repo.go](file:///d:/fz/0601/solo-dogfeeding/code/296-siyuan/kernel/api/repo.go) | 数据仓库 REST API 端点 |
-| [kernel/server/proxy/publish.go](file:///d:/fz/0601/solo-dogfeeding/code/296-siyuan/kernel/server/proxy/publish.go) | 发布服务反向代理、Basic Auth + Session 认证 |
-| [kernel/api/router.go](file:///d:/fz/0601/solo-dogfeeding/code/296-siyuan/kernel/api/router.go) | API 路由注册（中间件链：CheckAuth → CheckAdminRole → CheckReadonly） |
-| [app/stage/auth.html](file:///d:/fz/0601/solo-dogfeeding/code/296-siyuan/app/stage/auth.html) | 前端授权登录页面（验证码/记住我/退出） |
-| [app/src/protyle/util/publishAccess.ts](file:///d:/fz/0601/solo-dogfeeding/code/296-siyuan/app/src/protyle/util/publishAccess.ts) | 前端发布访问控制对话框（5种级别选择） |
+| [kernel/util/crypt.go](kernel/util/crypt.go) | AES 加密解密、SHA256 哈希 |
+| [kernel/model/auth.go](kernel/model/auth.go) | JWT 认证、发布服务账户、Basic Auth |
+| [kernel/model/session.go](kernel/model/session.go) | 访问授权码登录、验证码、登出、角色权限检查中间件 |
+| [kernel/util/session.go](kernel/util/session.go) | Session 数据结构、验证码计数 |
+| [kernel/model/role.go](kernel/model/role.go) | 角色定义（Admin/Editor/Reader/Visitor）、角色校验函数 |
+| [kernel/model/repository.go](kernel/model/repository.go) | 数据仓库密钥管理、快照索引、回滚、云端同步 |
+| [kernel/model/cloud_service.go](kernel/model/cloud_service.go) | 云端用户数据加密、激活码、订阅刷新 |
+| [kernel/model/publish_access.go](kernel/model/publish_access.go) | 发布访问控制（可见性/密码/禁止）、内容过滤 |
+| [kernel/model/sync.go](kernel/model/sync.go) | WebDAV/S3/Local 同步配置管理 |
+| [kernel/conf/repo.go](kernel/conf/repo.go) | 数据仓库配置结构（密钥/保留策略） |
+| [kernel/conf/sync.go](kernel/conf/sync.go) | 同步服务配置结构（WebDAV/S3/Local） |
+| [kernel/api/repo.go](kernel/api/repo.go) | 数据仓库 REST API 端点 |
+| [kernel/api/sync.go](kernel/api/sync.go) | 同步配置导入导出 REST API 端点 |
+| [kernel/server/proxy/publish.go](kernel/server/proxy/publish.go) | 发布服务反向代理、Basic Auth + Session 认证 |
+| [kernel/api/router.go](kernel/api/router.go) | API 路由注册（中间件链：CheckAuth → CheckAdminRole → CheckReadonly） |
+| [app/stage/auth.html](app/stage/auth.html) | 前端授权登录页面（验证码/记住我/退出） |
+| [app/src/protyle/util/publishAccess.ts](app/src/protyle/util/publishAccess.ts) | 前端发布访问控制对话框（5种级别选择） |
 
 ---
 
@@ -55,7 +60,7 @@ SiYuan 的权限与加密体系由 **三层防护** 构成：
 
 ### 2.1 角色模型
 
-定义于 [role.go](file:///d:/fz/0601/solo-dogfeeding/code/296-siyuan/kernel/model/role.go#L21-L32)：
+定义于 [kernel/model/role.go#L21-L32](kernel/model/role.go#L21-L32)：
 
 ```go
 type Role uint
@@ -80,7 +85,7 @@ const (
 
 ### 2.2 认证方式矩阵
 
-系统支持 **6 种认证途径**，定义于 [CheckAuth](file:///d:/fz/0601/solo-dogfeeding/code/296-siyuan/kernel/model/session.go#L207-L384)：
+系统支持 **6 种认证途径**，定义于 [CheckAuth](kernel/model/session.go#L207-L384)：
 
 | 认证方式 | 优先级 | 适用场景 | 授予角色 |
 |----------|--------|---------|---------|
@@ -93,7 +98,7 @@ const (
 
 ### 2.3 中间件执行链
 
-在 [router.go](file:///d:/fz/0601/solo-dogfeeding/code/296-siyuan/kernel/api/router.go) 中，每个受保护 API 按以下顺序注册中间件：
+在 [kernel/api/router.go](kernel/api/router.go) 中，每个受保护 API 按以下顺序注册中间件：
 
 ```
 请求 → CheckAuth → CheckAdminRole → CheckReadonly → 实际 Handler
@@ -113,7 +118,7 @@ ginServer.Handle("POST", "/api/filetree/removeDoc",
 
 ### 2.4 发布服务独立认证
 
-发布服务通过独立的反向代理端口运行，认证逻辑在 [publish.go](file:///d:/fz/0601/solo-dogfeeding/code/296-siyuan/kernel/server/proxy/publish.go#L131-L196)：
+发布服务通过独立的反向代理端口运行，认证逻辑在 [kernel/server/proxy/publish.go#L131-L196](kernel/server/proxy/publish.go#L131-L196)：
 
 1. **Session Cookie 认证**：检查 `publish-visitor-session-id`，有效则直接注入 JWT
 2. **Basic Auth 认证**：校验用户名密码，创建新 Session，返回 Cookie + JWT
@@ -133,13 +138,15 @@ ginServer.Handle("POST", "/api/filetree/removeDoc",
 | **发布访问密码** | `publishAccess.json: password` | 单篇发布文档保护 | 任意字符串 |
 | **发布服务账户** | `conf.json: publish.auth.accounts` | 发布站点全局登录 | 用户名 + 密码 |
 | **JWT 签名密钥** | 内存（`jwtKey`） | 发布服务 Token 签名 | 32 字节（每次启动随机生成） |
-| **静态 AES 密钥** | 代码硬编码 `SK` | 部分内部数据加密 | 16 字节 (AES-128) |
+| **静态 AES 密钥** | 代码硬编码 `SK` | 同步配置导入导出、云端用户数据 | 16 字节 (AES-128) |
+| **WebDAV 密码** | `conf.json: sync.webdav.password` | WebDAV 同步服务认证 | 任意字符串（明文存储） |
+| **S3 SecretKey** | `conf.json: sync.s3.secretKey` | S3 对象存储认证 | 任意字符串（明文存储） |
 
 ### 3.2 数据仓库密钥生命周期
 
-密钥管理位于 [repository.go](file:///d:/fz/0601/solo-dogfeeding/code/296-siyuan/kernel/model/repository.go)，有 **三种生成方式**：
+密钥管理位于 [kernel/model/repository.go](kernel/model/repository.go)，有 **三种生成方式**：
 
-#### 方式一：随机生成密钥 [InitRepoKey](file:///d:/fz/0601/solo-dogfeeding/code/296-siyuan/kernel/model/repository.go#L789-L824)
+#### 方式一：随机生成密钥 [InitRepoKey](kernel/model/repository.go#L789-L824)
 
 ```
 流程：
@@ -150,7 +157,7 @@ ginServer.Handle("POST", "/api/filetree/removeDoc",
   5. 触发首次索引 initDataRepo()
 ```
 
-#### 方式二：通过口令派生密钥 [InitRepoKeyFromPassphrase](file:///d:/fz/0601/solo-dogfeeding/code/296-siyuan/kernel/model/repository.go#L751-L787)
+#### 方式二：通过口令派生密钥 [InitRepoKeyFromPassphrase](kernel/model/repository.go#L751-L787)
 
 ```
 流程：
@@ -166,7 +173,7 @@ ginServer.Handle("POST", "/api/filetree/removeDoc",
   触发首次索引
 ```
 
-#### 方式三：导入现有密钥 [ImportRepoKey](file:///d:/fz/0601/solo-dogfeeding/code/296-siyuan/kernel/model/repository.go#L647-L679)
+#### 方式三：导入现有密钥 [ImportRepoKey](kernel/model/repository.go#L647-L679)
 
 ```
 流程：
@@ -191,26 +198,206 @@ if 1 > len(Conf.Repo.Key) {
 
 该检查贯穿所有仓库操作：索引、回滚、差异对比、云端同步、快照浏览等。
 
-### 3.4 ⚠️ 硬编码静态密钥风险
+### 3.4 ⚠️ 硬编码静态密钥用途与风险
 
-在 [crypt.go](file:///d:/fz/0601/solo-dogfeeding/code/296-siyuan/kernel/util/crypt.go#L29-L29) 中：
+在 [kernel/util/crypt.go#L29-L30](kernel/util/crypt.go#L29-L30) 中：
 
 ```go
-var SK = []byte("696D897C9AA0611B")          // 硬编码密钥
-var IV = []byte("RandomInitVector")            // 硬编码初始向量
+var SK = []byte("696D897C9AA0611B")          // 硬编码密钥 (16字节)
+var IV = []byte("RandomInitVector")            // 硬编码初始向量 (16字节)
 ```
 
+**算法细节**：
 - **算法**：AES-128-CBC + PKCS5Padding
-- **用途**：不明（用于 `AESEncrypt`/`AESDecrypt` 函数）
-- **风险等级**：高（密钥可被源码阅读者获取）
+- **编码链**：明文 → Hex 编码 → AES-CBC 加密 → Hex 编码（输出密文）
+- **解码链**：密文 → Hex 解码 → AES-CBC 解密 → Hex 解码（输出明文）
+
+**已确认的 4 个用途**：
+
+| 用途 | 位置 | 说明 |
+|------|------|------|
+| 云端用户数据本地持久化 | [cloud_service.go#L390](kernel/model/cloud_service.go#L390) | `AESEncrypt(JSON(user))` → `Conf.UserData` → 存 conf.json |
+| 云端用户数据本地加载 | [cloud_service.go#L403](kernel/model/cloud_service.go#L403) | `AESDecrypt(Conf.UserData)` → 恢复 user 对象到内存 |
+| 云端 API 返回数据解密 | [cloud_service.go#L570](kernel/model/cloud_service.go#L570) | 云端 `/apis/siyuan/user` 返回加密的用户数据，本地解密 |
+| 同步配置导入导出 | [api/sync.go#L144,L193,L337,L386](kernel/api/sync.go#L144) | WebDAV / S3 配置包导出加密、导入解密 |
+
+**风险等级**：高（密钥公开于源码，所有加密数据可被解密）
 
 ---
 
-## 4. 解锁流程详解
+## 4. 同步服务配置加密
 
-### 4.1 工作区访问授权码解锁
+### 4.1 同步服务配置结构
 
-核心流程位于 [LoginAuth](file:///d:/fz/0601/solo-dogfeeding/code/296-siyuan/kernel/model/session.go#L67-L163)：
+定义于 [kernel/conf/sync.go#L46-L78](kernel/conf/sync.go#L46-L78)：
+
+```go
+type WebDAV struct {
+    Endpoint       string `json:"endpoint"`       // 服务端点 URL
+    Username       string `json:"username"`       // 用户名 (明文)
+    Password       string `json:"password"`       // 密码 (明文)
+    SkipTlsVerify  bool   `json:"skipTlsVerify"`  // 跳过 TLS 验证
+    Timeout        int    `json:"timeout"`        // 超时秒数
+    ConcurrentReqs int    `json:"concurrentReqs"` // 并发请求数
+}
+
+type S3 struct {
+    Endpoint       string `json:"endpoint"`       // 服务端点
+    AccessKey      string `json:"accessKey"`      // Access Key (明文)
+    SecretKey      string `json:"secretKey"`      // Secret Key (明文)
+    Bucket         string `json:"bucket"`         // 存储空间
+    Region         string `json:"region"`         // 存储区域
+    PathStyle      bool   `json:"pathStyle"`      // 路径风格
+    SkipTlsVerify  bool   `json:"skipTlsVerify"`  // 跳过 TLS 验证
+    Timeout        int    `json:"timeout"`
+    ConcurrentReqs int    `json:"concurrentReqs"`
+}
+```
+
+**同步提供者枚举**：
+```go
+const (
+    ProviderSiYuan = 0 // 思源官方云端
+    ProviderS3     = 2 // S3 协议对象存储
+    ProviderWebDAV = 3 // WebDAV 协议
+    ProviderLocal  = 4 // 本地文件系统
+)
+```
+
+### 4.2 配置存储方式
+
+**运行时存储**：
+- WebDAV 用户名/密码、S3 AccessKey/SecretKey **全部明文** 存储在 `conf.json` 的 `Sync` 节点下
+- 设置函数：[kernel/model/sync.go#L434-L467](kernel/model/sync.go#L434-L467)
+  - `SetSyncProviderWebDAV()` → 直接赋值 `Conf.Sync.WebDAV = webdav`
+  - `SetSyncProviderS3()` → 直接赋值 `Conf.Sync.S3 = s3`
+
+**脱敏处理**：
+- `GetMaskedConf()` [kernel/model/conf.go#L1038-L1058](kernel/model/conf.go#L1038-L1058)：
+  - ✅ `UserData` 置空
+  - ✅ `AccessAuthCode` 掩码为 `*******`
+  - ❌ **同步配置（含密码/密钥）原样返回**
+- `HideConfSecret()` [kernel/model/conf.go#L1062-L1076](kernel/model/conf.go#L1062-L1076)：
+  - ✅ 整个 `Sync` 对象重置为空
+  - ✅ 同时清空 AI、Api、Repo、Publish 等敏感配置
+
+### 4.3 WebDAV 配置导入导出加密流程
+
+#### 导出流程 [exportSyncProviderWebDAV](kernel/api/sync.go#L167-L229)
+
+```
+用户点击"导出"
+    ↓
+[1] 序列化 JSON
+    data = JSON.Marshal(Conf.Sync.WebDAV)
+    包含明文: endpoint, username, password, skipTlsVerify...
+    ↓
+[2] 静态 AES 加密
+    dataStr = util.AESEncrypt(string(data))
+    → 明文 → Hex → AES-128-CBC(SK, IV) → Hex
+    ↓
+[3] 写入临时文件
+    文件名: siyuan-webdav-YYYYMMDDHHMMSS.json
+    路径: {TempDir}/export/{name}
+    权限: 0644
+    ↓
+[4] 打包 ZIP
+    创建 {name}.zip，包含 {name}.json
+    ↓
+[5] 返回下载路径
+    /export/{name}.zip
+```
+
+#### 导入流程 [importSyncProviderWebDAV](kernel/api/sync.go#L38-L165)
+
+```
+用户上传 .zip 或 .json 文件
+    ↓
+[1] 读取上传文件到内存
+    ↓
+[2] 解压/提取
+    .zip → 解压到 {TempDir}/import/webdav/
+    .json → 直接复制
+    ↓
+[3] 验证包结构
+    临时目录必须仅含 1 个文件
+    ↓
+[4] AES 解密
+    data = util.AESDecrypt(string(fileContent))
+    → Hex 解码 → AES 解密 → Hex 解码
+    ↓
+[5] 反序列化
+    JSON.Unmarshal(data, &webdav)
+    ↓
+[6] 验证与保存
+    SetSyncProviderWebDAV(webdav)
+    → 检查坚果云屏蔽规则
+    → 规范化 endpoint/timeout/concurrentReqs
+    → Conf.Save() 持久化到 conf.json
+    ↓
+[7] 返回当前配置
+    ret.Data = {"webdav": Conf.Sync.WebDAV}
+```
+
+### 4.4 S3 配置导入导出加密流程
+
+S3 配置导入导出流程与 WebDAV **完全一致**，定义于：
+- 导出：[exportSyncProviderS3](kernel/api/sync.go#L360-L422)
+- 导入：[importSyncProviderS3](kernel/api/sync.go#L231-L358)
+
+### 4.5 与内容读写、安全边界的关联
+
+**数据流向图**：
+
+```
+┌─────────────┐   明文密码    ┌─────────────┐   AES-256-GCM    ┌────────────┐
+│ conf.json   │────────────▶│  Sync 模块   │────────────────▶│ WebDAV/S3  │
+│ (WebDAV    │  (运行时内存) │ (同步引擎)  │  (repo.key 加密) │  云端存储  │
+│  Password) │               └─────────────┘                  └────────────┘
+│             │                                                        ▲
+│ (S3         │               ┌─────────────┐                          │
+│  SecretKey) │────────────▶│ 数据仓库     │                          │
+│             │  明文引用    │ (dejavu库)  │─── AES-256-GCM 对象 ────┘
+└─────────────┘               └─────────────┘
+        │
+        │ 导入/导出 AES-128-CBC (SK硬编码)
+        ▼
+┌─────────────┐
+│ 导出包      │  可被任意获取源码者解密
+│ .zip/.json  │
+└─────────────┘
+```
+
+**关键关联点**：
+
+1. **同步认证与内容加密分层**：
+   - WebDAV/S3 认证使用明文密码建立连接
+   - 但传输的**数据内容**（仓库对象）已通过 `repo.key` 独立加密为 AES-256-GCM
+   - 即使 WebDAV 服务被攻破，获取的对象仍需 repo.key 才能解密
+
+2. **安全边界分层**：
+   ```
+   边界 1 (网络): HTTPS 传输 → 保护同步认证密码
+   边界 2 (应用): 导入导出 AES → 保护配置包在文件传递中不被一眼看穿
+   边界 3 (数据): repo.key AES-256 → 保护文档内容本身
+   ```
+
+3. **导入导出包的安全意义**：
+   - 防止导出的 `.zip` 包在邮件/聊天传输中被直接阅读密码
+   - **但不提供真正的安全性**（密钥在源码中公开）
+   - 属于"混淆"而非"加密"级别保护
+
+4. **API 权限边界**：
+   - 导入导出端点均需 `CheckAuth + CheckAdminRole + CheckReadonly` 三重校验
+   - 仅管理员可操作，防止低权限用户获取同步密码
+
+---
+
+## 5. 解锁流程详解
+
+### 5.1 工作区访问授权码解锁
+
+核心流程位于 [LoginAuth](kernel/model/session.go#L67-L163)：
 
 ```
 用户输入 authCode + 可选 captcha + rememberMe
@@ -243,7 +430,7 @@ var IV = []byte("RandomInitVector")            // 硬编码初始向量
     - 前端 auth.html 监听后跳转
 ```
 
-### 4.2 验证码触发机制 [NeedCaptcha](file:///d:/fz/0601/solo-dogfeeding/code/296-siyuan/kernel/util/session.go#L28-L30)
+### 5.2 验证码触发机制 [NeedCaptcha](kernel/util/session.go#L28-L30)
 
 ```go
 func NeedCaptcha() bool {
@@ -251,16 +438,16 @@ func NeedCaptcha() bool {
 }
 ```
 
-**验证码生成参数** ([GetCaptcha](file:///d:/fz/0601/solo-dogfeeding/code/296-siyuan/kernel/model/session.go#L165-L193))：
+**验证码生成参数** ([GetCaptcha](kernel/model/session.go#L165-L193))：
 - 尺寸：100×26 像素
 - 字符集：`ABCDEFGHKLMNPQRSTUVWXYZ23456789`（去除易混淆字符）
 - 噪声：0.5
 - 曲线：0 条
 - 存入 session，每次验证后无论成功失败都重置
 
-### 4.3 发布文档密码解锁
+### 5.3 发布文档密码解锁
 
-文档级密码保护由 [CheckPublishAuthCookie](file:///d:/fz/0601/solo-dogfeeding/code/296-siyuan/kernel/model/publish_access.go#L240-L243) 和 [SetPublishAuthCookie](file:///d:/fz/0601/solo-dogfeeding/code/296-siyuan/kernel/model/publish_access.go#L228-L238) 实现：
+文档级密码保护由 [CheckPublishAuthCookie](kernel/model/publish_access.go#L240-L243) 和 [SetPublishAuthCookie](kernel/model/publish_access.go#L228-L238) 实现：
 
 ```
 访问受保护文档路径
@@ -282,21 +469,28 @@ func NeedCaptcha() bool {
 - MaxAge = 24 小时
 - HttpOnly = true, Secure = SSL, Path = /
 
-### 4.4 数据仓库密钥解锁（隐式）
+### 5.4 数据仓库密钥解锁（隐式）
 
 数据仓库密钥 **不单独解锁**，而是：
 1. 工作区启动时从 `conf.json` 加载到内存
 2. 每个仓库操作前检查 `len(Conf.Repo.Key) > 0`
 3. 如果为 nil/空 → 返回提示"请初始化数据仓库"
-4. **重置仓库** ([ResetRepo](file:///d:/fz/0601/solo-dogfeeding/code/296-siyuan/kernel/model/repository.go#L681-L703)) 会清空密钥 + 禁用同步
+4. **重置仓库** ([ResetRepo](kernel/model/repository.go#L681-L703)) 会清空密钥 + 禁用同步
+
+### 5.5 云端用户数据解锁（隐式）
+
+云端用户数据通过 `AESEncrypt` 加密存储在 `Conf.UserData` 中：
+- 启动时 [loadUserFromConf](kernel/model/cloud_service.go#L398-L410) 自动调用 `AESDecrypt` 解密
+- 登录/刷新用户时 [RefreshUser](kernel/model/cloud_service.go#L330-L396) 重新加密保存
+- 解密后 User 对象仅在内存中存在，不持久化
 
 ---
 
-## 5. 内容读写与访问控制联动
+## 6. 内容读写与访问控制联动
 
-### 5.1 发布访问控制过滤器链
+### 6.1 发布访问控制过滤器链
 
-在 [publish_access.go](file:///d:/fz/0601/solo-dogfeeding/code/296-siyuan/kernel/model/publish_access.go) 中实现了 **多层内容过滤**：
+在 [kernel/model/publish_access.go](kernel/model/publish_access.go) 中实现了 **多层内容过滤**：
 
 ```
 原始内容
@@ -324,9 +518,9 @@ func NeedCaptcha() bool {
     → 仅保留可见文档引用的 assets
 ```
 
-### 5.2 过滤核心函数分析
+### 6.2 过滤核心函数分析
 
-#### 密码路径继承 [GetPathPasswordByPublishAccess](file:///d:/fz/0601/solo-dogfeeding/code/296-siyuan/kernel/model/publish_access.go#L191-L216)
+#### 密码路径继承 [GetPathPasswordByPublishAccess](kernel/model/publish_access.go#L191-L216)
 
 ```
 算法：继承式密码查找
@@ -345,7 +539,7 @@ func NeedCaptcha() bool {
 
 **关键特性**：子文档继承父文档/笔记本的密码，无需每篇单独设置。
 
-#### 内容级过滤 [FilterContentByPublishAccess](file:///d:/fz/0601/solo-dogfeeding/code/296-siyuan/kernel/model/publish_access.go#L471-L518)
+#### 内容级过滤 [FilterContentByPublishAccess](kernel/model/publish_access.go#L471-L518)
 
 输出两种 HTML 占位：
 
@@ -368,9 +562,9 @@ func NeedCaptcha() bool {
 </div>
 ```
 
-### 5.3 只读模式联动
+### 6.3 只读模式联动
 
-只读模式双重检查 ([CheckReadonly](file:///d:/fz/0601/solo-dogfeeding/code/296-siyuan/kernel/model/session.go#L195-L205))：
+只读模式双重检查 ([CheckReadonly](kernel/model/session.go#L195-L205))：
 
 ```go
 func CheckReadonly(c *gin.Context) {
@@ -392,9 +586,9 @@ func CheckReadonly(c *gin.Context) {
 
 ---
 
-## 6. 界面提示联动机制
+## 7. 界面提示联动机制
 
-### 6.1 授权登录页面 [auth.html](file:///d:/fz/0601/solo-dogfeeding/code/296-siyuan/app/stage/auth.html)
+### 7.1 授权登录页面 [app/stage/auth.html](app/stage/auth.html)
 
 **页面元素与后端联动**：
 
@@ -406,7 +600,7 @@ func CheckReadonly(c *gin.Context) {
 | "退出思源"按钮 | 仅 localhost + 主窗口 | 调用 /api/system/exit |
 | 顶部错误提示 Snackbar | `response.code !== 0` | 返回 response.msg |
 
-**WebSocket 实时联动**（[auth.html:584-591](file:///d:/fz/0601/solo-dogfeeding/code/296-siyuan/app/stage/auth.html#L584-L591)）：
+**WebSocket 实时联动**（[app/stage/auth.html#L584-L591](app/stage/auth.html#L584-L591)）：
 
 ```javascript
 const ws = new WebSocket('ws://host/ws?...&type=auth');
@@ -420,9 +614,9 @@ ws.onmessage = (event) => {
 
 **用途**：多标签页/多窗口登录同步——一个窗口登录，所有授权页自动跳转。
 
-### 6.2 发布访问控制对话框 [publishAccess.ts](file:///d:/fz/0601/solo-dogfeeding/code/296-siyuan/app/src/protyle/util/publishAccess.ts)
+### 7.2 发布访问控制对话框 [app/src/protyle/util/publishAccess.ts](app/src/protyle/util/publishAccess.ts)
 
-**五级访问控制模型** ([getPublishAccessLevel](file:///d:/fz/0601/solo-dogfeeding/code/296-siyuan/app/src/protyle/util/publishAccess.ts#L50-L67))：
+**五级访问控制模型** ([getPublishAccessLevel](app/src/protyle/util/publishAccess.ts#L50-L67))：
 
 | 级别 | 图标 | visible | password | disable | 说明 |
 |------|------|---------|----------|---------|------|
@@ -446,7 +640,7 @@ openPublishAccessDialog(id)
     ↓ 调用方 POST /api/filetree/setPublishAccess
 ```
 
-### 6.3 消息广播机制
+### 7.3 消息广播机制
 
 关键广播事件（通过 WebSocket `BroadcastByType`）：
 
@@ -459,9 +653,9 @@ openPublishAccessDialog(id)
 
 ---
 
-## 7. 错误处理机制
+## 8. 错误处理机制
 
-### 7.1 认证错误处理矩阵
+### 8.1 认证错误处理矩阵
 
 | 错误场景 | HTTP 状态码 | 返回 Code | 消息 (Language ID) | 附加操作 |
 |---------|------------|-----------|-------------------|---------|
@@ -478,7 +672,20 @@ openPublishAccessDialog(id)
 | 角色不足 (Reader) | 403 | - | (空响应体) | Forbidden |
 | 只读模式写操作 | 200 | -1 | "当前处于只读模式" (34) | 5秒后自动关闭提示 |
 
-### 7.2 数据仓库错误处理
+### 8.2 同步配置导入导出错误处理
+
+| 错误场景 | HTTP 状态码 | 返回 Code | 说明 |
+|---------|------------|-----------|------|
+| 上传文件数 ≠ 1 | 200 | -1 | "invalid upload file" |
+| ZIP 解压失败 | 200 | -1 | "invalid WebDAV provider package" |
+| 解密失败 | 200 | -1 | AESDecrypt 返回 nil + 日志错误 |
+| JSON 反序列化失败 | 200 | -1 | "import WebDAV provider failed" |
+| 坚果云 WebDAV 拦截 | 200 | -1 | "不支持配置坚果云 WebDAV 进行同步" (194) |
+| 路径遍历攻击 | 200 | -1 | "import path is not sub path of import dir" |
+| 导出 JSON 序列化失败 | 200 | -1 | "export WebDAV provider failed" |
+| ZIP 打包失败 | 200 | -1 | "export WebDAV provider failed" |
+
+### 8.3 数据仓库错误处理
 
 | 错误场景 | 处理方式 | 用户提示 |
 |---------|---------|---------|
@@ -490,9 +697,9 @@ openPublishAccessDialog(id)
 | 密钥导入格式错误 | Base64 解码失败 / 长度 ≠ 32 | "导入数据仓库密钥失败" (157) |
 | 仓库致命错误 `ErrRepoFatal` | 自动重试间隔递增 | 同步状态写入错误信息 |
 
-### 7.3 自动重试与降级
+### 8.4 自动重试与降级
 
-**同步重试策略** ([repository.go](file:///d:/fz/0601/solo-dogfeeding/code/296-siyuan/kernel/model/repository.go))：
+**同步重试策略** ([kernel/model/repository.go](kernel/model/repository.go))：
 
 ```
 同步失败
@@ -511,9 +718,9 @@ planSyncAfter( fixSyncInterval = 30s * 2^autoSyncErrCount )
 
 ---
 
-## 8. 备份恢复与数据仓库
+## 9. 备份恢复与数据仓库
 
-### 8.1 数据仓库架构
+### 9.1 数据仓库架构
 
 ```
 workspace/
@@ -521,17 +728,18 @@ workspace/
 │  ├─ objects/                # 内容寻址块 (AES-256 加密)
 │  ├─ indexes/                # 快照索引列表
 │  └─ tags/                   # 命名快照标签
-└─ data/.siyuan/conf.json     # repo.key 存储处
+└─ data/.siyuan/conf.json     # repo.key, WebDAV/S3 密码存储处
 ```
 
 **加密范围**：
 - **仓库文件内容块**：使用 `Conf.Repo.Key` AES-256-GCM (dejavu/encryption 库)
-- **工作区配置文件**：conf.json  **明文** 存储 (包含 repo.key!)
+- **工作区配置文件**：conf.json  **明文** 存储 (包含 repo.key + WebDAV/S3 密码!)
 - **源文档 (.sy 文件)**：**明文** JSON 存储在 workspace/data/
 
 > ⚠️ **重要理解**：数据仓库加密保护的是 **快照/备份/同步数据**，不是工作区的运行时文档文件。
+> ⚠️ **同步配置加密分层**：导入导出包使用 AES-128 混淆保护，但 conf.json 中仍为明文。
 
-### 8.2 快照创建流程 [IndexRepo](file:///d:/fz/0601/solo-dogfeeding/code/296-siyuan/kernel/model/repository.go#L1162-L1205)
+### 9.2 快照创建流程 [IndexRepo](kernel/model/repository.go#L1162-L1205)
 
 ```
 触发：用户手动 / 同步前自动 / 回滚前自动
@@ -551,7 +759,7 @@ workspace/
     └─ 不同 → "已创建快照，耗时 X 秒" (147)
 ```
 
-### 8.3 快照恢复流程 [checkoutRepo](file:///d:/fz/0601/solo-dogfeeding/code/296-siyuan/kernel/model/repository.go#L839-L896)
+### 9.3 快照恢复流程 [checkoutRepo](kernel/model/repository.go#L839-L896)
 
 ```
 触发：用户选择历史快照 → CheckoutRepo(id)
@@ -575,7 +783,7 @@ workspace/
     若原先是开启同步 → 7秒后推送提醒"记得开启同步"
 ```
 
-### 8.4 单文件回滚 [RollbackRepoSnapshotFile](file:///d:/fz/0601/solo-dogfeeding/code/296-siyuan/kernel/model/repository.go#L191-L297)
+### 9.4 单文件回滚 [RollbackRepoSnapshotFile](kernel/model/repository.go#L191-L297)
 
 ```
 输入: fileID (快照文件引用)
@@ -594,9 +802,9 @@ repo.OpenFile(file) → 解密获取字节流
 IncSync() → 标记需要同步
 ```
 
-### 8.5 仓库清理策略
+### 9.5 仓库清理策略
 
-**自动清理** ([autoPurgeRepo](file:///d:/fz/0601/solo-dogfeeding/code/296-siyuan/kernel/model/repository.go#L75-L168))：
+**自动清理** ([autoPurgeRepo](kernel/model/repository.go#L75-L168))：
 - 每 12 小时执行一次（首次同步后启动）
 - `IndexRetentionDays` (默认 180天)：超出此范围的索引可被清理
 - `RetentionIndexesDaily` (默认 2个/天)：每天保留索引数量
@@ -605,11 +813,11 @@ IncSync() → 标记需要同步
 
 ---
 
-## 9. 安全边界分析
+## 10. 安全边界分析
 
-### 9.1 网络边界
+### 10.1 网络边界
 
-#### 本地访问白名单 [CheckAuth](file:///d:/fz/0601/solo-dogfeeding/code/296-siyuan/kernel/model/session.go#L258-L287)
+#### 本地访问白名单 [CheckAuth](kernel/model/session.go#L258-L287)
 
 ```
 条件 (所有条件满足 → 允许无授权码)：
@@ -625,7 +833,7 @@ IncSync() → 标记需要同步
 
 **边界穿透风险**：反向代理伪造 `X-Forwarded-Host: 127.0.0.1` → 被第3层 Host/Origin 检查拦截。
 
-#### 发布服务网络隔离 [publish.go](file:///d:/fz/0601/solo-dogfeeding/code/296-siyuan/kernel/server/proxy/publish.go)
+#### 发布服务网络隔离 [kernel/server/proxy/publish.go](kernel/server/proxy/publish.go)
 
 ```
 外部请求 → 发布端口 (独立 listener)
@@ -641,73 +849,104 @@ IncSync() → 标记需要同步
 
 **关键点**：发布服务的 JWT 密钥每次启动重新生成（`crypto/rand 32字节`），重启后所有发布服务会话失效。
 
-### 9.2 数据边界
+### 10.2 数据边界
 
 | 数据区域 | 加密状态 | 访问控制 |
 |---------|---------|---------|
 | workspace/data/*.sy | 明文 | 系统文件权限 + API 鉴权 |
-| workspace/repo/objects/* | AES-256-GCM | repo.key 持有者可解密 |
-| 云端同步对象 | AES-256-GCM | 同上 + 云端账户认证 |
-| workspace/conf.json | 明文 (含 repo.key!) | 系统文件权限 |
+| workspace/repo/objects/* | AES-256-GCM (repo.key) | repo.key 持有者可解密 |
+| 云端同步对象 | AES-256-GCM (repo.key) | 同上 + 云端账户认证 |
+| workspace/conf.json | 明文 (含 repo.key + WebDAV/S3 密码!) | 系统文件权限 |
+| 同步配置导出包 (.zip) | AES-128-CBC (硬编码 SK) | 混淆级保护，可被源码读者解密 |
+| Conf.UserData (云端用户) | AES-128-CBC (硬编码 SK) | 混淆级保护 |
 | Session Cookie (浏览器) | HttpOnly + Secure(SSL时) | 浏览器同源策略 |
 | 发布密码 Cookie | SHA256 哈希 + HttpOnly | 24小时过期 |
 
-### 9.3 并发安全边界
+### 10.3 同步配置安全边界
+
+```
+导出流程边界：
+  内存 (明文 WebDAV 密码)
+      ↓ AESEncrypt(SK)
+  导出包 (.zip/.json) → AES-128 混淆
+      ↓ 网络传输 (HTTPS)
+  用户存储 (U盘/邮件)
+      ↓ 导入时 AESDecrypt(SK)
+  内存 → conf.json (明文持久化)
+
+安全漏洞链：
+  源码公开 → SK 已知 → 所有历史导出包可被解密 → 获取 WebDAV/S3 密码
+  ↓
+  conf.json 明文 → 直接获取密码
+  ↓
+  结合 HTTPS 抓包 → 获取同步数据 → 需 repo.key 才能解密内容
+```
+
+### 10.4 并发安全边界
 
 - **Session 写入**：`sessionLock sync.Mutex` 保护 sessionsMap
 - **发布访问控制缓存**：`publishAccessLock sync.Mutex` + 30秒 TTL
-- **API 并发控制**：写操作路径全局串行化 ([ControlConcurrency](file:///d:/fz/0601/solo-dogfeeding/code/296-siyuan/kernel/model/session.go#L456-L507))
+- **API 并发控制**：写操作路径全局串行化 ([ControlConcurrency](kernel/model/session.go#L456-L507))
 - **仓库操作**：dejavu 库内部文件锁 `filelock`
+- **导入导出临时目录**：使用 `TempDir` 隔离 + 路径遍历检查 (`IsSubPath`)
 
 ---
 
-## 10. 协作模块关系图
+## 11. 协作模块关系图
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                        前端层 (Electron/Browser)                      │
-│  ┌──────────────┐     ┌───────────────────┐    ┌───────────────────┐  │
-│  │  auth.html   │     │ publishAccess.ts  │    │   password_prompt │  │
-│  │ (登录/验证码)│────▶│ (5级发布权限对话框)│    │   (PDF密码等)    │  │
-│  └──────┬───────┘     └─────────┬─────────┘    └───────────────────┘  │
-│         │                      │                  ▲                   │
-│         │ POST /api/system/*   │ GET/POST filetree│                   │
-└─────────┼──────────────────────┼──────────────────┼───────────────────┘
-          │                      │                  │
-┌─────────▼──────────────────────▼──────────────────▼───────────────────┐
-│                        API 路由层 (router.go)                           │
-│  ┌─────────────────────────────────────────────────────────────────┐  │
-│  │  中间件链: Recover → Timing → ControlConcurrency → CheckAuth     │  │
-│  │             → CheckAdminRole → CheckReadonly → Handler          │  │
-│  └─────────────────────────────────────────────────────────────────┘  │
-└─────────┬──────────────────────┬──────────────────────────────────────┘
-          │                      │
-┌─────────▼──────────────────────▼──────────────────────────────────────┐
-│                        业务模型层 (model/)                              │
-│  ┌───────────────┐  ┌────────────────┐  ┌────────────────────────────┐ │
-│  │ session.go    │  │publish_access. │  │     repository.go          │ │
-│  │ ·登录/登出     │  │go              │  │ ·密钥管理(3种方式)         │ │
-│  │ ·验证码       │  │ ·5级过滤链      │  │ ·快照索引/回滚              │ │
-│  │ ·CheckAuth    │  │ ·密码Cookie     │  │ ·云端同步(上传/下载/合并)  │ │
-│  │ ·角色检查     │  │ ·内容/视图/图   │  │ ·冲突处理(副本/历史)       │ │
-│  └───────┬───────┘  │   过滤         │  └───────────┬────────────────┘ │
-│          │          └────────┬───────┘              │                  │
-│  ┌───────▼───────┐  ┌───────▼────────┐  ┌───────────▼────────────────┐ │
-│  │   auth.go     │  │   role.go      │  │     crypt.go               │ │
-│  │ ·JWT生成/解析 │  │ ·4级角色定义   │  │ ·AES-128-CBC(硬编码密钥)   │ │
-│  │ ·发布账户管理 │  │ ·权限校验函数  │  │ ·SHA256哈希                │ │
-│  └───────────────┘  └────────────────┘  └────────────────────────────┘ │
+┌───────────────────────────────────────────────────────────────────────┐
+│                         前端层 (Electron/Browser)                       │
+│  ┌──────────────┐     ┌───────────────────┐    ┌────────────────────┐  │
+│  │  auth.html   │     │ publishAccess.ts  │    │ syncConfigDialog   │  │
+│  │ (登录/验证码)│────▶│ (5级发布权限对话框)│    │ (WebDAV/S3导入导出)│  │
+│  └──────┬───────┘     └─────────┬─────────┘    └─────────┬──────────┘  │
+│         │                      │                          │             │
+│         │ POST /api/system/*   │ GET/POST filetree       │ POST /api/sync │
+└─────────┼──────────────────────┼──────────────────────────┼─────────────┘
+          │                      │                          │
+┌─────────▼──────────────────────▼──────────────────────────▼─────────────┐
+│                        API 路由层 (kernel/api/)                          │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │  中间件链: Recover → Timing → ControlConcurrency → CheckAuth        │  │
+│  │             → CheckAdminRole → CheckReadonly → Handler             │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+└─────────┬──────────────────────┬──────────────────────────┬─────────────┘
+          │                      │                          │
+┌─────────▼──────────────────────▼──────────────────────────▼─────────────┐
+│                        业务模型层 (kernel/model/)                        │
+│  ┌───────────────┐  ┌────────────────┐  ┌──────────────────────────────┐ │
+│  │ session.go    │  │publish_access. │  │     repository.go            │ │
+│  │ ·登录/登出     │  │go              │  │ ·密钥管理(3种方式)           │ │
+│  │ ·验证码       │  │ ·5级过滤链      │  │ ·快照索引/回滚                │ │
+│  │ ·CheckAuth    │  │ ·密码Cookie     │  │ ·云端同步(上传/下载/合并)    │ │
+│  │ ·角色检查     │  │ ·内容/视图/图   │  │ ·冲突处理(副本/历史)         │ │
+│  └───────┬───────┘  │   过滤         │  └─────────────┬────────────────┘ │
+│          │          └────────┬───────┘                │                  │
+│  ┌───────▼───────┐  ┌───────▼────────┐  ┌─────────────▼────────────────┐ │
+│  │   auth.go     │  │   role.go      │  │     cloud_service.go         │ │
+│  │ ·JWT生成/解析 │  │ ·4级角色定义   │  │ ·用户数据 AESEncrypt/Decrypt  │ │
+│  │ ·发布账户管理 │  │ ·权限校验函数  │  │ ·激活码/订阅刷新              │ │
+│  └───────────────┘  └────────────────┘  └─────────────┬────────────────┘ │
+│                                                        │                  │
+│  ┌──────────────────────────────┐  ┌───────────────────▼──────────────┐ │
+│  │     sync.go                  │  │          crypt.go                │ │
+│  │ ·WebDAV/S3 配置管理          │  │ ·AES-128-CBC (硬编码 SK/IV)      │ │
+│  │ ·坚果云拦截/参数规范化        │  │ ·SHA256 哈希                    │ │
+│  │ ·同步模式/间隔设置            │  │                                 │ │
+│  └──────────────────────────────┘  └──────────────────────────────────┘ │
 └─────────┬──────────────────────────────────────────────────────────────┘
           │
 ┌─────────▼──────────────────────────────────────────────────────────────┐
-│                        配置/持久化层 (conf/)                            │
+│                        配置/持久化层 (kernel/conf/)                      │
 │  ┌───────────────────┐  ┌──────────────────┐  ┌──────────────────────┐ │
-│  │ conf.go           │  │ repo.go          │  │ publish.go           │ │
-│  │ ·AccessAuthCode   │  │ ·Key [32]byte    │  │ ·端口/启用/账户      │ │
-│  │ ·Api.Token        │  │ ·保留天数/数量   │  │ ·密码                │ │
-│  │ ·ReadOnly         │  │ ·本地仓库路径    │  │                      │ │
+│  │ conf.go           │  │ repo.go          │  │ sync.go              │ │
+│  │ ·AccessAuthCode   │  │ ·Key [32]byte    │  │ ·WebDAV (明文密码)   │ │
+│  │ ·Api.Token        │  │ ·保留天数/数量   │  │ ·S3 (明文SecretKey)  │ │
+│  │ ·UserData (AES)   │  │ ·本地仓库路径    │  │ ·Local/Provider枚举  │ │
+│  │ ·ReadOnly         │  │                  │  │                      │ │
 │  └───────────────────┘  └──────────────────┘  └──────────────────────┘ │
-└─────────────────────────────────────────────────────────────────────────┘
+└─────────┬──────────────────────────────────────────────────────────────┘
           │
 ┌─────────▼──────────────────────────────────────────────────────────────┐
 │                        外部服务/存储层                                    │
@@ -716,46 +955,50 @@ IncSync() → 标记需要同步
 │  │ (AES-GCM加密     │  │ (HTTPS + API    │  │ (第三方同步目标)       │ │
 │  │  内容寻址存储)   │  │  签名 Token)    │  │                        │ │
 │  └──────────────────┘  └─────────────────┘  └────────────────────────┘ │
-└─────────────────────────────────────────────────────────────────────────┘
+└────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 11. 潜在风险分析
+## 12. 潜在风险分析
 
-### 11.1 高风险项
+### 12.1 高风险项
 
 | 风险 | 位置 | 影响 | 建议 |
 |------|------|------|------|
-| **conf.json 明文存储密钥** | [conf.go](file:///d:/fz/0601/solo-dogfeeding/code/296-siyuan/kernel/model/conf.go) | 攻击者获取工作区目录即可拿到 repo.key，解密所有备份/快照 | 考虑使用 OS Keychain/DPAPI 加密存储 |
-| **硬编码 AES 密钥** | [crypt.go:29](file:///d:/fz/0601/solo-dogfeeding/code/296-siyuan/kernel/util/crypt.go#L29) | `SK` 和 `IV` 公开于源码，任何使用 `AESEncrypt` 的数据可被解密 | 评估该加密的实际用途，考虑移除或动态生成 |
-| **发布密码 SHA256 无盐** | [publish_access.go:229](file:///d:/fz/0601/solo-dogfeeding/code/296-siyuan/kernel/model/publish_access.go#L229) | Cookie 值 = SHA256(ID+password)，可彩虹表破解弱密码 | 改为使用 bcrypt/argon2 + 随机盐 |
+| **conf.json 明文存储密钥** | [kernel/model/conf.go](kernel/model/conf.go) | 攻击者获取工作区目录即可拿到 repo.key、WebDAV 密码、S3 SecretKey，解密所有备份/快照 + 登录第三方同步服务 | 考虑使用 OS Keychain/DPAPI 加密存储敏感配置 |
+| **硬编码 AES 密钥** | [kernel/util/crypt.go#L29](kernel/util/crypt.go#L29) | `SK="696D897C9AA0611B"` 和 `IV` 公开于源码，所有同步配置导出包、UserData 可被解密 | 评估是否仍需该加密，或改为动态生成密钥绑定设备 |
+| **同步配置导入导出伪加密** | [kernel/api/sync.go#L144,L193](kernel/api/sync.go#L144) | 导出包使用硬编码密钥加密，形同虚设，仅提供混淆级别保护 | 改用用户提供的导出密码 + PBKDF2 派生密钥，或直接移除加密改为警告 |
+| **发布密码 SHA256 无盐** | [kernel/model/publish_access.go#L229](kernel/model/publish_access.go#L229) | Cookie 值 = SHA256(ID+password)，可彩虹表破解弱密码 | 改为使用 bcrypt/argon2 + 随机盐 |
 | **运行时 .sy 文档明文** | workspace/data/ | 服务器被攻破时，所有文档直接可读 | 可考虑提供"工作区级透明加密"选项 |
-| **JWT 无过期时间** | [auth.go:107-117](file:///d:/fz/0601/solo-dogfeeding/code/296-siyuan/kernel/model/auth.go#L107-L117) | 发布服务 JWT 未设置 exp 声明，理论上永久有效 | 添加合理的 exp (如 24h) + 滑动刷新 |
+| **JWT 无过期时间** | [kernel/model/auth.go#L107-L117](kernel/model/auth.go#L107-L117) | 发布服务 JWT 未设置 exp 声明，理论上永久有效 | 添加合理的 exp (如 24h) + 滑动刷新 |
 
-### 11.2 中风险项
+### 12.2 中风险项
 
 | 风险 | 位置 | 影响 | 建议 |
 |------|------|------|------|
-| **验证码 session 存储** | [session.go:180](file:///d:/fz/0601/solo-dogfeeding/code/296-siyuan/kernel/model/session.go#L180) | 验证码明文存 session，理论上可从 Cookie 侧推断 | 哈希后存储，或一次性验证后立即删除 |
-| **错误计数全局共享** | [util/session.go:26](file:///d:/fz/0601/solo-dogfeeding/code/296-siyuan/kernel/util/session.go#L26) | `WrongAuthCount` 是进程级变量，攻击者 A 触发验证码会影响所有用户 B 的登录 | 改为按 IP + UserAgent 维度计数 |
-| **授权码明文比对** | [session.go:116](file:///d:/fz/0601/solo-dogfeeding/code/296-siyuan/kernel/model/session.go#L116) | `Conf.AccessAuthCode != authCode` 使用 Go 字符串 `!=`，理论可被时序攻击 | 改用 `subtle.ConstantTimeCompare` |
+| **GetMaskedConf 泄露同步密码** | [kernel/model/conf.go#L1038-L1058](kernel/model/conf.go#L1038-L1058) | 该 API 仅掩码 AccessAuthCode 和 UserData，但完整返回 Sync.WebDAV.Password 和 Sync.S3.SecretKey | 将同步敏感字段也加入掩码 |
+| **验证码 session 存储** | [kernel/model/session.go#L180](kernel/model/session.go#L180) | 验证码明文存 session，理论上可从 Cookie 侧推断 | 哈希后存储，或一次性验证后立即删除 |
+| **错误计数全局共享** | [kernel/util/session.go#L26](kernel/util/session.go#L26) | `WrongAuthCount` 是进程级变量，攻击者 A 触发验证码会影响所有用户 B 的登录 | 改为按 IP + UserAgent 维度计数 |
+| **授权码明文比对** | [kernel/model/session.go#L116](kernel/model/session.go#L116) | `Conf.AccessAuthCode != authCode` 使用 Go 字符串 `!=`，理论可被时序攻击 | 改用 `subtle.ConstantTimeCompare` |
 | **Cookie 缺少 SameSite** | 多处 Cookie 设置 | 可能易受 CSRF 攻击 | 添加 `SameSite=Lax` 或 `Strict` |
-| **Checkout 前备份覆盖** | [repository.go:874](file:///d:/fz/0601/solo-dogfeeding/code/296-siyuan/kernel/model/repository.go#L874) | 连续快速回滚会覆盖"回滚前备份"，丢失真正的原始数据 | 备份索引添加时间戳标签防止覆盖 |
+| **Checkout 前备份覆盖** | [kernel/model/repository.go#L874](kernel/model/repository.go#L874) | 连续快速回滚会覆盖"回滚前备份"，丢失真正的原始数据 | 备份索引添加时间戳标签防止覆盖 |
 
-### 11.3 低风险项
+### 12.3 低风险项
 
 | 风险 | 位置 | 影响 | 建议 |
 |------|------|------|------|
-| 30秒发布访问缓存 | [publish_access.go:61-62](file:///d:/fz/0601/solo-dogfeeding/code/296-siyuan/kernel/model/publish_access.go#L61-L62) | 修改权限后最多 30 秒才生效 | 提供主动失效接口 |
-| 验证码字符集有限 | [session.go:167](file:///d:/fz/0601/solo-dogfeeding/code/296-siyuan/kernel/model/session.go#L167) | 仅大写+数字，7 位字符熵约 41 bit | 考虑添加小写字母或增加长度 |
-| 仓库自动清理随机性 | [repository.go:149-150](file:///d:/fz/0601/solo-dogfeeding/code/296-siyuan/kernel/model/repository.go#L149-L150) | `mathRand` 选择保留的索引，非密码学安全 | 如需可审计性改用 crypto/rand |
+| 30秒发布访问缓存 | [kernel/model/publish_access.go#L61-L62](kernel/model/publish_access.go#L61-L62) | 修改权限后最多 30 秒才生效 | 提供主动失效接口 |
+| 验证码字符集有限 | [kernel/model/session.go#L167](kernel/model/session.go#L167) | 仅大写+数字，7 位字符熵约 41 bit | 考虑添加小写字母或增加长度 |
+| 仓库自动清理随机性 | [kernel/model/repository.go#L149-L150](kernel/model/repository.go#L149-L150) | `mathRand` 选择保留的索引，非密码学安全 | 如需可审计性改用 crypto/rand |
+| 导入导出临时目录权限 | [kernel/api/sync.go#L76,L173](kernel/api/sync.go#L76) | 临时文件权限为 0644，同机用户可读取 | 改为 0600 限制访问 |
+| 坚果云拦截仅检查域名 | [kernel/model/sync.go#L454](kernel/model/sync.go#L454) | 仅检查 `dav.jianguoyun.com` 字符串，可通过 IP/反向代理绕过 | 如需严格限制，需额外检测机制 |
 
 ---
 
-## 12. 后续验证清单
+## 13. 后续验证清单
 
-### 12.1 功能验证
+### 13.1 功能验证
 
 #### A. 解锁流程测试
 - [ ] **A1** 空授权码 + 本地访问 → 自动通过，不跳登录页
@@ -777,66 +1020,79 @@ IncSync() → 标记需要同步
 - [ ] **B6** 清空密钥 → 所有仓库操作返回"请初始化"
 - [ ] **B7** 重置仓库 → Key 清空 + Sync 禁用 + 用户需重新初始化
 
-#### C. 发布访问控制测试
-- [ ] **C1** 5 级权限 (public/protected/hidden/private/forbidden) 各自正确渲染
-- [ ] **C2** protected 级别 → 输入正确密码 → 24h 内无需再输
-- [ ] **C3** 父文档设置密码 → 子文档自动继承密码
-- [ ] **C4** 笔记本设置密码 → 所有下属文档继承
-- [ ] **C5** forbidden 文档 → 搜索/列表/图/标签中均不出现
-- [ ] **C6** 数据库视图 (Table/Gallery/Kanban) → 行按权限过滤
-- [ ] **C7** 引用/嵌入文档 → 按目标文档权限过滤显示
-- [ ] **C8** 资源文件 → 仅可见文档引用的 assets 可访问
+#### C. 同步配置导入导出测试
+- [ ] **C1** WebDAV 配置导出 → 生成 .zip 包含加密 .json
+- [ ] **C2** WebDAV 配置导入 → 正确解密并保存密码到 conf.json
+- [ ] **C3** S3 配置导出 → 生成 .zip 包含加密 .json
+- [ ] **C4** S3 配置导入 → 正确解密并保存 SecretKey 到 conf.json
+- [ ] **C5** 导入损坏的 zip → 返回"invalid WebDAV provider package"
+- [ ] **C6** 导入非加密 json → AESDecrypt 失败，返回错误
+- [ ] **C7** 坚果云 WebDAV 端点 → 被拦截，返回 Language 194
+- [ ] **C8** 导入路径遍历攻击 (../) → 被 IsSubPath 拦截
+- [ ] **C9** GetMaskedConf API → 检查是否返回明文 WebDAV 密码
 
-#### D. 云端同步 & 备份恢复测试
-- [ ] **D1** Checkout 快照 → 自动创建"回滚前备份"快照
-- [ ] **D2** Checkout 期间 → 云端同步自动暂停
-- [ ] **D3** 单文件回滚 → 文档正确恢复 + 不影响其他文件
-- [ ] **D4** 云端空间已满 → 明确提示已用空间
-- [ ] **D5** 备份数量超限 → 明确提示错误 (84+154)
-- [ ] **D6** 同步中断后重试 → 指数退避正常
-- [ ] **D7** 自动清理 → 超过 180 天的索引被清理，每天保留 2 个
-- [ ] **D8** 冲突文档生成 → 命名正确 + 路径正确
+#### D. 发布访问控制测试
+- [ ] **D1** 5 级权限 (public/protected/hidden/private/forbidden) 各自正确渲染
+- [ ] **D2** protected 级别 → 输入正确密码 → 24h 内无需再输
+- [ ] **D3** 父文档设置密码 → 子文档自动继承密码
+- [ ] **D4** 笔记本设置密码 → 所有下属文档继承
+- [ ] **D5** forbidden 文档 → 搜索/列表/图/标签中均不出现
+- [ ] **D6** 数据库视图 (Table/Gallery/Kanban) → 行按权限过滤
+- [ ] **D7** 引用/嵌入文档 → 按目标文档权限过滤显示
+- [ ] **D8** 资源文件 → 仅可见文档引用的 assets 可访问
 
-### 12.2 安全验证
+#### E. 云端同步 & 备份恢复测试
+- [ ] **E1** Checkout 快照 → 自动创建"回滚前备份"快照
+- [ ] **E2** Checkout 期间 → 云端同步自动暂停
+- [ ] **E3** 单文件回滚 → 文档正确恢复 + 不影响其他文件
+- [ ] **E4** 云端空间已满 → 明确提示已用空间
+- [ ] **E5** 备份数量超限 → 明确提示错误 (84+154)
+- [ ] **E6** 同步中断后重试 → 指数退避正常
+- [ ] **E7** 自动清理 → 超过 180 天的索引被清理，每天保留 2 个
+- [ ] **E8** 冲突文档生成 → 命名正确 + 路径正确
 
-#### E. 认证边界测试
-- [ ] **E1** 伪造 `X-Forwarded-Host: 127.0.0.1` → 无法绕过授权码检查
-- [ ] **E2** 伪造 Origin: `chrome-extension://malicious` → 仍需检查其他条件
-- [ ] **E3** API Token 在 Header 和 Query 两种方式 → 均可正常工作
-- [ ] **E4** 错误 API Token → 返回 401，不泄露 Token 是否存在
-- [ ] **E5** JWT 篡改/过期 → ParseJWT 失败 → 退回到其他认证方式
-- [ ] **E6** 发布服务 JWT 脱离发布代理 → 在 Kernel 主端口无法直接使用
-- [ ] **E7** Basic Auth WebDAV → 正确凭据通过，错误返回 401
+### 13.2 安全验证
 
-#### F. 漏洞与健壮性测试
-- [ ] **F1** 授权码登录 → 测量不同长度输入响应时间，检测时序攻击可能性
-- [ ] **F2** 暴力尝试验证码 → 3 次错误后验证码是否每次变化
-- [ ] **F3** 超长授权码 (10k 字符) → 不应崩溃/DoS
-- [ ] **F4** 特殊字符/SQL 注入在密码字段 → 均被安全处理
-- [ ] **F5** 并发大量 CheckAuth 请求 → 无竞态、无死锁
-- [ ] **F6** conf.json 设置为只读 → 优雅降级不崩溃
-- [ ] **F7** repo 目录损坏 → 检测到错误并提示用户，不丢失源数据
+#### F. 认证边界测试
+- [ ] **F1** 伪造 `X-Forwarded-Host: 127.0.0.1` → 无法绕过授权码检查
+- [ ] **F2** 伪造 Origin: `chrome-extension://malicious` → 仍需检查其他条件
+- [ ] **F3** API Token 在 Header 和 Query 两种方式 → 均可正常工作
+- [ ] **F4** 错误 API Token → 返回 401，不泄露 Token 是否存在
+- [ ] **F5** JWT 篡改/过期 → ParseJWT 失败 → 退回到其他认证方式
+- [ ] **F6** 发布服务 JWT 脱离发布代理 → 在 Kernel 主端口无法直接使用
+- [ ] **F7** Basic Auth WebDAV → 正确凭据通过，错误返回 401
 
-#### G. 加密验证
-- [ ] **G1** 导出仓库对象 → 确认不可直接读取（AES-GCM 密文特征）
-- [ ] **G2** 两个相同内容文件 → 去重后只存一份 object (内容寻址)
-- [ ] **G3** 修改 repo.key → 旧 repo 数据不可读 (正确行为)
-- [ ] **G4** 快照 diff → 不泄露任何需要密钥的元信息
-- [ ] **G5** AESEncrypt 函数 → 确认当前是否有敏感数据使用该硬编码密钥加密
-- [ ] **G6** 发布 Cookie → 抓包验证 HttpOnly + Secure(HTTPS时)
+#### G. 漏洞与健壮性测试
+- [ ] **G1** 授权码登录 → 测量不同长度输入响应时间，检测时序攻击可能性
+- [ ] **G2** 暴力尝试验证码 → 3 次错误后验证码是否每次变化
+- [ ] **G3** 超长授权码 (10k 字符) → 不应崩溃/DoS
+- [ ] **G4** 特殊字符/SQL 注入在密码字段 → 均被安全处理
+- [ ] **G5** 并发大量 CheckAuth 请求 → 无竞态、无死锁
+- [ ] **G6** conf.json 设置为只读 → 优雅降级不崩溃
+- [ ] **G7** repo 目录损坏 → 检测到错误并提示用户，不丢失源数据
 
-### 12.3 非功能验证
+#### H. 加密验证
+- [ ] **H1** 导出仓库对象 → 确认不可直接读取（AES-GCM 密文特征）
+- [ ] **H2** 两个相同内容文件 → 去重后只存一份 object (内容寻址)
+- [ ] **H3** 修改 repo.key → 旧 repo 数据不可读 (正确行为)
+- [ ] **H4** 快照 diff → 不泄露任何需要密钥的元信息
+- [ ] **H5** 同步配置导出包 → 确认使用 AESEncrypt 且可用 SK 解密
+- [ ] **H6** UserData → 确认使用 AESEncrypt 且可用 SK 解密
+- [ ] **H7** 发布 Cookie → 抓包验证 HttpOnly + Secure(HTTPS时)
 
-#### H. 性能与资源
-- [ ] **H1** 大数据集 (10万文档) Checkout → FullReindex 时间可接受
-- [ ] **H2** 1000 次认证失败 → 内存不持续增长 (验证码 GC)
-- [ ] **H3** 仓库目录 50GB → Purge/Index 操作不应 OOM
-- [ ] **H4** ControlConcurrency 高并发下 → 无请求饿死现象
+### 13.3 非功能验证
 
-#### I. 跨平台测试
-- [ ] **I1** Windows/Linux/macOS → 文件权限 (repo 目录 0700) 一致
-- [ ] **I2** iOS/Android → 移动端访问授权码流程正常
-- [ ] **I3** ARM64 / x86_64 → AES-NI 可用性不影响正确性
+#### I. 性能与资源
+- [ ] **I1** 大数据集 (10万文档) Checkout → FullReindex 时间可接受
+- [ ] **I2** 1000 次认证失败 → 内存不持续增长 (验证码 GC)
+- [ ] **I3** 仓库目录 50GB → Purge/Index 操作不应 OOM
+- [ ] **I4** ControlConcurrency 高并发下 → 无请求饿死现象
+
+#### J. 跨平台测试
+- [ ] **J1** Windows/Linux/macOS → 文件权限 (repo 目录 0700) 一致
+- [ ] **J2** iOS/Android → 移动端访问授权码流程正常
+- [ ] **J3** ARM64 / x86_64 → AES-NI 可用性不影响正确性
+- [ ] **J4** 同步配置导入导出 → 跨平台兼容 (zip 格式)
 
 ---
 
@@ -862,6 +1118,7 @@ IncSync() → 标记需要同步
 | 154 | 云端备份数量超出限制 | 备份数超限 |
 | 156 | 请重新登录 | Session 过期 |
 | 157 | 导入数据仓库密钥失败 | 密钥格式错误 |
+| 194 | 不支持配置坚果云 WebDAV 进行同步 | 坚果云拦截 |
 | 202/203 | 清理本地仓库 | 清理进度 |
 | 258 | Session 保存失败 | 内部错误 |
 | 283 | 请输入访问密码 | 发布文档密码框占位符 |
