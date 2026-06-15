@@ -8,6 +8,8 @@
 - ✅ 窗口状态管理（Wnd/Tab 类及其方法）
 - ✅ 跨窗口同步（IPC 消息、WebSocket 广播）
 - ✅ 关闭保存逻辑（完整链路：主进程拦截 → 渲染进程处理 → 持久化 → 销毁）
+- ✅ 主窗口与独立窗口 App 类差异（两个独立 msgCallback，5 个主窗口独有事件分支）
+- ✅ 运行时行为差异（getAllTabs/getAllModels 作用域隔离，allModels.files/bookmark/tag 在独立窗口为空）
 
 ---
 
@@ -19,18 +21,22 @@ SiYuan（思源笔记）的多窗口与标签页管理系统是其界面交互�
 
 | 模块 | 文件路径 | 职责 |
 |------|---------|------|
+| 主窗口 App | [index.ts](app/src/index.ts#L46-L246) | 主窗口应用类，含完整 msgCallback（27 个事件分支） |
+| 独立窗口 App | [window/index.ts](app/src/window/index.ts#L32-L190) | 独立窗口应用类，msgCallback 较主窗口少 5 个分支 |
 | 布局容器 | [Layout.ts](app/src/layout/index.ts#L10-L111) | 布局容器，管理子 Wnd/Layout，支持横向/纵向分屏 |
 | 窗口管理 | [Wnd.ts](app/src/layout/Wnd.ts#L56-L1090) | 窗口（分屏单元），管理标签页集合，处理拖拽、分屏 |
 | 标签页 | [Tab.ts](app/src/layout/Tab.ts#L18-L242) | 标签页实例，维护头部和面板 DOM，承载 Model |
 | 模型基类 | [Model.ts](app/src/layout/Model.ts#L9-L107) | WebSocket 通信基类，各类面板模型的父类 |
 | 布局工具 | [util.ts](app/src/layout/util.ts) | 布局序列化/反序列化、持久化、焦点管理 |
 | 标签工具 | [tabUtil.ts](app/src/layout/tabUtil.ts) | 标签页工具函数、激活态获取、批量关闭 |
+| 模型收集 | [getAll.ts](app/src/layout/getAll.ts) | getAllModels / getAllTabs 等全局查询函数 |
 | 新窗口 | [openNewWindow.ts](app/src/window/openNewWindow.ts#L22-L112) | 打开独立 Electron 窗口 |
 | 窗口关闭 | [closeWin.ts](app/src/window/closeWin.ts#L5-L13) | 独立窗口关闭前的资源清理 |
 | 跨窗口通信 | [onWindowsMsg.ts](app/src/window/onWindowsMsg.ts#L13-L45) | 渲染进程间消息处理 |
 | 前进后退 | [backForward.ts](app/src/util/backForward.ts) | 导航栈管理 |
-| 窗口初始化 | [init.ts](app/src/window/init.ts#L21-L95) | 独立窗口初始化流程 |
-| IPC 消息分发 | [onGetConfig.ts](app/src/boot/onGetConfig.ts#L114-L184) | 主进程消息分发处理（关闭保存、跨窗口消息） |
+| 独立窗口初始化 | [init.ts](app/src/window/init.ts#L21-L85) | 独立窗口初始化流程（JSONToCenter，无 Dock） |
+| 主窗口初始化 | [onGetConfig.ts](app/src/boot/onGetConfig.ts#L35-L106) | 主窗口初始化流程（JSONToLayout + Dock + 工具栏） |
+| 同步刷新 | [processSystem.ts](app/src/dialog/processSystem.ts#L40-L152) | reloadSync / updateTitle 等数据同步函数 |
 | Electron 主进程 | [main.js](app/electron/main.js) | 窗口创建、IPC 通信、关闭拦截 |
 | 后端配置 | [conf.go](kernel/model/conf.go#L62-L109) | 布局配置持久化存储 |
 
@@ -825,40 +831,111 @@ func PushEvent(event *Result) {
 
 ### 7.3 主窗口与独立窗口：WebSocket 推送处理对比
 
-**重要发现**：主窗口和独立窗口处理 WebSocket 推送的代码是**完全相同**的！
+**关键修正**：主窗口和独立窗口使用的是**两个不同的 App 类**，注册了**不同的 msgCallback**，并非"完全相同"。
 
-两者都在 `App` 构造函数中注册了相同的 `msgCallback` 处理函数 [window/index.ts#L60-L163](app/src/window/index.ts#L60-L163)：
+- 主窗口 App 类定义在 [index.ts](app/src/index.ts#L46-L246)，msgCallback 位于 L73-L212
+- 独立窗口 App 类定义在 [window/index.ts](app/src/window/index.ts#L32-L190)，msgCallback 位于 L54-L164
+
+两者共享同一套 `Model` 基类和 `type: "main"` 标识，但 `msgCallback` 中的 switch 分支存在显著差异。
+
+#### 7.3.1 事件分支对比
+
+**共享事件分支（22 项，代码相同）**：
+
+| 事件 | 主窗口 [index.ts](app/src/index.ts) | 独立窗口 [window/index.ts](app/src/window/index.ts) |
+|------|--------------------------------------|-----------------------------------------------------|
+| `logoutAuth` | L79-L81 | L60-L62 |
+| `setAppearance` | L82-L84 | L63-L65 |
+| `setSnippet` | L85-L88 | L66-L69 |
+| `setDefRefCount` | L89-L91 | L70-L72 |
+| `setRefDynamicText` | L102-L104 | L73-L75 |
+| `reloadPlugin` | L105-L107 | L76-L78 |
+| `reloadEmojiConf` | L108-L110 | L79-L81 |
+| `syncMergeResult` | L111-L113 | L85-L87 |
+| `reloaddoc` | L114-L116 | L82-L84 |
+| `readonly` | L117-L120 | L88-L91 |
+| `setConf` | L121-L123 | L92-L94 |
+| `progress` | L136-L138 | L95-L97 |
+| `setLocalStorageVal` | L139-L141 | L98-L100 |
+| `rename` | L142-L154 | L101-L113 |
+| `closeBox` / `removeBox` | L155-L168 | L114-L127 |
+| `removeDoc` | L169-L181 | L128-L140 |
+| `statusbar` | L182-L184 | L141-L143 |
+| `txerr` | L188-L190 | L144-L146 |
+| `syncing` | L191-L193 | L147-L149 |
+| `backgroundtask` | L194-L196 | L150-L152 |
+| `refreshtheme` | L197-L203 | L153-L159 |
+| `openFileById` | L204-L206 | L160-L162 |
+
+**主窗口独有事件分支（5 项，独立窗口缺失）**：
+
+| 事件 | 位置 | 功能 | 独立窗口后果 |
+|------|------|------|-------------|
+| `reloadTag` | [index.ts#L92-L96](app/src/index.ts#L92-L96) | 刷新标签 Dock 面板（`getDockByType("tag")`） | 独立窗口无 Dock 面板，即使收到也无需处理 |
+| `setLocalShorthandCount` | [index.ts#L98-L100](app/src/index.ts#L98-L100) | 浏览器端简写计数更新 | 仅浏览器端，独立窗口为 Electron 桌面端 |
+| `setPublish` | [index.ts#L124-L135](app/src/index.ts#L124-L135) | 更新发布配置，刷新文件树发布图标 | 独立窗口无文件树，**事件被静默忽略** |
+| `downloadProgress` | [index.ts#L185-L187](app/src/index.ts#L185-L187) | 显示下载进度 | 独立窗口无下载进度 UI，**事件被静默忽略** |
+| `exit` | [index.ts#L207-L210](app/src/index.ts#L207-L210) | 浏览器端退出（跳转 `about:blank`） | 独立窗口为 Electron 端，不适用 |
+
+#### 7.3.2 初始化流程差异
+
+两个窗口使用不同的初始化路径，导致运行时布局结构不同，进而影响 `getAllModels()` 和 `getAllTabs()` 的返回值：
+
+| 阶段 | 主窗口 | 独立窗口 |
+|------|-------|---------|
+| 初始化函数 | [onGetConfig()](app/src/boot/onGetConfig.ts#L35-L106) | [init()](app/src/window/init.ts#L21-L85) |
+| 布局构建 | `JSONToLayout()` → 中心布局 + Dock 面板 | `JSONToCenter()` → 仅中心布局 |
+| Dock 面板 | ✅ 左/右/底部 Dock 完整构建（文件树、标签、书签、大纲、反链等） | ❌ 不构建任何 Dock 面板 |
+| 顶部工具栏 | ✅ `initBar(app)` | ❌ 无 |
+| 初始同步 | ✅ `bootSync()` | ❌ 无 |
+
+**布局结构差异对事件处理的影响**：
+
+| allModels 字段 | 主窗口 | 独立窗口 | 影响 |
+|----------------|-------|---------|------|
+| `editor` | ✅ 中心区域标签中的编辑器 | ✅ 中心区域标签中的编辑器 | 两者行为一致 |
+| `graph` | ✅ Dock + 中心区域 | ✅ 仅中心区域 | 两者行为一致 |
+| `outline` | ✅ Dock + 中心区域 | ✅ 仅中心区域 | 两者行为一致 |
+| `backlink` | ✅ Dock + 中心区域 | ✅ 仅中心区域 | 两者行为一致 |
+| `files` | ✅ Dock 左侧文件树 | ❌ 始终为空数组 | `reloadSync` 中 `setNoteBook` + `item.init(false)` 仅主窗口生效 |
+| `bookmark` | ✅ Dock 左侧书签面板 | ❌ 始终为空数组 | `reloadSync` 中 `item.update()` 仅主窗口生效 |
+| `tag` | ✅ Dock 右侧标签面板 | ❌ 始终为空数组 | `reloadSync` 中 `item.update()` 仅主窗口生效；`reloadTag` 事件独立窗口缺失 |
+| `search` | ✅ 中心区域搜索标签 | ✅ 中心区域搜索标签 | 两者行为一致 |
+| `custom` | ✅ 插件自定义标签 | ✅ 插件自定义标签 | 两者行为一致 |
+
+#### 7.3.3 共享事件的运行时行为差异
+
+即使 switch 分支代码完全相同，两个窗口的执行结果也不同：
+
+**1. `rename` / `removeDoc` / `closeBox` / `removeBox`：`getAllTabs()` 作用域不同**
+
+`getAllTabs()` 遍历的是 `window.siyuan.layout.centerLayout`（[getAll.ts#L176-L178](app/src/layout/getAll.ts#L176-L178)），而每个窗口（主窗口或独立窗口）有独立的渲染进程，各自持有独立的 `window.siyuan` 对象。因此：
+- 主窗口的 `getAllTabs()` 只返回主窗口的标签
+- 独立窗口的 `getAllTabs()` 只返回独立窗口的标签
+- 两者互不干扰，各自只处理自己窗口内的标签
+
+**2. `syncMergeResult` → `reloadSync`：Dock 面板刷新差异**
+
+[reloadSync()](app/src/dialog/processSystem.ts#L40-L152) 中对 `allModels.files`、`allModels.bookmark`、`allModels.tag` 的遍历在独立窗口中为空操作：
 
 ```typescript
-new Model({
-    msgCallback(data) {
-        if (data.cmd === "error" && data.msg) {
-            showMessage(data.msg, 3000, "error");
-        }
-        if (data.reqId === this.reqId || 0 === data.reqId) {
-            switch (data.cmd) {
-                case "logoutAuth":         redirectToCheckAuth(); break;
-                case "setAppearance":      updateAppearance(data.data); break;
-                case "rename":             this.handleRename(data); break;
-                case "closeBox":
-                case "removeBox":          this.handleCloseBox(data); break;
-                case "removeDoc":          this.handleRemoveDoc(data); break;
-                case "reloadPlugin":       reloadPlugin(this, data.data); break;
-                // ... 其他 20+ 种事件
-            }
-        }
-    }
-})
+// 主窗口：allModels.files 有条目 → 刷新文件树
+// 独立窗口：allModels.files 为空 → 此段不执行
+if (!onlyUpdateDoc) {
+    allModels.files.forEach(item => {
+        setNoteBook(() => { item.init(false); });
+    });
+}
+allModels.bookmark.forEach(item => { item.update(); });  // 主窗口生效，独立窗口空操作
+allModels.tag.forEach(item => { item.update(); });       // 主窗口生效，独立窗口空操作
 ```
 
-**处理逻辑完全相同，但执行结果有差异**：
+**3. `reloadPlugin`：插件实例隔离**
 
-| 差异点 | 主窗口 | 独立窗口 |
-|--------|-------|---------|
-| 文件树刷新 | ✅ 有文件树，`setNoteBook()` 会刷新 | ❌ 无文件树，`setNoteBook()` 无效 |
-| 侧边栏更新 | ✅ 有完整侧边栏，`allModels` 包含所有 Dock 面板 | ✅ 有标签面板，但可能缺少某些 Dock 面板 |
-| 插件实例 | ✅ 完整的插件实例集合 | ✅ 独立的插件实例集合（相同插件代码，独立实例） |
-| 窗口标题 | ✅ 会调用 `setTitle()` 更新 | ✅ 也会调用 `setTitle()` 更新 |
+两者代码相同，但传入的 `this` 指向各自窗口的 `App` 实例：
+- 主窗口 `app.plugins` 和独立窗口 `app.plugins` 是完全独立的数组
+- 相同插件代码，但运行时实例和状态各自隔离
+- `reloadPlugin(this, data.data)` 在各自窗口独立执行
 
 ---
 
@@ -880,9 +957,12 @@ evt.Data = map[string]any{
 util.PushEvent(evt)
 ```
 
-**前端同步流程**（所有窗口同时执行）：
+**前端同步流程**（每个窗口独立执行，各自处理自己的标签）：
 
-**第一步：处理未激活标签** [window/index.ts#L101-L113](app/src/window/index.ts#L101-L113)
+**第一步：处理未激活标签**（主窗口 [index.ts#L142-L154](app/src/index.ts#L142-L154)，独立窗口 [window/index.ts#L101-L113](app/src/window/index.ts#L101-L113)）
+
+两者代码相同，但 `getAllTabs()` 作用域不同：主窗口只处理主窗口标签，独立窗口只处理独立窗口标签。
+
 ```typescript
 case "rename":
     getAllTabs().forEach((tab) => {
@@ -890,9 +970,8 @@ case "rename":
             const initTab = tab.headElement.getAttribute("data-initdata");
             if (initTab) {
                 const initTabData = JSON.parse(initTab);
-                // 只匹配 Editor 类型且 rootID 匹配的标签
                 if (initTabData.instance === "Editor" && initTabData.rootId === data.data.id) {
-                    tab.updateTitle(data.data.title);  // 更新标签头标题
+                    tab.updateTitle(data.data.title);
                 }
             }
         }
@@ -903,15 +982,13 @@ case "rename":
 **第二步：处理已激活标签**（通过 `reloadSync` 间接处理）
 - 后端还会发送 `syncMergeResult` 或 `reloaddoc` 事件
 - 触发 `reloadSync()` 函数 [processSystem.ts#L79-L87](app/src/dialog/processSystem.ts#L79-L87)
-- 在 `reloadSync` 中遍历所有已激活的 Editor Model：
+- 在 `reloadSync` 中遍历当前窗口所有已激活的 Editor Model：
 ```typescript
 allModels.editor.forEach(item => {
     if (data.upsertRootIDs.includes(item.editor.protyle.block.rootID)) {
         fetchPost("/api/block/getDocInfo", { id: item.editor.protyle.block.rootID },
             (response) => {
-                // 1. 刷新编辑器内容
                 reloadProtyle(item.editor.protyle, false, updateReadonly);
-                // 2. 更新标签标题和编辑器标题栏
                 updateTitle(item.editor.protyle.block.rootID, item.parent, item.editor.protyle);
             });
     }
@@ -922,10 +999,9 @@ allModels.editor.forEach(item => {
 ```typescript
 const updateTitle = (rootID: string, tab: Tab, protyle?: IProtyle) => {
     fetchPost("/api/block/getDocInfo", { id: rootID }, (response) => {
-        tab.updateTitle(response.data.name);  // 更新标签头
+        tab.updateTitle(response.data.name);
         if (protyle && protyle.title) {
-            // 更新编辑器内的标题栏
-            protyle.title.setTitle(response.data.name, 
+            protyle.title.setTitle(response.data.name,
                 response.data.ial[Constants.CUSTOM_SY_TITLE_EMPTY] === "true");
         }
     });
@@ -938,17 +1014,22 @@ const updateTitle = (rootID: string, tab: Tab, protyle?: IProtyle) => {
   ↓
 后端事务处理 → 更新数据库
   ↓
-推送 rename 事件（PushModeBroadcast）
+推送 rename 事件（PushModeBroadcast）→ 所有 WebSocket 连接
   ↓
-所有窗口（主+独立）同时接收
-  │
-  ├─→ 未激活标签：直接更新 tab.headElement 标题
-  │    [window/index.ts#L101-L113]
-  │
-  └─→ 已激活标签：通过 reloadSync
-       ├─ 刷新编辑器内容
-       └─ 更新标签标题 + 编辑器标题栏
-          [processSystem.ts#L79-L87]
+┌──────────────────────────────┐  ┌──────────────────────────────┐
+│      主窗口渲染进程            │  │      独立窗口渲染进程          │
+│  msgCallback [index.ts#L142] │  │  msgCallback [window/index.ts#L101] │
+│                              │  │                              │
+│  1. getAllTabs() → 主窗口标签  │  │  1. getAllTabs() → 独立窗口标签 │
+│     未激活：updateTitle       │  │     未激活：updateTitle       │
+│                              │  │                              │
+│  2. syncMergeResult →        │  │  2. syncMergeResult →        │
+│     reloadSync →             │  │     reloadSync →             │
+│     allModels.editor → 刷新  │  │     allModels.editor → 刷新  │
+│     allModels.files → 刷新   │  │     allModels.files → 空操作 │
+│     allModels.tag → 刷新     │  │     allModels.tag → 空操作   │
+│     allModels.bookmark → 刷新│  │     allModels.bookmark → 空操作│
+└──────────────────────────────┘  └──────────────────────────────┘
 ```
 
 ---
@@ -968,9 +1049,12 @@ evt.Data = map[string]any{
 util.PushEvent(evt)
 ```
 
-**前端同步流程**（所有窗口同时执行）：
+**前端同步流程**（每个窗口独立执行，各自处理自己的标签）：
 
-**第一步：处理未激活标签** [window/index.ts#L128-L140](app/src/window/index.ts#L128-L140)
+**第一步：处理未激活标签**（主窗口 [index.ts#L169-L181](app/src/index.ts#L169-L181)，独立窗口 [window/index.ts#L128-L140](app/src/window/index.ts#L128-L140)）
+
+两者代码相同，`getAllTabs()` 作用域各自隔离：
+
 ```typescript
 case "removeDoc":
     getAllTabs().forEach((tab) => {
@@ -978,9 +1062,9 @@ case "removeDoc":
             const initTab = tab.headElement.getAttribute("data-initdata");
             if (initTab) {
                 const initTabData = JSON.parse(initTab);
-                if (initTabData.instance === "Editor" 
+                if (initTabData.instance === "Editor"
                     && data.data.ids.includes(initTabData.rootId)) {
-                    tab.parent.removeTab(tab.id);  // 直接关闭标签
+                    tab.parent.removeTab(tab.id);
                 }
             }
         }
@@ -988,17 +1072,16 @@ case "removeDoc":
     break;
 ```
 
-**第二步：处理已激活标签**（通过 `reloadSync`）
-- 在 `reloadSync` 中遍历所有已激活的 Model：
+**第二步：处理已激活标签**（通过 `reloadSync`，两个窗口调用同一函数但 `allModels` 内容不同）
+
+[processSystem.ts#L88-L128](app/src/dialog/processSystem.ts#L88-L128)：
 ```typescript
 allModels.editor.forEach(item => {
     if (data.removeRootIDs.includes(item.editor.protyle.block.rootID)) {
-        // 关闭标签
         item.parent.parent.removeTab(item.parent.id, false, false);
-        // 清理滚动位置缓存
         delete window.siyuan.storage[Constants.LOCAL_FILEPOSITION]
             [item.editor.protyle.block.rootID];
-        setStorageVal(Constants.LOCAL_FILEPOSITION, 
+        setStorageVal(Constants.LOCAL_FILEPOSITION,
             window.siyuan.storage[Constants.LOCAL_FILEPOSITION]);
     }
 });
@@ -1015,20 +1098,24 @@ allModels.editor.forEach(item => {
   ↓
 后端事务处理 → 删除文件 → 更新数据库
   ↓
-推送 removeDoc 事件（PushModeBroadcast）
+推送 removeDoc 事件（PushModeBroadcast）→ 所有 WebSocket 连接
   ↓
-所有窗口（主+独立）同时接收
-  │
-  ├─→ 未激活标签：直接 removeTab 关闭
-  │    [window/index.ts#L128-L140]
-  │
-  └─→ 已激活标签：通过 reloadSync
-       ├─ Editor：关闭标签 + 清理滚动位置
-       ├─ Graph（本地）：关闭标签
-       ├─ Outline（本地）：关闭标签
-       ├─ Backlink（本地）：关闭标签
-       └─ 其他类型：刷新数据
-          [processSystem.ts#L88-L128]
+┌───────────────────────────────────┐  ┌───────────────────────────────────┐
+│      主窗口渲染进程                 │  │      独立窗口渲染进程               │
+│  msgCallback [index.ts#L169]      │  │  msgCallback [window/index.ts#L128]│
+│                                   │  │                                   │
+│  1. getAllTabs() → 主窗口标签       │  │  1. getAllTabs() → 独立窗口标签     │
+│     未激活：removeTab 关闭         │  │     未激活：removeTab 关闭         │
+│                                   │  │                                   │
+│  2. syncMergeResult → reloadSync  │  │  2. syncMergeResult → reloadSync  │
+│     allModels.editor → 关闭+清理  │  │     allModels.editor → 关闭+清理  │
+│     allModels.graph → 关闭/刷新   │  │     allModels.graph → 关闭/刷新   │
+│     allModels.outline → 关闭/刷新 │  │     allModels.outline → 关闭/刷新 │
+│     allModels.backlink → 关闭/刷新│  │     allModels.backlink → 关闭/刷新│
+│     allModels.files → 刷新文件树  │  │     allModels.files → 空操作      │
+│     allModels.bookmark → 刷新     │  │     allModels.bookmark → 空操作   │
+│     allModels.tag → 刷新          │  │     allModels.tag → 空操作        │
+└───────────────────────────────────┘  └───────────────────────────────────┘
 ```
 
 ---
@@ -1053,9 +1140,12 @@ evt.Data = map[string]any{"box": boxID}
 util.PushEvent(evt)
 ```
 
-**前端同步流程**（所有窗口同时执行）：
+**前端同步流程**（每个窗口独立执行，各自处理自己的标签）：
 
-**第一步：处理未激活标签** [window/index.ts#L114-L127](app/src/window/index.ts#L114-L127)
+**第一步：处理未激活标签**（主窗口 [index.ts#L155-L168](app/src/index.ts#L155-L168)，独立窗口 [window/index.ts#L114-L127](app/src/window/index.ts#L114-L127)）
+
+两者代码相同，`getAllTabs()` 作用域各自隔离：
+
 ```typescript
 case "closeBox":
 case "removeBox":
@@ -1064,9 +1154,9 @@ case "removeBox":
             const initTab = tab.headElement.getAttribute("data-initdata");
             if (initTab) {
                 const initTabData = JSON.parse(initTab);
-                if (initTabData.instance === "Editor" 
+                if (initTabData.instance === "Editor"
                     && data.data.box === initTabData.notebookId) {
-                    tab.parent.removeTab(tab.id);  // 关闭该笔记本的所有标签
+                    tab.parent.removeTab(tab.id);
                 }
             }
         }
@@ -1077,6 +1167,11 @@ case "removeBox":
 **第二步：处理已激活标签**（同样通过 `reloadSync`）
 - 当笔记本关闭/删除时，会触发 `syncMergeResult` 事件
 - `reloadSync` 中检查 `removeRootIDs` 包含的文档并关闭标签
+- 主窗口额外刷新文件树（`allModels.files`），独立窗口无文件树则空操作
+
+**两个窗口的差异**：
+- 主窗口：除了关闭标签，还会通过 `reloadSync` → `allModels.files` → `setNoteBook()` + `item.init(false)` 刷新文件树，移除已关闭的笔记本节点
+- 独立窗口：`allModels.files` 为空，不会触发文件树刷新（本身也无文件树）
 
 **特殊说明**：
 - `closeBox` 和 `removeBox` 在前端处理逻辑完全相同
@@ -1106,7 +1201,10 @@ util.PushEvent(evt)
 
 **前端同步流程**：
 
-**主窗口和独立窗口各自独立处理** [window/index.ts#L76-L78](app/src/window/index.ts#L76-L78)：
+**两个窗口分别独立处理**（主窗口 [index.ts#L105-L107](app/src/index.ts#L105-L107)，独立窗口 [window/index.ts#L76-L78](app/src/window/index.ts#L76-L78)）：
+
+代码相同，但 `this` 指向各自窗口的 `App` 实例：
+
 ```typescript
 case "reloadPlugin":
     reloadPlugin(this, data.data);
@@ -1260,22 +1358,28 @@ tab.parent.removeTab(ipcData.data) → 移除原标签
 
 ### 7.11 同步机制总结
 
-| 同步类型 | 通道 | 推送范围 | 主窗口处理 | 独立窗口处理 |
-|---------|------|---------|-----------|-------------|
-| 文档重命名 | WebSocket | 所有应用所有会话 | ✅ 更新未激活标签标题 + reloadSync 处理已激活 | ✅ 相同逻辑 |
-| 文档删除 | WebSocket | 所有应用所有会话 | ✅ 关闭未激活标签 + reloadSync 关闭已激活 | ✅ 相同逻辑 |
-| 笔记本关闭 | WebSocket | 所有应用所有会话 | ✅ 关闭该笔记本所有标签 | ✅ 相同逻辑 |
-| 插件事件 | WebSocket | 所有应用所有会话 | ✅ 独立执行 reloadPlugin | ✅ 独立执行 reloadPlugin（独立插件实例） |
-| 标签拖拽关闭 | IPC | 所有窗口 | ✅ 移除对应标签 | ✅ 移除对应标签 |
-| 系统锁屏 | IPC | 所有窗口 | ✅ 根据配置锁屏 | ✅ 根据配置锁屏 |
-| 拖拽样式同步 | IPC | 所有窗口 | ✅ 更新样式 | ✅ 更新样式 + 调整拖拽区域 |
+| 同步类型 | 通道 | 推送范围 | 主窗口处理 | 独立窗口处理 | 差异原因 |
+|---------|------|---------|-----------|-------------|---------|
+| 文档重命名 | WebSocket | 所有会话 | ✅ 更新未激活标签标题 + reloadSync 刷新已激活 + 刷新 Dock 面板 | ✅ 更新未激活标签标题 + reloadSync 刷新已激活 + Dock 面板空操作 | `allModels.files/bookmark/tag` 在独立窗口为空 |
+| 文档删除 | WebSocket | 所有会话 | ✅ 关闭未激活标签 + reloadSync 关闭已激活 + 刷新文件树/书签/标签 | ✅ 关闭未激活标签 + reloadSync 关闭已激活 + 文件树/书签/标签空操作 | 同上 |
+| 笔记本关闭 | WebSocket | 所有会话 | ✅ 关闭该笔记本所有标签 + 刷新文件树 | ✅ 关闭该笔记本所有标签 + 文件树空操作 | `allModels.files` 在独立窗口为空 |
+| 插件事件 | WebSocket | 所有会话 | ✅ `reloadPlugin(this, data.data)` | ✅ `reloadPlugin(this, data.data)` | 代码相同，但 `this` 指向各自的 `App` 实例，插件状态隔离 |
+| 标签刷新 | WebSocket | 所有会话 | ✅ `reloadTag` → 刷新 Tag Dock | ❌ 无此分支，事件静默忽略 | 独立窗口无 Dock 面板 |
+| 发布配置 | WebSocket | 所有会话 | ✅ `setPublish` → 刷新文件树图标 | ❌ 无此分支，事件静默忽略 | 独立窗口无文件树 |
+| 下载进度 | WebSocket | 所有会话 | ✅ `downloadProgress` → 显示进度 | ❌ 无此分支，事件静默忽略 | 独立窗口无下载 UI |
+| 浏览器退出 | WebSocket | 所有会话 | ✅ `exit` → 跳转 about:blank | ❌ 无此分支 | 独立窗口为 Electron 端 |
+| 标签拖拽关闭 | IPC | 所有窗口 | ✅ 移除对应标签 | ✅ 移除对应标签 | 代码相同，行为一致 |
+| 系统锁屏 | IPC | 所有窗口 | ✅ 根据配置锁屏 | ✅ 根据配置锁屏 | 代码相同，行为一致 |
+| 拖拽样式同步 | IPC | 所有窗口 | ✅ 移除拖拽样式 | ✅ 移除拖拽样式 + 调整拖拽区域 | 独立窗口额外处理 `-webkit-app-region` |
 
 **关键设计原则**：
 1. **数据同步走 WebSocket，控制同步走 IPC**
-2. **主窗口和独立窗口使用相同的处理代码**，确保行为一致
-3. **后端使用 PushMode 精确控制广播范围**，避免不必要的消息
-4. **未激活标签和已激活标签分开处理**，前者轻量更新，后者完整刷新
-5. **插件实例隔离**，各窗口独立管理自己的插件生命周期
+2. **主窗口和独立窗口使用两个不同的 App 类**，msgCallback 有 5 个主窗口独有的事件分支
+3. **共享事件分支代码相同，但运行时效果不同**：`getAllTabs()` / `getAllModels()` 作用域各自隔离，每个窗口只处理自己的标签和模型
+4. **独立窗口无 Dock 面板**：`allModels.files/bookmark/tag` 始终为空，`reloadSync` 中的 Dock 面板刷新在独立窗口中为空操作
+5. **后端使用 PushMode 精确控制广播范围**，避免不必要的消息
+6. **未激活标签和已激活标签分开处理**，前者轻量更新，后者完整刷新
+7. **插件实例隔离**，各窗口独立管理自己的插件生命周期
 
 ---
 
@@ -1809,6 +1913,7 @@ Linux 系统下使用剪贴板管理特殊的粘贴事件拦截机制，通过 `
 4. **独立窗口滚动位置丢失**：独立窗口关闭时**不调用 `saveScroll()`**，最新的滚动位置可能未保存到 localStorage，下次打开时滚动位置是上次 saveLayout 时的状态
 5. **独立窗口崩溃**：独立窗口崩溃时，sessionStorage 中的布局状态丢失，下次打开无法恢复
 6. **独立窗口布局不可恢复**：独立窗口销毁后 sessionStorage 清空，重新打开时只能从 URL 参数创建新布局，无法恢复之前的多标签/分屏状态
+7. **独立窗口缺失事件分支**：独立窗口 msgCallback 缺少 `setPublish`、`downloadProgress` 等分支，后端推送的这些事件在独立窗口中被静默丢弃。当前因独立窗口无对应 UI 不影响功能，但若未来扩展独立窗口功能，可能导致状态不同步
 
 ### 12.2 资源泄漏风险
 
@@ -1864,6 +1969,9 @@ Linux 系统下使用剪贴板管理特殊的粘贴事件拦截机制，通过 `
 - [ ] 插件重载后主窗口和独立窗口插件状态一致性
 - [ ] 快速连续修改文档标题时各窗口状态一致性
 - [ ] 多窗口同时打开同一文档时，其中一个窗口删除文档的同步处理
+- [ ] 主窗口独有事件（reloadTag / setPublish）推送时独立窗口是否正常忽略
+- [ ] 独立窗口中打开编辑器标签后 rename/removeDoc 事件的同步效果
+- [ ] 两个窗口 App 类 msgCallback 分支数量差异验证（主窗口 27 项 vs 独立窗口 22 项）
 
 ### 13.2 性能验证
 
@@ -1906,8 +2014,9 @@ SiYuan 的多窗口与标签页管理系统设计体现了桌面级应用的复�
 2. **懒加载优化**：未激活标签不初始化 Model，通过 `data-initdata` 延迟加载，平衡了功能与性能
 3. **多维度持久化**：后端配置 + sessionStorage + localStorage 三层存储，兼顾主窗口和独立窗口
 4. **双路通信**：Electron IPC 用于窗口间控制（关闭、拖拽样式同步），WebSocket 用于数据同步
-5. **细粒度标签资源管理**：针对不同 Model 类型有专门的销毁逻辑，插件可自定义 `destroy()` 方法
-6. **双轨关闭机制**：主窗口走"保存布局+退出应用"路径，独立窗口走"卸载插件+销毁窗口"路径，各司其职
+5. **双 App 类架构**：主窗口和独立窗口使用不同的 App 类，msgCallback 有 5 个主窗口独有分支，共享分支代码相同但运行时效果因布局结构差异而不同
+6. **细粒度标签资源管理**：针对不同 Model 类型有专门的销毁逻辑，插件可自定义 `destroy()` 方法
+7. **双轨关闭机制**：主窗口走"保存布局+退出应用"路径，独立窗口走"卸载插件+销毁窗口"路径，各司其职
 
 ### 三层协作模式
 
@@ -1923,11 +2032,12 @@ SiYuan 的多窗口与标签页管理系统设计体现了桌面级应用的复�
 
 1. **独立窗口关闭流程完善**：独立窗口关闭时应调用 `exportLayout()` 保存滚动位置，或在 `saveLayout` 中集成滚动位置保存
 2. **独立窗口资源释放**：独立窗口关闭时应主动遍历标签调用 `destroyModel()`，确保 WebSocket 优雅关闭和资源及时释放
-3. **状态一致性**：跨窗口拖拽的竞态条件、持久化重试机制
-4. **异常处理**：网络异常时的关闭保存失败回退、插件异步卸载的等待机制
-5. **性能优化**：增量序列化、连接池管理 WebSocket
-6. **可维护性**：统一的消息分发中心、类型安全的序列化协议
-7. **独立窗口布局持久化**：可考虑将独立窗口布局也保存到后端配置，支持跨会话恢复
+3. **独立窗口事件分支补全**：独立窗口缺少 `setPublish` 和 `downloadProgress` 分支，虽然当前因无对应 UI 而无影响，但若未来独立窗口增加相关功能需同步补全
+4. **状态一致性**：跨窗口拖拽的竞态条件、持久化重试机制
+5. **异常处理**：网络异常时的关闭保存失败回退、插件异步卸载的等待机制
+6. **性能优化**：增量序列化、连接池管理 WebSocket
+7. **可维护性**：统一的消息分发中心、类型安全的序列化协议
+8. **独立窗口布局持久化**：可考虑将独立窗口布局也保存到后端配置，支持跨会话恢复
 
 特别是在标签数量极大（>50）和多窗口密集交互的场景下，需要重点关注性能、状态一致性和资源释放问题。
 
@@ -1974,15 +2084,32 @@ SiYuan 的多窗口与标签页管理系统设计体现了桌面级应用的复�
 
 | 核对项 | 状态 | 位置 |
 |-------|------|------|
+| 主窗口 App 类 msgCallback（27 分支） | ✅ | [index.ts#L73-L212](app/src/index.ts#L73-L212) |
+| 独立窗口 App 类 msgCallback（22 分支） | ✅ | [window/index.ts#L54-L164](app/src/window/index.ts#L54-L164) |
+| 主窗口独有：reloadTag | ✅ | [index.ts#L92-L96](app/src/index.ts#L92-L96) |
+| 主窗口独有：setLocalShorthandCount | ✅ | [index.ts#L98-L100](app/src/index.ts#L98-L100) |
+| 主窗口独有：setPublish | ✅ | [index.ts#L124-L135](app/src/index.ts#L124-L135) |
+| 主窗口独有：downloadProgress | ✅ | [index.ts#L185-L187](app/src/index.ts#L185-L187) |
+| 主窗口独有：exit | ✅ | [index.ts#L207-L210](app/src/index.ts#L207-L210) |
 | onWindowsMsg 跨窗口消息处理 | ✅ | [onWindowsMsg.ts#L13-L45](app/src/window/onWindowsMsg.ts#L13-L45) |
 | 主进程 siyuan-send-windows 广播 | ✅ | [main.js#L1301-L1305](app/electron/main.js#L1301-L1305) |
 | 锁屏事件广播 | ✅ | [main.js#L1416-L1420](app/electron/main.js#L1416-L1420) |
+| 主窗口初始化 onGetConfig | ✅ | [onGetConfig.ts#L35-L106](app/src/boot/onGetConfig.ts#L35-L106) |
+| 独立窗口初始化 init | ✅ | [init.ts#L21-L85](app/src/window/init.ts#L21-L85) |
+| reloadSync 中 Dock 面板刷新 | ✅ | [processSystem.ts#L129-L141](app/src/dialog/processSystem.ts#L129-L141) |
+| getAllModels 遍历 layout.layout | ✅ | [getAll.ts#L109-L112](app/src/layout/getAll.ts#L109-L112) |
+| getAllTabs 遍历 centerLayout | ✅ | [getAll.ts#L176-L178](app/src/layout/getAll.ts#L176-L178) |
+| JSONToLayout（中心+Dock） | ✅ | [util.ts#L388-L390](app/src/layout/util.ts#L388-L390) |
+| JSONToCenter（仅中心） | ✅ | [util.ts#L254-L386](app/src/layout/util.ts#L254-L386) |
 
 ### 关键发现
 
 | 发现 | 说明 |
 |------|------|
-| 主窗口和独立窗口关闭是两条独立路径 | ❌ 之前错误地认为是统一流程，现已纠正 |
+| 主窗口和独立窗口是两个不同的 App 类 | ❌ 之前错误地认为 msgCallback "完全相同"，现已纠正 |
+| 独立窗口 msgCallback 缺少 5 个事件分支 | ✅ 确认：reloadTag / setLocalShorthandCount / setPublish / downloadProgress / exit |
+| 共享事件代码相同但运行时效果不同 | ✅ 确认：getAllTabs/getAllModels 作用域各自隔离，allModels.files/bookmark/tag 在独立窗口为空 |
+| 主窗口和独立窗口关闭是两条独立路径 | ✅ 之前已纠正 |
 | 独立窗口关闭不调用 exportLayout | ✅ 确认：仅卸载插件后直接 destroy |
 | 独立窗口关闭不主动调用 destroyModel | ✅ 确认：依赖窗口销毁后 GC 回收 |
 | 主窗口关闭不卸载插件 | ✅ 确认：依赖进程退出自动回收 |
