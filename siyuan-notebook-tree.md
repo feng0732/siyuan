@@ -1145,7 +1145,7 @@ for i := range parts {
 
 5. **尝试重建索引**：
    - 设置 → 搜索 → 重建索引
-   - 或调用 API：`POST /api/filetree/reindex`
+   - 或调用 API：`POST /api/system/rebuildDataIndex`
 
 > **常见误判排除**：
 > - 文档是否在已关闭的笔记本中？
@@ -1188,7 +1188,7 @@ for i := range parts {
 1. 关闭思源笔记
 2. 删除 `storage/blocktrees.db` 文件
 3. 重新启动，程序会自动重建索引
-4. 或使用 `POST /api/filetree/reindex` API 重建
+4. 或使用 `POST /api/system/rebuildDataIndex` API 重建
 
 > **注意**：BlockTree 是索引数据库，损坏不会丢失数据，只是查询变慢。所有数据都在 `.sy` 文件中。
 
@@ -1202,9 +1202,10 @@ for i := range parts {
 **排查步骤：**
 
 1. 刷新页面（前端缓存）
-2. 调用 `POST /api/filetree/clearCache` 清除缓存
-3. 检查 docIALCache 是否已失效
-4. 检查 treeCache 是否已失效
+2. 后端缓存无独立清理 API，可通过修改文档内容触发缓存更新
+3. 或使用 `POST /api/system/rebuildDataIndex` 全量重建（会连带刷新缓存）
+4. 检查 docIALCache 是否已失效
+5. 检查 treeCache 是否已失效
 
 > **常见误判排除**：
 > - 是前端缓存还是后端缓存？
@@ -1232,7 +1233,8 @@ for i := range parts {
 3. **修复方式**：
    - 单文档：打开文档触发 `LoadTreeByBlockIDWithReindex`（如果支持）
    - 全量：设置 → 搜索 → 重建索引
-   - 或调用 API：`POST /api/filetree/reindex`
+   - 或调用 API：`POST /api/system/rebuildDataIndex`
+   - 按路径增量修复：`POST /api/filetree/upsertIndexes`（传 paths 参数）
 
 4. **日志关键词**：
    - `searching tree on filesystem` — 正在文件系统中搜索丢失的树
@@ -1281,14 +1283,21 @@ for i := range parts {
 
 ### 13.3 调试工具与 API
 
-| 工具 | 类型 | 用途 |
-|------|------|------|
-| `POST /api/filetree/reindex` | API | 重建文件树索引 |
-| `POST /api/filetree/clearCache` | API | 清除文件树缓存 |
-| `POST /api/system/getConf` | API | 查看系统配置 |
-| `workspace/corrupted/` | 目录 | 损坏文件存放处 |
-| `storage/blocktrees.db` | 文件 | BlockTree 索引数据库 |
-| `data/*/.sy` | 文件 | 实际文档数据 |
+| 工具 / API | 类型 | 用途 | 状态 |
+|------------|------|------|------|
+| `POST /api/system/rebuildDataIndex` | API | 全量重建数据索引（含 BlockTree、SQL 搜索索引等） | 可用，推荐 |
+| `POST /api/system/vacuumDataIndex` | API | 压缩（VACUUM）数据索引数据库 | 可用 |
+| `POST /api/filetree/upsertIndexes` | API | 按指定路径增量更新索引（传 `paths` 参数） | 可用 |
+| `POST /api/filetree/removeIndexes` | API | 按指定路径删除索引（传 `paths` 参数） | 可用 |
+| `POST /api/filetree/refreshFiletree` | API | 文件树刷新（实为全量重建索引） | **已废弃**（路由末尾带空格，调用 `rebuildDataIndex`，计划 2026-06-30 删除） |
+| `POST /api/system/getConf` | API | 查看系统配置 | 可用 |
+| `workspace/corrupted/` | 目录 | 损坏文件存放处 | — |
+| `storage/blocktrees.db` | 文件 | BlockTree 索引数据库（SQLite） | — |
+| `data/*/.sy` | 文件 | 实际文档数据 | — |
+
+> **不存在的接口说明**：
+> - `POST /api/filetree/reindex`：从未存在
+> - `POST /api/filetree/clearCache`：从未存在，后端缓存无独立 HTTP 清理接口
 
 ### 13.4 数据一致性检查方法
 
