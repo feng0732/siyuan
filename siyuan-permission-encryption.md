@@ -963,39 +963,147 @@ IncSync() → 标记需要同步
 - 只读模式下若被用于导出敏感配置，管理员通过「配置变更审计」无法发现（conf.json 未变）
 - 若系统提供了 `export2Liandi` 带 `CheckReadonly` 的对照接口，说明这并非统一设计，而是 **同步配置导出接口遗漏了中间件**
 
-#### 10.5.5 漏洞链利用路径
+#### 10.5.5 漏洞链利用路径（已证实 + 风险假设分层）
+
+> **说明**：以下链路按可信度分「✅ 已证实事实」和「⚠️ 风险假设」标记。未证实的结论不使用确定语气：
 
 ```
 前置条件：工作区管理员因维护需求设置 ReadOnly = true
     │
     ▼
-[1] 攻击者获取 Editor/Reader 角色的有效会话 Cookie
+[1] ✅ [已证实] 攻击者通过某种渠道获取：
+    │     · 主服务端口会话 Cookie（需 RoleAdmin 权限）→ 见 10.6 角色来源表
+    │     · 或通过网络层获取发布服务 BasicAuth 账号（仅生成 RoleReader JWT）
     │
     ▼
-[2] 直接 POST /api/sync/exportSyncProviderWebDAV
-    │   CheckAuth ✅（有会话）
-    │   CheckAdminRole ✅（若会话本身是 Admin）
-    │   CheckReadonly ❓（无此中间件）
+[2] ✅ [已证实] 以 RoleAdmin 身份（非 Editor/Reader）POST /api/sync/exportSyncProviderWebDAV
+    │   CheckAuth ✅（RoleAdmin 有效）
+    │   CheckAdminRole ✅（RoleAdmin 通过）
+    │   CheckReadonly ❓（无此中间件 → 绕过只读模式）
     │   → 返回 JSON { "data": "/export/webdav-1718400000.zip" }
     │
     ▼
-[3] 或若仅有 Reader 会话 → 尝试 P3 等级静态下载
-    │   GET /export/webdav-20260615-*.zip （目录枚举）
-    │   CheckAuth ✅（有会话）
-    │   → 下载成功（IsSubPath 检查通过）
+[3] ⚠️ [风险假设 - 需发布服务启用方可成立] 以 RoleReader 身份（发布服务 JWT 或 BasicAuth）
+    │   直接访问发布端口 GET /export/webdav-*.zip（或从主端口）
+    │   → 发布代理 rewrite → 转发到主服务
+    │   → jwtMiddleware 解析 X-Auth-Token → 注入 RoleReader
+    │   → CheckAuth：GetGinContextRole 读到 RoleReader 属于有效角色 → 通过
+    │   → 无 CheckAdminRole
+    │   → ⚠️ 前提：文件已在步骤[2]或某管理员之前生成
     │
     ▼
-[4] 离线解压 ZIP → 获取 AES-128-CBC 密文
+[4] ✅ [已证实] 离线解压 ZIP → 获取 AES-128-CBC 密文
     │
     ▼
-[5] 使用源码公开的 SK/IV → 双重 Hex 解码 → 明文 WebDAV 密码
+[5] ✅ [已证实] 使用源码公开的 SK="696D897C9AA0611B" + IV="RandomInitVector"
+    │     → 双重 Hex 解码 → 明文 WebDAV 密码
     │
     ▼
-[6] 使用 WebDAV 密码 → 从第三方服务拉取加密仓库
+[6] ✅ [已证实] 使用 WebDAV 密码 → 从第三方服务拉取加密仓库对象
     │
     ▼
-[7] 若同时获得 repo.key（单独文件）→ 完整解密所有笔记
+[7] ⚠️ [风险假设 - 需同时获得 repo.key]
+          若另外获得 conf/repo/repo.key（单独保存的 32 字节二进制文件）→ 完整解密所有笔记
 ```
+
+**Editor 角色说明**：当前代码中 JWT 硬编码 `ClaimsKeyRole: RoleReader`，不存在 Editor 角色的签发路径，因此「Editor 会话」作为攻击前提在当前版本不成立（详见 10.6 节）。
+
+---
+
+### 10.6 角色来源与发布服务令牌权限边界（事实 vs 假设）
+
+#### 10.6.1 全局中间件与角色注入链（✅ 已证实）
+
+| 中间件顺序 | 组件 | 注入角色 | 代码位置 |
+|-----------|-----|---------|---------|
+| 第 1 层（所有请求必经） | `jwtMiddleware` | 解析 `X-Auth-Token` 头：<br>· JWT 有效 → `Claims[role]`（发布服务时 = RoleReader)<br>· JWT 无效/不存在 → RoleVisitor | [kernel/server/serve.go#L1017-L1032](kernel/server/serve.go#L1017-L1032) |
+| 第 2 层（路由级） | `CheckAuth` | 检查 9 条 fallback，全部设为 **RoleAdministrator**：<br>① 已有有效角色（①-1 Admin/Editor/Reader → pass）<br>② API Token (Header) → Admin<br>③ API Token (Query) → Admin<br>④ 空授权码+本机 → Admin<br>⑤ 本机 `/assets/` `/export/` → Admin<br>⑥ Session Cookie（授权码登录）→ Admin<br>⑦ BasicAuth（授权码）→ Admin<br>⑧ 放过 appearance/stage 静态 → 不设角色（仅路径匹配）<br>⑨ 其他未授权 → 拒绝 | [kernel/model/session.go#L207-L384](kernel/model/session.go#L207-L384) |
+| 第 3 层（路由级） | `CheckAdminRole` | 仅放行 RoleAdministrator → 403 Forbidden 其他 | [kernel/model/session.go#L386-L392](kernel/model/session.go#L386-L392) |
+| 第 3 层（路由级） | `CheckReadonly` | 全局只读标志位或当前会话标记 | [kernel/model/session.go#L195-L205](kernel/model/session.go#L195-L205) |
+
+> 关键代码：`jwtMiddleware` 为全局 `ginServer.Use(...) 第 143 行注册于 [kernel/server/serve.go#L140-L145](kernel/server/serve.go#L140-L145)，在路由匹配之前就已经写入 gin context，与路由中间件链按顺序叠加。
+
+#### 10.6.2 非管理员角色的唯一来源（✅ 已证实）
+
+**Reader（读者=2）** 唯一来源路径：
+
+```
+用户浏览器
+    │
+    ▼
+访问 发布服务独立端口（Conf.Publish.Port）
+    │
+    ▼
+PublishServiceTransport.RoundTrip（发布代理）
+    │
+    ├─ 若 Conf.Publish.Auth.Enable = true
+    │   ├─ 匹配 Session → 查 BasicAuth
+    │   │
+    │   └─ 最终 → request.Header.Set(X-Auth-Token, account.Token）
+    │         account.Token = JWT（由 InitAccounts 生成
+    │         内部 ClaimsKeyRole 写死为 RoleReader）
+    │
+    └─ 若 Conf.Publish.Auth.Enable = false
+        → 使用匿名账号 "" 的 Token（同样为 RoleReader）
+    │
+    ▼
+http.DefaultTransport.RoundTrip（转发到 util.ServerURL=主服务端口）
+    │
+    ▼
+主服务 gin 入口
+    │
+    ▼
+jwtMiddleware（全局）→ ParseXAuthToken → 读到 RoleReader → c.Set(RoleContextKey, RoleReader)
+    │
+    ▼
+路由匹配 + CheckAuth（第①分支 GetGinContextRole 读到 RoleReader
+→ 属于有效角色列表 [Admin, Editor, Reader] → ✅ 通过
+```
+
+**Editor（编辑者=1）**：JWT 生成代码位于 [kernel/model/auth.go#L105-L124](kernel/model/auth.go#L105-L124)
+```go
+// 签发代码：
+for username, account := range accountsMap {
+    t := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+        ...
+        ClaimsKeyRole: RoleReader,  // ✅ 硬编码为 2 = RoleReader
+    })
+    account.Token, _ = t.SignedString(jwtKey)
+}
+```
+→ ✅ 已证实：**当前版本（硬编码 RoleReader，不存在 Editor 角色签发路径。若未来版本变更需重新评估。
+
+#### 10.6.3 Reader 能否下载同步配置包？（分级结论）
+
+> **结论按接口和入口端口精确分析（✅ 已证实 + ⚠️ 风险假设区分）
+
+| # | 访问场景 | 入口端口 | 攻击目标接口 | 结果 | 可信度 |
+|---|---------|---------|---------|------|-------|
+| R1 | Reader（发布服务 BasicAuth/Session）→ POST /api/sync/exportSyncProviderWebDAV（**P2 生成 ZIP） | 发布端口 → 转发主端口 | CheckAuth ✅（Reader 有效）<br>CheckAdminRole ❌（Reader 非 Admin → 403 Forbidden | **不能生成导出包** | ✅ 已证实 |
+| R2 | 本机 127.0.0.1 直接请求 GET /export/webdav-*.zip（无 X-Auth-Token → jwtMiddleware 设 RoleVisitor） | 主端口 6806 | 进入 CheckAuth：<br>localhost=true → 路径前缀 /export/ → 匹配到分支 L299：<br>```<br>if localhost {<br>    if strings.HasPrefix(uri, "/export/") {<br>        c.Set(RoleContextKey, RoleAdministrator)<br>        c.Next(); return }}<br>```<br>→ **直接设为 RoleAdmin，绕过所有其他检查）→ **可以下载** | ✅ 已证实 |
+| R3 | 本机 非 127.0.0.1（远程主机）→ 无 JWT + 无有效会话 + 无授权码 → GET /export/webdav-*.zip | 主端口 | 主端口 远程 → localhost=false<br>→ 不匹配 L299<br>→ 进入其他 fallback 失败 → 所有 fallback 均不通过 → **401 Unauthorized | **不能** 下载 | ✅ 已证实 |
+| R4 | Reader（发布服务端口）→ GET /export/webdav-*.zip（P3 静态下载） | 发布端口 → 转发主端口 | **关键问题：发布代理 rewrite 不限制路径吗？→ 检查 rewrite()：<br>```go<br>func rewrite(r *httputil.ProxyRequest) {<br>    r.SetURL(util.ServerURL) // 无路径过滤！<br>}```<br>→ 任何路径都可转发<br>→ 转发后 JWT 注入 RoleReader<br>→ jwtMiddleware 设 RoleReader<br>→ CheckAuth 第①分支：RoleReader ∈ 有效列表 → ✅ 通过<br>→ `/export/*filepath` 路由仅 CheckAuth，无 CheckAdminRole<br>→ **只要某 Admin 已在之前生成过 zip 文件<br>→ ⚠️ 需同时满足：发布服务已启用 + 文件已存在) | **可以下载（需管理员先在本机/主端口** 生成后) | ⚠️ 风险假设（需多前置条件需全部满足 |
+
+#### 10.6.4 修正后的 P3 /export/*filepath 下载权限矩阵
+
+| 请求来源（RemoteAddr） | X-Auth-Token | 结果角色 | 能否下载 /export/*.zip | 证据 |
+|---------------------|--------------|---------|-----------------------|------|
+| 本机 127.0.0.1 | 有（任意值，含发布 JWT） | RoleAdmin（L299 强制覆盖） | ✅ 可以 | [kernel/model/session.go#L298-L302](kernel/model/session.go#L298-L302) |
+| 本机 127.0.0.1 | 无 | RoleAdmin（同上） | ✅ 可以 | 同上 |
+| 远程 IP（外部主机） | 无 + 无有效 Session/Token | RoleVisitor（jwtMiddleware 设) | ❌ 401 | CheckAuth fallback 连锁失败 |
+| 远程 IP | 发布服务 BasicAuth/Session → 转发 → RoleReader（JWT) | RoleReader | ⚠️ 可能可以（发布服务端口+文件存在） | 发布代理 rewrite 无路径限制 + P3 仅 CheckAuth） |
+| 远程 IP | 伪造 X-Auth-Token 头（需要 jwtKey，进程启动随机，签名失败 | 无法签名伪造 JWT 签名密钥每次启动随机生成 [kernel/model/auth.go#L97-L103](kernel/model/auth.go#L97-L103) | ❌ 不可伪造 | jwtKey 在每次启动时随机生成，无法外部伪造 |
+
+#### 10.6.5 对原分析中不准确表述的纠正
+
+| 原表述（之前文档中的不准确/绝对化描述） | 修正后表述 |
+|------------------------------|----------|
+| "攻击者获取 Editor/Reader 角色的有效会话 Cookie" | "攻击者需获取 **RoleAdmin 会话（通过授权码登录）；若攻击路径涉及 Reader 攻击链需依赖发布服务额外前置条件 |
+| "仅有 Reader 会话 → 尝试枚举下载" | "仅有 Reader JWT 可尝试从 **P3 静态路由下载，但前提：① 发布服务已启用 ② zip 之前某管理员已生成导出包） |
+| "Editor 角色" | "当前版本不存在 Editor 角色签发路径，JWT 固定为 Reader；Editor 仅用于未来版本变更时" |
+| 枚举文件名爆破成功" | "是否存在易猜测文件名模式需进一步测试；但 /export/ 仅列目录被目录遍历防护（IsSubPath）但无速率限制" |
+
+
 
 ---
 
@@ -1076,7 +1184,8 @@ IncSync() → 标记需要同步
 | **conf.json 明文存储密钥** | [kernel/model/conf.go](kernel/model/conf.go) | 攻击者获取工作区目录即可拿到 repo.key、WebDAV 密码、S3 SecretKey，解密所有备份/快照 + 登录第三方同步服务 | 考虑使用 OS Keychain/DPAPI 加密存储敏感配置 |
 | **硬编码 AES 密钥** | [kernel/util/crypt.go#L29](kernel/util/crypt.go#L29) | `SK="696D897C9AA0611B"` 和 `IV` 公开于源码，所有同步配置导出包、UserData 可被解密 | 评估是否仍需该加密，或改为动态生成密钥绑定设备 |
 | **同步配置导入导出伪加密** | [kernel/api/sync.go#L144,L193](kernel/api/sync.go#L144) | 导出包使用硬编码密钥加密，形同虚设，仅提供混淆级别保护 | 改用用户提供的导出密码 + PBKDF2 派生密钥，或直接移除加密改为警告 |
-| **导出接口遗漏 CheckReadonly** | [kernel/api/router.go#L295,L297](kernel/api/router.go#L295) | `exportSyncProviderS3/WebDAV` 只读模式下仍可导出敏感密码；`/export/*` 下载路由缺少 Admin 校验，低权限 Reader 可枚举下载 | 路由注册统一添加 `CheckReadonly`，下载组追加 `CheckAdminRole` |
+| **导出接口遗漏 CheckReadonly** | [kernel/api/router.go#L295,L297](kernel/api/router.go#L295) | `exportSyncProviderS3/WebDAV` 只读模式下仍可导出敏感密码；`/export/*` 下载路由缺少 Admin 校验 | 路由注册统一添加 `CheckReadonly`，下载组追加 `CheckAdminRole` |
+| **发布代理路径无白名单** | [kernel/server/proxy/publish.go#L125-L129](kernel/server/proxy/publish.go#L125-L129) | `rewrite()` 无路径限制，发布服务端口可转发任意内部路径（含 `/export/*`、`/api/sync/*`）；结合 Reader JWT，低权限用户可访问内部只读 API | 在发布代理中增加路径白名单，仅放行已发布文档相关路由 |
 | **发布密码 SHA256 无盐** | [kernel/model/publish_access.go#L229](kernel/model/publish_access.go#L229) | Cookie 值 = SHA256(ID+password)，可彩虹表破解弱密码 | 改为使用 bcrypt/argon2 + 随机盐 |
 | **运行时 .sy 文档明文** | workspace/data/ | 服务器被攻破时，所有文档直接可读 | 可考虑提供"工作区级透明加密"选项 |
 | **JWT 无过期时间** | [kernel/model/auth.go#L107-L117](kernel/model/auth.go#L107-L117) | 发布服务 JWT 未设置 exp 声明，理论上永久有效 | 添加合理的 exp (如 24h) + 滑动刷新 |
@@ -1140,10 +1249,10 @@ IncSync() → 标记需要同步
 - [ ] **C9** GetMaskedConf API → 检查是否返回明文 WebDAV 密码
 - [ ] **C10** 只读模式下调用 importSyncProviderWebDAV → 被 CheckReadonly 拦截 (code=1)
 - [ ] **C11** 只读模式下调用 exportSyncProviderWebDAV → 验证当前是否可绕过限制
-- [ ] **C12** 只读模式下直接 GET /export/webdav-{timestamp}.zip → 验证 Reader 会话是否可下载
+- [ ] **C12** 发布服务端口（Reader JWT）→ GET /export/webdav-{timestamp}.zip → 验证是否下载成功（需提前由 Admin 生成文件）
 - [ ] **C13** 正常模式 vs 只读模式 → 对比 8 个同步接口的中间件覆盖率是否一致
-- [ ] **C14** 枚举 /export/webdav-*.zip 路径 → 是否存在可被 Reader 会话利用的文件名规律
-- [ ] **C15** Editor 角色会话调用 exportSyncProvider* → 被 CheckAdminRole 拦截（确认当前 P2/P3 权限梯度正确）
+- [ ] **C14** 发布服务 BasicAuth 账号登录发布端口 → POST /api/sync/exportSyncProvider* → 验证被 CheckAdminRole 403 拦截（已证实在代码中，但集成测试确认）
+- [ ] **C15** 发布代理 rewrite 路径白名单测试：发布端口访问 /api/system/getConf、/api/repo/* 等内部 API → 验证 Reader JWT 是否能意外访问
 
 #### D. 发布访问控制测试
 - [ ] **D1** 5 级权限 (public/protected/hidden/private/forbidden) 各自正确渲染
