@@ -332,6 +332,106 @@ upsertTree 执行流程（命中忽略时）：
 - 缓存机制：首次读取后设置 `IndexIgnoreCached = true`，后续直接返回缓存结果
 - 缓存失效：`FullReindex()` 中显式设置 `sql.IndexIgnoreCached = false`，触发重新加载
 
+#### 三种生命周期路径下的索引状态对比
+
+根据索引忽略配置生效的时机和触发操作的不同，被忽略文档在各索引表中的最终状态存在显著差异。以下是三种典型路径的详细对比：
+
+##### 路径一：全量重建（FullReindex）时文档已被配置为忽略
+
+即配置 `indexignore` 在先，然后执行完整重建（`FullReindex` → `InitDatabase(true)` → `indexBox`）。
+
+**执行流程**：
+1. `InitDatabase(true)` 清空数据库所有表
+2. `indexBox` 逐文档加载并调用 `IndexTreeQueue`（action="index"）
+3. `indexTree` → `insertTree0` → 命中 `indexignore` → 直接 return
+4. 随后 `IndexRefs` 阶段直接遍历文件系统，发现含引用的文档 → 调用 `UpdateRefsTreeQueue`（action="update_refs"）
+5. `upsertRefs` 无索引忽略检查 → refs 被正常写入
+
+**各索引表最终状态**：
+
+| 索引表 | 状态 | 原因 |
+|--------|------|------|
+| **blocks 表**（含 tag 列、ial 列） | ❌ 无数据 | `insertTree0` 被忽略，块级索引完全缺失 |
+| **spans 表**（标签行级） | ❌ 无数据 | 同上，标签面板不会显示该文档的标签 |
+| **assets 表** | ❌ 无数据 | 同上 |
+| **attributes 表**（属性展开） | ❌ 无数据 | 同上，属性搜索搜不到该文档 |
+| **refs 表**（引用） | ⚠️ **有数据**（若文档含引用） | `IndexRefs` 阶段通过 `update_refs` 补回，`upsertRefs` 无忽略检查 |
+| **file_annotation_refs 表** | ⚠️ **有数据**（若文档含文件标注引用） | 同上 |
+
+> **一致性影响**：全量重建后，被忽略文档的 refs 表与其他表出现不一致——refs 表中有「该文档引用了其他块」的记录，但该文档的块在 blocks/spans 表中不存在。这会导致反向链接面板中能找到这些引用，但点击跳转时可能找不到块内容。
+
+##### 路径二：先正常索引，后加入忽略规则，再触发 upsert（编辑保存）
+
+即文档一开始在索引中，后来被加入 `indexignore`，然后用户编辑该文档并保存（触发 `upsertTree`）。
+
+**执行流程**：
+1. upsertTree 先计算 blocks 增量 → 删除变化的块
+2. upsertTree 全量删除 spans/assets/attributes/refs 子表
+3. 调用 `insertTree0` → 命中 `indexignore` → return，所有插入被跳过
+
+**各索引表最终状态**：
+
+| 索引表 | 状态 | 原因 |
+|--------|------|------|
+| **blocks 表**（含 tag 列、ial 列） | ⚠️ **部分保留** | Hash 未变化的块保留旧数据，变化的块被删除且不重插。文档根节点（通常不会变）大概率保留，但内容块可能丢失 |
+| **spans 表**（标签行级） | ❌ **全空** | 整文档全量删除后未重插，标签面板计数会减少 |
+| **assets 表** | ❌ **全空** | 同上 |
+| **attributes 表**（属性展开） | ❌ **全空** | 同上，属性搜索搜不到该文档的 custom 属性 |
+| **refs 表**（引用） | ❌ **全空** | 同上 |
+| **file_annotation_refs 表** | ❌ **全空** | 同上 |
+
+> **标签索引一致性影响**：blocks 表的 tag 列（块级标签）可能还有残留（因为部分块未被删除），但 spans 表的行级标签索引已全部清空。两级标签索引不一致：全文搜索可能还能搜到标签（通过 blocks.tag 的 FTS），但标签面板统计计数会减少（基于 spans 表）。
+
+> **属性索引一致性影响**：blocks.ial 中仍有完整属性数据（未变化的块），但 attributes 展开表已空。通过 `getBlockAttrs`（读 blocks.ial）仍能获取属性，但通过属性搜索/属性视图（查 attributes 表）找不到该文档。
+
+##### 路径三：仅触发引用刷新（update_refs）
+
+即文档已被配置为忽略索引，不做任何编辑保存，仅触发引用相关操作（手动刷新反向链接、动态锚文本级联更新、IndexRefs）。
+
+**执行流程**：
+1. `UpdateRefsTreeQueue` 入队 → action="update_refs"
+2. `upsertRefs` → 先删后插 refs（**无索引忽略检查**）
+3. 其他表完全不涉及
+
+**各索引表最终状态**：
+
+| 索引表 | 状态 | 原因 |
+|--------|------|------|
+| **blocks 表** | ✅ **不变** | `update_refs` 不操作 blocks |
+| **spans 表**（标签） | ✅ **不变** | `update_refs` 不操作 spans |
+| **assets 表** | ✅ **不变** | 同上 |
+| **attributes 表**（属性） | ✅ **不变** | 同上 |
+| **refs 表**（引用） | ✅ **正常重建** | `upsertRefs` 不受忽略影响，全量删插正常执行 |
+| **file_annotation_refs 表** | ✅ **正常重建** | 同上 |
+
+> **与路径二的组合效应**：如果路径二之后再触发引用刷新（很常见，因为编辑保存后通常会刷新反向链接），最终状态会变成：blocks 部分保留 + spans/assets/attributes 全空 + refs 被补回。即引用索引与其他索引的不一致程度进一步扩大。
+
+##### 三种路径汇总对比表
+
+| 路径 | blocks | tag 列（块级） | spans（标签行级） | attributes（属性） | refs（引用） |
+|------|--------|--------------|-------------------|-------------------|-------------|
+| 全量重建 + 忽略 | ❌ 无 | ❌ 无 | ❌ 无 | ❌ 无 | ⚠️ 有（含引用时） |
+| 后加忽略 + upsert | ⚠️ 部分 | ⚠️ 部分残留 | ❌ 全空 | ❌ 全空 | ❌ 全空 |
+| 仅触发 update_refs | ✅ 不变 | ✅ 不变 | ✅ 不变 | ✅ 不变 | ✅ 正常重建 |
+| 后加忽略 + upsert + 再刷引用 | ⚠️ 部分 | ⚠️ 部分残留 | ❌ 全空 | ❌ 全空 | ✅ 被补回 |
+
+##### 对标签、属性、引用三类索引一致性的具体影响
+
+**标签索引**：存在两级不一致的风险
+- blocks.tag（块级聚合，FTS 搜索用）：可能有残留（upsert 未变化的块保留）
+- spans 表（行级，标签面板/标签搜索用）：全空
+- 表现：全文搜索 `#标签名#` 可能还能搜到该文档的某些块，但标签面板的标签计数不包含该文档
+
+**属性索引**：存在两层不一致的风险
+- blocks.ial（整体 JSON，`GetBlockAttrs` 用）：可能有残留
+- attributes 展开表（逐行，属性视图/属性搜索用）：全空
+- 表现：通过 API 读属性正常，但属性视图和属性搜索找不到该文档
+
+**引用索引**：最复杂的不一致源
+- 全量重建场景：refs 有数据但 blocks/spans 无对应块 → 反向链接能列出但跳转可能异常
+- upsert 后刷引用场景：refs 被补回但 attributes/spans 为空 → 引用跳转正常但相关属性/标签搜索缺失
+- `update_refs` 完全绕过索引忽略，是「索引忽略语义不完整」的核心体现
+
 ### 4.5 标签索引的两级结构
 
 标签在数据库中存在**两级索引**，分别服务于不同查询场景：
@@ -655,8 +755,11 @@ SQL 索引队列（`kernel/sql/queue.go`）中，**同一 tree.ID 的同类操�
 | **队列溢出** | 低 | txQueue buffer=7，大量连续操作可能阻塞；dbQueueOperation 无显式长度限制，极端情况内存增长 |
 | **批量操作中断** | 中 | RenameTag/RemoveTag 逐文档循环，中途中断会导致部分文档已更新、部分未更新（无全局事务回滚） |
 | **索引忽略导致 upsert 数据丢失** | 高 | upsertTree 先删后插，如果 `insertTree0` 中命中 `indexignore` 规则，子表数据（spans/attributes/refs）已被删除但不会被重新插入，导致标签、属性、引用索引全部丢失 |
+| **两级标签索引不一致** | 中 | 索引忽略 + upsert 场景下，blocks.tag（块级标签，FTS 用）可能有残留（未变化的块保留），但 spans 表（行级标签，标签面板用）已全空。全文搜索能搜到但标签面板计数减少 |
+| **两层属性索引不一致** | 中 | 索引忽略 + upsert 场景下，blocks.ial（整体 JSON，GetBlockAttrs 用）可能有残留，但 attributes 展开表（属性视图/属性搜索用）已全空。API 能读到属性但属性搜不到 |
 | **update_refs 与 upsert 竞态冗余** | 低 | 同一文档可能同时入队 `update_refs` 和 `upsert`，两者都会操作 refs 表但互不感知，存在冗余删除+插入，最终结果正确但浪费 IO |
 | **索引忽略悬挂引用** | 低 | `update_refs` 不受 `indexignore` 影响，被忽略文档的 refs 仍会被更新，但该文档的 blocks/spans/attributes 已被删除，导致 refs 中存在「指向索引中不存在块」的悬挂引用 |
+| **全量重建时 refs 与主索引脱节** | 中 | 全量重建场景下，被忽略文档的 blocks/spans/attributes 全无，但 refs 会被 IndexRefs 阶段通过 update_refs 补回。反向链接能列出引用但点击跳转可能找不到对应块 |
 
 ### 11.2 性能风险
 
@@ -705,6 +808,10 @@ SQL 索引队列（`kernel/sql/queue.go`）中，**同一 tree.ID 的同类操�
 | V-11 | update_refs 隔离性 | 对文档 A 触发 `update_refs`，检查 blocks/spans/attributes 表 | blocks/spans/attributes 不受影响，仅 refs 和 file_annotation_refs 被重建 |
 | V-12 | 索引忽略 + upsert 数据完整性 | 先索引文档 A，再在 `indexignore` 中添加 A 的路径，然后编辑保存 A | A 的 spans/attributes/refs 被清空，标签面板和属性搜索不再出现 A 的内容 |
 | V-13 | 索引忽略悬挂引用 | 文档 B 引用文档 A，A 被 `indexignore` 忽略，对 B 触发 `update_refs` | refs 表中仍存在 B→A 的引用记录，但 A 的 blocks 表中无对应行（悬挂引用） |
+| V-14 | 全量重建 + 索引忽略 refs 残留 | 配置 `indexignore` 忽略含引用的文档 A → 执行 FullReindex | blocks/spans/attributes 中无 A 的数据，但 refs 表中有 A 的引用记录（IndexRefs 阶段补回） |
+| V-15 | 标签两级索引不一致验证 | 文档 A 先索引，加忽略规则后修改部分块（部分块 Hash 不变） | blocks.tag 中仍有未变化块的标签数据，但 spans 表行级标签全空；全文搜索能搜到，标签面板计数减少 |
+| V-16 | 属性两层索引不一致验证 | 文档 A 设 custom 属性后加忽略规则，修改部分块后保存 | API `getBlockAttrs` 仍能读到属性（从 blocks.ial），但属性视图/属性搜索搜不到（attributes 表已空） |
+| V-17 | 忽略 + upsert + 刷引用组合效应 | 文档 A 被忽略，编辑保存后立即刷反向链接 | blocks 部分保留 + spans/assets/attributes 全空 + refs 被补回，三态不一致 |
 
 ### 12.2 性能与压力测试
 
@@ -764,3 +871,4 @@ SQL 索引队列（`kernel/sql/queue.go`）中，**同一 tree.ID 的同类操�
 **修正记录**：
 - v2 - 修正 upsertTree 增量更新理解：仅 blocks 表做 Hash 增量，spans/assets/attributes/refs 均为整文档全量重建
 - v3 - 修正 update_refs 理解：仅重建 refs+file_annotation_refs，不涉及其他表；补充索引忽略配置对 upsert 的副作用分析（先删后忽略=数据丢失）、update_refs 与 upsert 的竞态分析
+- v4 - 新增索引忽略三种生命周期路径对比：全量重建、后加忽略+upsert、仅触发引用刷新；明确标签两级索引不一致、属性两层索引不一致、refs 与主索引脱节等具体一致性风险
