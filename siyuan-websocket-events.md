@@ -755,20 +755,128 @@ const promiseTransaction = () => {
 
 #### 5.2.5 旁路：直接提交（不防抖）
 
-以下操作 **跳过防抖**，直接发送 HTTP 请求：
+[transaction.ts L1401-L1435](file:///d:/fz/0601/solo-dogfeeding/code/297-siyuan/app/src/protyle/wysiwyg/transaction.ts#L1401-L1435)
+
+以下操作 **跳过防抖**，直接发送 HTTP 请求，且**不进入 `transactions` 队列**：
 
 ```typescript
-// 折叠、属性视图设置等操作需要即时响应
-if (doOperations.length === 1 && (
-    doOperations[0].action === "unfoldHeading" || 
-    doOperations[0].action === "setAttrViewBlockView" ||
-    (doOperations[0].action === "setAttrs" && doOperations[0].data.startsWith('{"fold":'))
-) || (doOperations.length === 2 && doOperations[0].action === "insertAttrViewBlock")) {
-    protyle.transactionTime = time + Constants.TIMEOUT_INPUT * 2;  // 阻止合并
-    fetchPost("/api/transactions", ...);
-    return;
+if ((doOperations.length === 1 && (
+    doOperations[0].action === "unfoldHeading" ||      // 展开标题
+    doOperations[0].action === "setAttrViewBlockView" || // 属性视图切换
+    (doOperations[0].action === "setAttrs" &&           // 折叠属性（update类型变种）
+     doOperations[0].data.startsWith('{"fold":'))
+)) || (doOperations.length === 2 && doOperations[0].action === "insertAttrViewBlock")) {
+    protyle.transactionTime = time + Constants.TIMEOUT_INPUT * 2;  // 设未来时间
+    fetchPost("/api/transactions", ...);  // 直接 HTTP，不入队
+    return;  // 不执行后续的 clearTimeout/队列操作
 }
 ```
+
+**关键细节：设未来时间不影响当前操作，影响的是后续输入。**
+
+#### 5.2.6 队列交错：即时操作 + 既有待提交事务 + 后续输入
+
+这是代码设计最精妙的部分。`transactionTime = time + 512ms` 的作用**不是阻止当前操作与之前合并**（当前操作已经 `return` 不入队了），而是阻止**后续输入与队列中已存在的旧 update 合并**——因为旧 update 是即时操作修改文档状态之前入队的，不能再合并。
+
+用完整时间线追踪（代码注释：L1406 "防止 needDebounce 为 true"）：
+
+```
+═══════════════════════════════════════════════════════════════════
+初始状态:
+  transactions 队列: []  (空)
+  transactionTime:    undefined
+  transactionsTimeout: 无定时器
+═══════════════════════════════════════════════════════════════════
+
+t=0ms  用户输入字符 'a'
+       → lastTransaction 不存在 → needDebounce=false
+       → transactions.push(Tx_a: [{action:'update', data:'a'}])
+            队列: [Tx_a]  ← 在队列中，等待 512ms 后提交
+       → transactionTime = 0
+       → transactionsTimeout = setTimeout(promiseTx, 512ms)
+            计划在 t=512ms 触发提交
+
+t=100ms 用户输入字符 'b'
+       → 条件检查：
+         1. lastTx=Tx_a 存在 ✓
+         2. Tx_a.doOps=[{action:'update'}] ✓
+         3. 当前 doOps=[{action:'update'}] ✓
+         4. 同一块 ID ✓
+         5. transactionTime(0) - time(100) = -100 < 256 ✓
+       → needDebounce=true → 原地替换 Tx_a.data 为 'ab'
+            队列: [Tx_ab]  (不变，内容更新)
+       → transactionTime = 100
+       → clearTimeout + setTimeout(promiseTx, 512ms)
+            计划在 t=612ms 触发提交
+
+t=150ms 用户点击标题折叠按钮（setAttrs 折叠属性）
+       → 匹配即时操作条件：doOps[0].action='setAttrs' 且 data 含 'fold'
+       
+       ┌─────────────────────────────────────────────────────────┐
+       │ 即时操作分支：                                           │
+       │ ① transactionTime = 150 + 512 = 662  ← 设为未来时间！     │
+       │ ② fetchPost("/api/transactions", fold_tx) → 立即 HTTP   │
+       │    fold_tx 不进入 transactions 队列                     │
+       │ ③ return; → 不执行下面的 clearTimeout / push / 重置定时器 │
+       └─────────────────────────────────────────────────────────┘
+       
+       此时系统状态快照:
+         队列:            [Tx_ab]  ← 旧 update 仍在队列中！
+         transactionTime: 662     ← 未来时间，影响后续判断
+         定时器:          仍在 t=612ms 触发  ← 没被 clear！
+         在途 HTTP:       fold_tx  (折叠操作)
+         后端执行顺序:    fold_tx 会先于 Tx_ab 到达（ControlConcurrency 串行化）
+
+t=200ms 用户继续输入字符 'c'   ← 关键！此时队列中仍有旧 Tx_ab
+       → 条件检查：
+         1. lastTx=Tx_ab 存在 ✓  (队列里那个还是它)
+         2. Tx_ab.doOps=[{action:'update'}] ✓
+         3. 当前 doOps=[{action:'update'}] ✓
+         4. 同一块 ID ✓
+         5. transactionTime(662) - time(200) = 462 < 256 ?  ❌ FALSE
+       ┌─────────────────────────────────────────────────────────┐
+       │ 条件 5 失败 → needDebounce=false！                        │
+       │ → 字符 'c' 不会合并到旧的 Tx_ab，而是 push 为新事务 Tx_c    │
+       │ → 这正是我们想要的：                                      │
+       │   Tx_ab 是折叠前的快照，不能再合并新内容到它                 │
+       │   必须分离为两个独立事务，否则会覆盖 fold 的效果！           │
+       └─────────────────────────────────────────────────────────┘
+       → transactions.push(Tx_c: [{action:'update', data:'c'}])
+            队列: [Tx_ab, Tx_c]
+       → transactionTime = 200   ← 正常输入重置为当前时间
+       → clearTimeout + setTimeout(promiseTx, 512ms)
+            计划在 t=712ms 触发（t=200ms 的定时器替换了 t=612ms 的）
+
+t=612ms  (被 clearTimeout，不触发)
+
+t=712ms  promiseTransaction() 定时器触发
+       ┌─────────────────────────────────────────────────────────┐
+       │ 步骤 1：发送 Tx_ab HTTP 请求                              │
+       │   transactions 立即出队: [Tx_c]                          │
+       │   ControlConcurrency: 排队（fold_tx 可能还在执行）        │
+       └─────────────────────────────────────────────────────────┘
+
+HTTP 回调收到 Tx_ab 响应
+       → 队列不为空 → promiseTransaction() 递归调用
+       ┌─────────────────────────────────────────────────────────┐
+       │ 步骤 2：发送 Tx_c HTTP 请求                              │
+       │   transactions 立即出队: []                              │
+       └─────────────────────────────────────────────────────────┘
+
+后端按 ControlConcurrency 串行执行顺序：
+  fold_tx (折叠) → Tx_ab (更新'ab') → Tx_c (更新'c')
+  ↑ 立即提交的      ↑ 队列中旧的       ↑ 队列中新的
+
+═══════════════════════════════════════════════════════════════════
+```
+
+**关键结论**：
+1. 即时操作（折叠等）不入 `transactions` 队列，直接 HTTP，因此**与防抖队列完全解耦**
+2. `transactionTime = time + 512ms` 是一个"防火墙"：阻止后续输入与**折叠之前就已经在队列中的旧 update** 合并，避免折叠状态被合并操作错误覆盖
+3. 定时器也被"旁路"了——即时操作不 `clearTimeout`，但后续正常输入会重新设定时器（见 t=200ms），因此最终正确重置
+4. 三种操作类型（`unfoldHeading`/`setAttrViewBlockView`/`setAttrs-fold`）虽不完全是 `update` 类型，但设未来时间仍必要——因为判断合并的是"后续输入"而不是"当前操作"
+
+---
 
 ### 5.3 后端串行化保证
 
@@ -836,15 +944,28 @@ func pushTransactions(app, session string, transactions []*model.Transaction) {
 | 层级 | 机制 | 保证范围 | 代码依据 |
 |------|------|----------|----------|
 | 前端防抖层 | `transactions` FIFO 队列 + `promiseTransaction` 递归回调串行提交 | 同一编辑器的操作按顺序提交（在途仅一个 HTTP） | [transaction.ts L64-L86](file:///d:/fz/0601/solo-dogfeeding/code/297-siyuan/app/src/protyle/wysiwyg/transaction.ts#L64-L86) |
+| 前端旁路层 | 即时操作（折叠等）直接 HTTP，不入队列 | 即时操作与队列事务竞争；最终由后端串行化决定顺序 | [transaction.ts L1401-L1435](file:///d:/fz/0601/solo-dogfeeding/code/297-siyuan/app/src/protyle/wysiwyg/transaction.ts#L1401-L1435) |
+| 前端合并屏障 | `transactionTime = time + 512ms` + 条件 5 判断 | 阻止后续输入合并到"即时操作前已入队的旧 update" | [L1387](file:///d:/fz/0601/solo-dogfeeding/code/297-siyuan/app/src/protyle/wysiwyg/transaction.ts#L1387) + [L1407](file:///d:/fz/0601/solo-dogfeeding/code/297-siyuan/app/src/protyle/wysiwyg/transaction.ts#L1407) |
 | HTTP 传输层 | TCP 保证顺序 | 单个请求内的字节流顺序 | TCP 协议 |
-| 后端中间件 | `ControlConcurrency` 按 API 路径加互斥锁 | `/api/transactions` 的所有请求串行执行（同一 API 路径仅一个 goroutine 在处理） | [session.go L456-L507](file:///d:/fz/0601/solo-dogfeeding/code/297-siyuan/kernel/model/session.go#L456-L507) |
+| 后端中间件 | `ControlConcurrency` 按 API 路径加互斥锁 | `/api/transactions` 的所有请求串行执行（同一 API 路径仅一个 goroutine 在处理），按到达先后执行 | [session.go L456-L507](file:///d:/fz/0601/solo-dogfeeding/code/297-siyuan/kernel/model/session.go#L456-L507) |
 | 事务层 | `WaitForCommit` + `FlushTxQueue` | 推送发生在所有持久化完成之后，避免推送了但文件未写入 | [transaction.go](file:///d:/fz/0601/solo-dogfeeding/code/297-siyuan/kernel/api/transaction.go) |
 | WebSocket 层 | TCP 保证顺序 + melody 单连接串行 `session.Write` | 单个 WebSocket 连接内消息按发送顺序到达 | TCP 协议 + melody 内部 Write 序列化 |
+
+**交错场景下的实际执行顺序（以 5.2.6 时间线为例）**：
+
+| 操作 | 前端发送时刻 | 到达后端顺序 | 执行顺序 | 说明 |
+|------|-------------|-------------|----------|------|
+| fold_tx（折叠） | t=150ms（立即） | 第 1 个到达 | fold_tx | 即时操作先发先到 |
+| Tx_ab（更新'ab'） | t=712ms（队列） | 第 2 个到达 | → Tx_ab | 队列等待后发送，ControlConcurrency 使其排队等待 fold_tx |
+| Tx_c（更新'c'） | t=712ms+Tx_ab回调后 | 第 3 个到达 | → Tx_c | promiseTransaction 串行，等 Tx_ab 返回后才发送 |
+
+> **重要**：fold_tx 是直接发送的，所以总是比队列中的 Tx_ab 先到后端。ControlConcurrency 保证执行顺序也是 fold→Tx_ab→Tx_c，不会产生乱序覆盖。
 
 **无法保证的范围**：
 - 不同 `type` 连接之间（如 main 与 protyle）的消息到达顺序，因为是不同的 TCP 连接
 - 重连期间丢失的消息，因为没有重放机制
 - 后端 `BroadcastByType` 遍历过程中新加入/离开的连接，遍历快照可能不含该连接
+- 多个编辑器（不同 protyle 实例）之间的操作发送顺序（各自独立队列，无法全局保证）
 
 ---
 
@@ -1102,10 +1223,12 @@ ws.onmessage = (event) => {
 | 12 | **心跳缺失 - 桌面端** | 桌面端完全没有应用层心跳，NAT/防火墙空闲超时会导致连接假死，只有用户操作触发 send 时才发现断开 | 连接假死、消息延迟 | 高 | 应用层 30s 定时 ping/pong，超时主动关闭触发重连 |
 | 13 | **心跳缺失 - 移动端** | 移动端仅被动触发 `reconnectWebSocket`（切前台时），无后台定时器；ping 是单向的，服务端不回复 pong | 后台时连接易断 | 中 | 增加定时 ping 定时器；服务端回复 pong 用于 RTT 计算 |
 | 14 | **发布服务竞态** | `ClosePublishServiceSessions` 中 `time.Sleep(500ms)` 是硬编码等待，高负载下消息可能未发出就关闭连接 | 部分客户端收不到关闭通知 | 低 | 使用 Write 回调 + WaitGroup 替代 sleep |
-| 15 | **事务防抖竞态** | 512ms 防抖期间若 WebSocket 断开，本地事务未提交但可能已有推送基于旧状态；`transactions` 队列在页面刷新时丢失 | 数据丢失 | 中 | 提交失败时事务回滚 + 本地重做队列；localStorage 持久化待提交事务 |
-| 16 | **BroadcastByType 原子性** | 遍历 sync.Map 过程中若新 session 加入/离开，遍历快照可能不包含该 session | 消息漏发/重复 | 低 | 使用不可变快照 + 版本号确认 |
-| 17 | **ControlConcurrency 死锁风险** | 按 API 路径粒度加锁，若处理函数内部调用另一个加锁 API（嵌套请求）会产生死锁 | 服务挂起 | 低 | 增加可重入检测；或明确禁止嵌套写请求 |
-| 18 | **多连接重复 UI 更新** | 同一事件（如 rename）同时推送给多个 type，前端多模块独立处理，可能产生重复渲染/闪烁 | UI 体验差 | 低 | 事件去重；或统一事件总线再分发 |
+| 15 | **事务防抖竞态** | 512ms 防抖期间若 WebSocket 断开，本地事务未提交但可能已有推送基于旧状态；`transactions` 队列在页面刷新时丢失；即时操作（折叠等）与队列事务交错需依赖 transactionTime 防火墙，若新操作类型非 `update` 但仍需隔离，时间条件可能失效 | 数据丢失、状态错乱 | 中 | 提交失败时事务回滚 + 本地重做队列；localStorage 持久化待提交事务 |
+| 16 | **旁路事务丢包** | 即时操作直接 HTTP 不入 `transactions` 队列，若失败无重试（promiseTransaction 有 FIFO 重试语义但旁路没有）；`return` 跳过所有队列逻辑，失败不会触发队列中其他事务的重新校验 | 单次操作失败无感知 | 低 | 即时操作失败回调中重置 `transactionTime`，重新合并队列事务 |
+| 17 | **BroadcastByType 原子性** | 遍历 sync.Map 过程中若新 session 加入/离开，遍历快照可能不包含该 session | 消息漏发/重复 | 低 | 使用不可变快照 + 版本号确认 |
+| 18 | **ControlConcurrency 死锁风险** | 按 API 路径粒度加锁，若处理函数内部调用另一个加锁 API（嵌套请求）会产生死锁 | 服务挂起 | 低 | 增加可重入检测；或明确禁止嵌套写请求 |
+| 19 | **多连接重复 UI 更新** | 同一事件（如 rename）同时推送给多个 type，前端多模块独立处理，可能产生重复渲染/闪烁 | UI 体验差 | 低 | 事件去重；或统一事件总线再分发 |
+| 20 | **定时器重置竞态** | 正常输入在 L1436 `clearTimeout(transactionsTimeout)`，但即时操作分支直接 `return` 不执行；若折叠操作后用户长时间不输入（>512ms），旧定时器会触发提交，此时队列中事务可能与已提交的折叠操作状态产生时间差 | 事务延迟到达 | 低 | 即时操作分支补充 `clearTimeout`，与正常路径统一 |
 
 ---
 
