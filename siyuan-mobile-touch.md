@@ -168,6 +168,7 @@ SiYuan 的响应式不是单一机制，而是 **端间硬切换、局部 CSS �
 │ 切换时机：运行时视口 resize 触发（纯 CSS，无需 JS）                  │
 │ 核心业务断点（L1，SiYuan 自有，必须保障）：                           │
 │   620px — superblock 横列 ↔ 竖排 切换（仅移动端 _mobile.scss）      │
+│   750px — 通用表单组件换行（component/_form.scss 双端）             │
 │   750px — 设置/历史/快捷键面板窄屏化（util/_responsive.scss 双端）   │
 │ 组件微调断点（L2，通用组件，视觉优化）：                               │
 │   520px — snackbar 通知条位置调整 + tooltips 工具提示隐藏（双端）     │
@@ -258,18 +259,58 @@ Level 3 — 第三方库自带断点（2 个库，共 8 个断点，SiYuan 未�
 
 ---
 
-**750px — 表单/对话框/面板窄屏适配（`app/src/assets/scss/util/_responsive.scss`，双端共用）**
+**750px — 两套独立规则并存：通用表单组件级 + 业务面板级（双端共用）**
+
+> 重要：`750px` 这个宽度点上有**两套完全独立的 @media 规则**，分别来自不同文件、作用于不同层级，请勿混淆。
+
+---
+
+**750px 规则 A：通用表单组件级（`app/src/assets/scss/component/_form.scss`）**
+
+这是**设计系统级**的响应式，作用于 B3 组件库的通用表单项容器 `.b3-label--inner`（带内嵌标签的表单行）。所有使用该组件的对话框、设置项、弹出层都会自动继承此行为。
+
+窄屏（≤750px）时，`.b3-label--inner` 从"标签与控件横向并排"变为"控件全部换行竖排"，具体各组件的换行行为：
+
+| 表单控件 | 宽屏（>750px）默认布局 | 窄屏（≤750px）换行行为 | 间距 |
+|----------|----------------------|----------------------|------|
+| **b3-text-field 输入框** | 与标签横向同排，宽度自适应 | `width: 100%` 全宽，换行到标签下方 | `margin-top: 8px` |
+| **b3-select 下拉选择框** | 与标签横向同排，宽度自适应 | `width: 100%` 全宽，换行到标签下方 | `margin-top: 8px` |
+| **b3-form__icona 图标按钮** | 与标签/输入框横向同排 | `width: 100%` 全宽，换行到标签下方 | `margin-top: 8px` |
+| **b3-button 普通按钮** | 横向排列，按钮宽度由内容决定 | `width: 100%` 全宽占满，非首按钮额外间距 | 首按钮紧贴标签行；非首按钮 `margin-top: 16px` |
+
+核心触发 CSS：`.b3-label--inner { flex-wrap: wrap; }` — 允许 flex 容器换行，再配合各子元素的 `width: 100%` 实现竖排。
+
+**设计意图**：B3 表单组件的基础响应式能力。无论表单出现在什么业务场景（设置、对话框、属性面板、新建文档等），只要使用 `.b3-label--inner` 结构，窄屏时标签和控件就会自动从"左右排列"切换为"上下排列"，保证小屏触控区域充足。
+
+---
+
+**750px 规则 B：业务面板级（`app/src/assets/scss/util/_responsive.scss`）**
+
+这是**SiYuan 业务层**的响应式，仅作用于 `.config`（设置面板）、`.history`（历史版本）等特定业务面板。在通用表单组件响应式之外，做了额外的业务级微调。
 
 覆盖 4 类功能面板组件：
 
-| 组件 | 调整前（>750px） | 调整后（≤750px） | CSS 选择器 |
-|------|-----------------|-----------------|-----------|
-| **设置面板 Tab 栏** | 图标 + 文字并排，固定宽度 | 仅显示图标，`width: auto` | `.config__panel > .b3-tab-bar` |
-| **设置项表单行** | 标签与控件横向并排 | 控件 `width: 100%`，全部换行竖排 | `.config__item > *` |
-| **历史版本面板** | 左右分栏（历史列表 + 差异预览） | 上下分栏，上栏 `height: 40%` | `.history__panel` |
-| **快捷键定义** | 键位输入框横向排列 | 键位输入框 `width: 100%` + 居中 | `.config-keymap__key` |
+| 组件 | 调整前（>750px） | 调整后（≤750px） | CSS 选择器 | 与通用表单的关系 |
+|------|-----------------|-----------------|-----------|----------------|
+| **设置面板 Tab 栏** | 图标 + 文字并排，固定宽度 | 仅显示图标，`width: auto` | `.config__panel > .b3-tab-bar` | 独立于通用表单，Tab 栏专属 |
+| **设置项表单项** | 标签与控件横向并排 | 控件 `width: 100%`，全部换行竖排 | `.config__item > *` | 与通用表单 `.b3-label--inner` 行为类似，但选择器直接针对 `.config__item`，两者是叠加生效 |
+| **历史版本面板** | 左右分栏（历史列表 + 差异预览） | 上下分栏，上栏 `height: 40%` | `.history__panel` | 面板级布局调整，与表单组件无关 |
+| **快捷键定义** | 键位输入框横向排列 | 键位输入框 `width: 100%` + 居中 | `.config-keymap__key` | 快捷键面板专属，补充居中等特殊样式 |
 
-**设计意图**：750px 断点作用于**弹出对话框/浮动面板**（#model 设置面板、Dialog 对话框、历史版本窗口）。这些组件在桌面端可能以较小的宽度弹出（或桌面窗口本身就被用户拖窄），在移动端则要占满整个屏幕。通过同一个 @media 规则覆盖双端的窄屏场景，避免重复写 CSS。
+**设计意图**：设置/历史等业务面板有自己的 HTML 结构（`.config__item` 而非纯 `.b3-label--inner`），需要额外的响应式规则来适配窄屏。这些规则与通用表单组件的 750px 断点**同时触发、叠加生效**——通用组件负责基础布局（标签换行），业务面板负责专属结构（Tab 栏简化、历史分栏切换）。
+
+---
+
+**两套 750px 规则的对比区分**：
+
+| 维度 | 规则 A：通用表单组件级 | 规则 B：业务面板级 |
+|------|----------------------|------------------|
+| 所在文件 | `component/_form.scss` | `util/_responsive.scss` |
+| 作用层级 | 设计系统 / 组件库 | SiYuan 业务 / 功能面板 |
+| 影响范围 | 所有使用 `.b3-label--inner` 的地方（设置、对话框、属性面板等） | 仅 `.config` / `.history` / 导出等特定业务面板 |
+| 断点个数 | 1 个 @media 块 | 1 个 @media 块（内部分多个业务选择器） |
+| 是否定制 | B3 设计系统原生能力 | SiYuan 业务定制 |
+| 典型场景 | 任意对话框里的表单项换行 | 设置面板 Tab 隐藏文字、历史面板左右→上下 |
 
 ---
 
@@ -310,7 +351,8 @@ Level 3 — 第三方库自带断点（2 个库，共 8 个断点，SiYuan 未�
 | 分级 | 断点宽度 | 文件位置 | 生效端 | 影响组件 |
 |------|---------|---------|--------|---------|
 | **L1 核心业务** | **620px** | `main/_mobile.scss` | 仅移动端 | Superblock 横列→竖排 |
-| **L1 核心业务** | **750px** | `util/_responsive.scss` | 双端共用 | 设置面板/历史面板/快捷键表单 |
+| **L1 核心业务** | **750px**（通用表单） | `component/_form.scss` | 双端共用 | 所有 `.b3-label--inner` 表单行：输入框/下拉/图标按钮/普通按钮换行竖排 |
+| **L1 核心业务** | **750px**（业务面板） | `util/_responsive.scss` | 双端共用 | 设置面板/历史面板/快捷键面板的专属结构 |
 | **L2 组件微调** | **520px** | `component/_snackbar.scss` | 双端共用 | Snackbar 通知条位置与滑入动画 |
 | **L2 组件微调** | **520px** | `component/_tooltips.scss` | 双端共用 | Tooltips 工具提示隐藏 |
 | L3 第三方库 | 535px | `pdf/_pdf.scss` | 双端共用 | PDF.js 缩放选择器 |
@@ -363,7 +405,7 @@ window.addEventListener("resize", () => {
 | **实现机制** | 双 webpack 入口 + ifdef 宏 + 双 HTML 模板 | `@media (max-width: Npx)` CSS 规则 | `matchMedia("orientation")` + JS 状态/样式修改 |
 | **切换时机** | 构建发布时（一次性） | 运行时 viewport resize（纯 CSS） | 物理方向旋转/键盘弹起时 resize（JS 驱动） |
 | **改变范围** | DOM 根结构、包体内容、模块裁剪 | 特定组件的 CSS 属性（flex-direction / width / display） | 状态变量 + 少量 class（键盘缓存、卡片图标） |
-| **核心断点** | N/A（是/否移动端二选一） | L1 业务：620px / 750px；L2 组件：520px；L3 第三方：535~1199px | portrait ↔ landscape（无中间态） |
+| **核心断点** | N/A（是/否移动端二选一） | L1 业务：620px（superblock）+ 750px 两套（通用表单 + 业务面板）；L2 组件：520px；L3 第三方：535~1199px | portrait ↔ landscape（无中间态） |
 | **影响 superblock 列布局** | 间接（移动端才加载 `_mobile.scss` 中的 620px 规则） | **直接**：620px 时横列→竖排 | 无直接影响 |
 | **影响键盘工具栏** | 直接（工具栏只有移动端才有） | 无直接 CSS 影响 | **直接**：height1/height2 缓存分离 |
 | **桌面端可用** | N/A（属于桌面端侧） | 是（750px 断点桌面端窗口缩窄时也生效） | 否（`updateCardHV()` 被 `/// #if MOBILE` 包裹） |
@@ -375,7 +417,8 @@ window.addEventListener("resize", () => {
 - L1 业务断点：
   - superblock 620px：`app/src/assets/scss/main/_mobile.scss` 第 510~518 行
   - superblock 默认列布局：`app/src/assets/scss/protyle/_wysiwyg.scss` 第 277~282 行
-  - 750px 通用表单/面板：`app/src/assets/scss/util/_responsive.scss` 全文
+  - 750px 通用表单组件：`app/src/assets/scss/component/_form.scss` 第 160~178 行
+  - 750px 业务面板：`app/src/assets/scss/util/_responsive.scss` 全文
 - L2 组件断点：
   - snackbar 520px 位置：`app/src/assets/scss/component/_snackbar.scss` 第 96~109 行
   - tooltips 520px 隐藏：`app/src/assets/scss/component/_tooltips.scss` 第 152~156 行
@@ -1184,7 +1227,7 @@ SiYuan 移动端的设计在**工程可维护性**和**双端复用率**之间�
 - **三层响应式而非单一机制：**
   - **Layer 1 端间硬切换（编译入口级）**：双 HTML 模板 + 双 JS/SCSS 入口 + ifdef 宏裁剪，实现桌面端/移动端包体级分离
   - **Layer 2 局部 CSS @media 断点（按业务影响三级分级）**：
-    - L1 核心业务（SiYuan 自有，不可缺失）：620px 控制 superblock 横列→竖排（移动端独有）、750px 控制设置/历史/快捷键面板窄屏适配（双端共用）
+    - L1 核心业务（SiYuan 自有，不可缺失）：620px 控制 superblock 横列→竖排（移动端独有）、750px 两套规则并存——通用表单组件级（`.b3-label--inner` 标签换行，所有表单共用）+ 业务面板级（设置/历史/快捷键专属面板，叠加在通用表单之上），均为双端共用
     - L2 组件微调（通用组件，视觉优化）：520px 控制 snackbar 通知条位置偏移 + tooltips 工具提示隐藏（双端共用）
     - L3 第三方库（SiYuan 未定制，升级库时自然变更）：PDF.js 535~840px / Viewer.js 767~1199px 工具栏分级隐藏
   - **Layer 3 横竖屏 JS 监听（状态级）**：`matchMedia("orientation")` 驱动键盘高度缓存分离（portrait/landscape 各存一套）和卡片图标显隐，不触发布局结构性变化
