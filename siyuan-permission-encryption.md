@@ -387,9 +387,11 @@ S3 配置导入导出流程与 WebDAV **完全一致**，定义于：
    - **但不提供真正的安全性**（密钥在源码中公开）
    - 属于"混淆"而非"加密"级别保护
 
-4. **API 权限边界**：
-   - 导入导出端点均需 `CheckAuth + CheckAdminRole + CheckReadonly` 三重校验
-   - 仅管理员可操作，防止低权限用户获取同步密码
+4. **API 权限边界（中间件差异）**：
+   - **写操作接口**（`setSyncProvider*`、`importSyncProvider*`）：`CheckAuth + CheckAdminRole + CheckReadonly` 三重校验
+   - **读操作接口**（`exportSyncProvider*`）：`CheckAuth + CheckAdminRole` **仅双重校验，缺少 CheckReadonly**
+   - `/export/*filepath` 静态下载：**仅 CheckAuth**，无 Admin 和 Readonly 校验
+   - 详见第 10.5 节「导入导出只读模式校验差异分析」
 
 ---
 
@@ -892,6 +894,111 @@ IncSync() → 标记需要同步
 
 ---
 
+### 10.5 导入导出只读模式校验差异分析
+
+#### 10.5.1 路由中间件链精确对比
+
+路由注册位于 [kernel/api/router.go#L283-L298](kernel/api/router.go#L283-L298)，导出相关接口共 10 个，按中间件覆盖可分为 **4 个权限等级**：
+
+| 权限等级 | 接口列表 | 中间件链 |
+|---------|---------|---------|
+| **P1-写操作（最高）** | `setSyncProvider`<br>`setSyncProviderS3`<br>`setSyncProviderWebDAV`<br>`setSyncProviderLocal`<br>`importSyncProviderS3`<br>`importSyncProviderWebDAV` | `CheckAuth` → `CheckAdminRole` → **`CheckReadonly`** → Handler |
+| **P2-导出配置** | `exportSyncProviderS3`<br>`exportSyncProviderWebDAV` | `CheckAuth` → `CheckAdminRole` → ❌ → Handler<br>**（缺少 CheckReadonly）** |
+| **P3-静态文件下载** | `GET /export/*filepath` (含导出的 ZIP) | `CheckAuth` → ❌ → ❌ → Handler<br>**（仅认证，无 Admin/Readonly）** |
+| P4-其他导出 | `/api/export/*` 系列 (28个) | 多数：`CheckAuth` → `CheckAdminRole` → ❌<br>`export2Liandi` 例外：加了 `CheckReadonly` |
+
+> **代码引用**：`/export/*filepath` 组定义于 [kernel/server/serve.go#L302-L351](kernel/server/serve.go#L302-L351)，使用 `ginServer.Group("/export/", model.CheckAuth)` 注册，显式仅包含 `CheckAuth` 一个中间件。
+
+#### 10.5.2 差异设计意图推测与实际后果
+
+**设计意图（合理的方面）**：
+1. **写操作（导入）修改 `conf.json` → 需要 `CheckReadonly`**：导入接口会调用 `SetSyncProviderWebDAV` → `Conf.Save()`，属于工作区写操作，因此只读模式理应阻止。
+2. **读操作（导出）不修改配置 → 不强制 `CheckReadonly`**：导出仅读取 `Conf.Sync.WebDAV` 字段，不改变工作区状态，属于"信息读取"而非"配置变更"。
+3. **静态文件下载是已生成文件的 HTTP 分发**：类似资源访问，与工作区读写模式无关。
+
+**实际后果（安全风险）**：
+
+```
+  只读模式开启 (Conf.ReadOnly = true)
+       │
+       ├─ ▶️  P1 importSyncProvider*    ✅ 被 CheckReadonly 拦截 (code=1)
+       ├─ ▶️  P1 setSyncProvider*       ✅ 被 CheckReadonly 拦截
+       ├─ ⚠️  P2 exportSyncProvider*    ❌ 正常执行 → Conf.Sync 被读取
+       │                                → 生成包含明文密码的 ZIP
+       │                                → 写入 TempDir/export/
+       └─ ⚠️  P3 GET /export/*.zip      ❌ 正常下载 → 敏感配置外泄
+```
+
+**关键矛盾**：只读模式的设计目标是「防止工作区配置被修改」，但在 **只读模式下反而更容易进行配置导出**（避免了管理员在正常模式下的操作跟踪）。
+
+#### 10.5.3 对配置包读写的具体影响
+
+| 配置包操作方向 | 受 CheckReadonly 限制？ | 只读模式下行为 |
+|--------------|------------------------|---------------|
+| **导入（解包→解密→写 conf.json）** | ✅ **是** | 返回 code=1 + `ReadOnly mode can not perform this operation` 提示；配置不写入 |
+| **导出（读 conf.json→加密→打包）** | ❌ **否** | 正常生成加密 ZIP 至 `TempDir/export/{timestamp}.zip`；返回 200 + URL |
+| **下载导出 ZIP** | ❌ **否** | 正常响应 `Content-Disposition: attachment`；无速率限制或审计 |
+
+**导出接口内部操作细节**（[exportSyncProviderWebDAV](kernel/api/sync.go#L167-L229)）：
+1. **读取 Conf.Sync.WebDAV**（无文件写入 conf.json）
+2. JSON 序列化 → AESEncrypt → 写入 `TempDir/export/webdav-{uuid}.json`
+3. ZIP 打包 `TempDir/export/webdav-{timestamp}.zip`（创建新文件）
+4. 返回 `/export/{filename}` 下载 URL
+
+> ⚠️ **注意**：虽然导出不修改 `conf.json`，但会 **写入 `TempDir/export/` 目录**。这意味着「只读模式」保护的是 `data/workspace/` 配置，而非临时目录。
+
+#### 10.5.4 对安全边界的三层冲击
+
+**边界 A：配置变更边界（预期保护 ✓）**
+- 导入/设置接口被 `CheckReadonly` 正确拦截，只读模式下 **无法修改同步配置**
+- 符合「只读 = 不允许修改工作区设置」的用户预期
+
+**边界 B：信息泄露边界（预期保护 ✗）**
+- 导出接口绕过只读限制，管理员在 **维护期间（只读模式开启时）的正常操作隔离失效**
+- 典型场景：运维开启只读模式进行系统维护 → 本意是「冻结配置变更」→ 但攻击者获取的有效会话此时仍可导出所有 WebDAV/S3 密码
+- 导出的 ZIP 文件名使用时间戳命名，存在被其他登录用户通过猜测 `/export/webdav-20260615-*.zip` 路径进行 **文件名爆破获取** 的可能（P3 等级无 Admin 检查）
+
+**边界 C：审计与责任边界（隐式保护 ✗）**
+- 正常模式下配置变更（包括导入）有日志；导出缺少专用日志标记
+- 只读模式下若被用于导出敏感配置，管理员通过「配置变更审计」无法发现（conf.json 未变）
+- 若系统提供了 `export2Liandi` 带 `CheckReadonly` 的对照接口，说明这并非统一设计，而是 **同步配置导出接口遗漏了中间件**
+
+#### 10.5.5 漏洞链利用路径
+
+```
+前置条件：工作区管理员因维护需求设置 ReadOnly = true
+    │
+    ▼
+[1] 攻击者获取 Editor/Reader 角色的有效会话 Cookie
+    │
+    ▼
+[2] 直接 POST /api/sync/exportSyncProviderWebDAV
+    │   CheckAuth ✅（有会话）
+    │   CheckAdminRole ✅（若会话本身是 Admin）
+    │   CheckReadonly ❓（无此中间件）
+    │   → 返回 JSON { "data": "/export/webdav-1718400000.zip" }
+    │
+    ▼
+[3] 或若仅有 Reader 会话 → 尝试 P3 等级静态下载
+    │   GET /export/webdav-20260615-*.zip （目录枚举）
+    │   CheckAuth ✅（有会话）
+    │   → 下载成功（IsSubPath 检查通过）
+    │
+    ▼
+[4] 离线解压 ZIP → 获取 AES-128-CBC 密文
+    │
+    ▼
+[5] 使用源码公开的 SK/IV → 双重 Hex 解码 → 明文 WebDAV 密码
+    │
+    ▼
+[6] 使用 WebDAV 密码 → 从第三方服务拉取加密仓库
+    │
+    ▼
+[7] 若同时获得 repo.key（单独文件）→ 完整解密所有笔记
+```
+
+---
+
 ## 11. 协作模块关系图
 
 ```
@@ -969,6 +1076,7 @@ IncSync() → 标记需要同步
 | **conf.json 明文存储密钥** | [kernel/model/conf.go](kernel/model/conf.go) | 攻击者获取工作区目录即可拿到 repo.key、WebDAV 密码、S3 SecretKey，解密所有备份/快照 + 登录第三方同步服务 | 考虑使用 OS Keychain/DPAPI 加密存储敏感配置 |
 | **硬编码 AES 密钥** | [kernel/util/crypt.go#L29](kernel/util/crypt.go#L29) | `SK="696D897C9AA0611B"` 和 `IV` 公开于源码，所有同步配置导出包、UserData 可被解密 | 评估是否仍需该加密，或改为动态生成密钥绑定设备 |
 | **同步配置导入导出伪加密** | [kernel/api/sync.go#L144,L193](kernel/api/sync.go#L144) | 导出包使用硬编码密钥加密，形同虚设，仅提供混淆级别保护 | 改用用户提供的导出密码 + PBKDF2 派生密钥，或直接移除加密改为警告 |
+| **导出接口遗漏 CheckReadonly** | [kernel/api/router.go#L295,L297](kernel/api/router.go#L295) | `exportSyncProviderS3/WebDAV` 只读模式下仍可导出敏感密码；`/export/*` 下载路由缺少 Admin 校验，低权限 Reader 可枚举下载 | 路由注册统一添加 `CheckReadonly`，下载组追加 `CheckAdminRole` |
 | **发布密码 SHA256 无盐** | [kernel/model/publish_access.go#L229](kernel/model/publish_access.go#L229) | Cookie 值 = SHA256(ID+password)，可彩虹表破解弱密码 | 改为使用 bcrypt/argon2 + 随机盐 |
 | **运行时 .sy 文档明文** | workspace/data/ | 服务器被攻破时，所有文档直接可读 | 可考虑提供"工作区级透明加密"选项 |
 | **JWT 无过期时间** | [kernel/model/auth.go#L107-L117](kernel/model/auth.go#L107-L117) | 发布服务 JWT 未设置 exp 声明，理论上永久有效 | 添加合理的 exp (如 24h) + 滑动刷新 |
@@ -1030,6 +1138,12 @@ IncSync() → 标记需要同步
 - [ ] **C7** 坚果云 WebDAV 端点 → 被拦截，返回 Language 194
 - [ ] **C8** 导入路径遍历攻击 (../) → 被 IsSubPath 拦截
 - [ ] **C9** GetMaskedConf API → 检查是否返回明文 WebDAV 密码
+- [ ] **C10** 只读模式下调用 importSyncProviderWebDAV → 被 CheckReadonly 拦截 (code=1)
+- [ ] **C11** 只读模式下调用 exportSyncProviderWebDAV → 验证当前是否可绕过限制
+- [ ] **C12** 只读模式下直接 GET /export/webdav-{timestamp}.zip → 验证 Reader 会话是否可下载
+- [ ] **C13** 正常模式 vs 只读模式 → 对比 8 个同步接口的中间件覆盖率是否一致
+- [ ] **C14** 枚举 /export/webdav-*.zip 路径 → 是否存在可被 Reader 会话利用的文件名规律
+- [ ] **C15** Editor 角色会话调用 exportSyncProvider* → 被 CheckAdminRole 拦截（确认当前 P2/P3 权限梯度正确）
 
 #### D. 发布访问控制测试
 - [ ] **D1** 5 级权限 (public/protected/hidden/private/forbidden) 各自正确渲染
