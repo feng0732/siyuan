@@ -303,7 +303,7 @@ private connect(options: {
 **onopen** —— 连接建立：
 1. 调用用户 `callback`
 2. 若存在 `errorLog` 对话框（内核中断后产生），则：
-   - 触发 `reloadSync` 重新同步
+   - 触发 `reloadSync` 重新同步（仅此时触发，正常重连不触发）
    - 关闭错误对话框
 
 **onmessage** —— 消息接收：
@@ -312,12 +312,18 @@ private connect(options: {
 3. 交给具体业务的 `msgCallback` 分发
 
 **onclose** —— 连接关闭：
-1. 若原因为 `unauthenticated`，不重连（鉴权失败）
-2. 若原因为 `close websocket`，不重连（服务端主动正常关闭）
-3. **否则 3 秒后自动重连**：重新调用 `connect()`，使用相同的 id/type/msgCallback
+1. 若 `ev.reason` 字符串**包含** `"unauthenticated"` 子串，**不重连**（鉴权失败）
+2. 若 `ev.reason` 字符串**不包含** `"close websocket"` 子串，**3 秒后自动重连**（异常关闭）
+3. 若 `ev.reason` 字符串**包含** `"close websocket"` 子串，**不重连**（服务端主动正常关闭）
+
+> 判断逻辑使用 `String.indexOf()` 子串搜索，不是精确匹配。例如：
+> - `"  unauthenticated"` → 匹配，不重连
+> - `"  close websocket: publish service closed"` → 匹配 "close websocket"，不重连
+> - 空字符串或网络错误码（如 "1006"）→ 不匹配，重连
 
 **onerror** —— 连接错误：
-- 仅对 `type=main` 的连接（连接状态 `readyState=3`）触发 `kernelError()` 提示
+- 仅对 URL 以 `&type=main` 结尾 且 `readyState=3` 的连接触发 `kernelError()` 提示
+- `onerror` 本身不触发重连，通常随后会触发 `onclose`，由 `onclose` 逻辑处理
 
 #### 4.1.3 send 方法
 ```typescript
@@ -488,7 +494,7 @@ super({
    - 收到命令后直接触发 `this.update()` 整体刷新
    - 实现简单但性能较差，每次变更都全量重渲染
 
-2. **ID 匹配消费**（prototype、backlink、outline、graph - local型）：
+2. **ID 匹配消费**（protyle、backlink、outline、graph - local型）：
    ```typescript
    if (data.data === this.protyle.block.rootID) { reloadProtyle(...) }  // protyle
    if (data.data.ids.includes(this.rootId) && this.type === "local") {  // backlink
@@ -559,7 +565,7 @@ func (cmd *ping) IsRead() bool {
     │ input 事件触发事务收集
     │ transaction.ts → transaction()
     │ window.siyuan.transactions.push(...)
-    │ transactionsTimeout → 256ms 防抖后批量提交
+    │ transactionsTimeout → 512ms 防抖延时后批量提交
     ▼
 [HTTP POST /api/transactions]
     │ 携带参数: transactions, reqId, app, session
@@ -604,10 +610,17 @@ func (cmd *ping) IsRead() bool {
 
 [transaction.ts](file:///d:/fz/0601/solo-dogfeeding/code/297-siyuan/app/src/protyle/wysiwyg/transaction.ts#L1364-L1460)
 
-#### 5.2.1 防抖合并条件
+涉及两个独立的时间参数，需严格区分：
+
+| 参数名 | 值 | 用途 | 代码位置 |
+|--------|-----|------|----------|
+| `TIMEOUT_INPUT` | 256ms | **合并判断窗口**：两次输入时间间隔小于此值才可能合并 | L1387: `protyle.transactionTime - time < Constants.TIMEOUT_INPUT` |
+| `TIMEOUT_INPUT * 2` | 512ms | **防抖提交延时**：最后一次输入后等待多久提交 HTTP | L1449-1451: `setTimeout(promiseTransaction, Constants.TIMEOUT_INPUT * 2)` |
+
+#### 5.2.1 合并判断条件（256ms 窗口）
 
 ```typescript
-const TIMEOUT_INPUT = 256;  // Constants.TIMEOUT_INPUT = 256ms
+public static readonly TIMEOUT_INPUT = 256;  // constants.ts L302
 
 let needDebounce = false;
 if (lastTransaction && 
@@ -616,7 +629,8 @@ if (lastTransaction &&
     doOperations.length === 1 && 
     doOperations[0].action === "update" &&
     lastTransaction.doOperations[0].id === doOperations[0].id &&
-    protyle.transactionTime - time < Constants.TIMEOUT_INPUT) {
+    protyle.transactionTime - time < Constants.TIMEOUT_INPUT  // < 256ms
+) {
     needDebounce = true;
 }
 ```
@@ -626,11 +640,11 @@ if (lastTransaction &&
 2. 上一个事务只有 1 个 operation 且是 `update` 类型
 3. 当前事务也只有 1 个 operation 且是 `update` 类型
 4. 两次操作的 **块 ID 相同**（同一块连续编辑）
-5. 时间间隔 < 256ms
+5. 时间间隔 < **256ms**
 
 满足条件时，**原地替换** `window.siyuan.transactions` 数组中最后一个元素的 `doOperations`，不新增条目。
 
-#### 5.2.2 防抖提交流程
+#### 5.2.2 防抖提交流程（512ms 延时）
 
 ```
 t=0ms   用户输入字符 'a'
@@ -639,26 +653,25 @@ t=0ms   用户输入字符 'a'
         → transactions.push({doOperations: [{action:'update', id:'xxx', data:'a'}]})
         → protyle.transactionTime = time
         → transactionsTimeout = setTimeout(promiseTransaction, 512ms)
-        (注意: TIMEOUT_INPUT * 2 = 512ms，不是 256ms!)
 
 t=100ms 用户输入字符 'b'
         → transaction() 被调用
-        → 5个条件都满足，needDebounce=true
+        → 5个条件都满足（间隔 100ms < 256ms），needDebounce=true
         → 原地替换：transactions[last].doOperations = [{action:'update', id:'xxx', data:'ab'}]
         → protyle.transactionTime = time
         → clearTimeout(transactionsTimeout)
         → transactionsTimeout = setTimeout(promiseTransaction, 512ms)
         (防抖重置：再等 512ms)
 
-t=612ms 定时器触发
+t=612ms 定时器触发（t=100ms + 512ms）
         → promiseTransaction() 执行
         → 取出 transactions[0] 发送 HTTP 请求
         → transactions.splice(0, 1)
 ```
 
 **关键点**：
-- 防抖窗口是 **TIMEOUT_INPUT * 2 = 512ms**，不是 256ms
-- 每次输入都重置定时器（典型的 debounce trailing 模式）
+- 两次输入的合并窗口是 **256ms**（判断是否为同一块的连续编辑）
+- 每次输入后重置的防抖延时是 **512ms**（等待多久确认不再输入才提交）
 - `transactions` 数组是 **FIFO 队列**，`promiseTransaction` 按顺序逐个提交
 
 #### 5.2.3 promiseTransaction 串行提交
@@ -776,15 +789,18 @@ func pushTransactions(app, session string, transactions []*model.Transaction) {
 
 ### 5.4 消息顺序的多层保证总结
 
-| 层级 | 机制 | 保证范围 |
-|------|------|----------|
-| 前端防抖层 | `transactions` FIFO 队列 + `promiseTransaction` 串行递归 | 同一编辑器的操作按顺序提交 |
-| HTTP 传输层 | TCP 保证顺序 | 单个请求内的字节流顺序 |
-| 后端中间件 | `ControlConcurrency` 按 API 路径加锁 | `/api/transactions` 的所有请求串行执行 |
-| 事务层 | `WaitForCommit` + `FlushTxQueue` | 推送发生在持久化之后 |
-| WebSocket 层 | TCP 保证顺序 + melody 单连接串行 Write | 单个连接内消息按发送顺序到达 |
+| 层级 | 机制 | 保证范围 | 代码依据 |
+|------|------|----------|----------|
+| 前端防抖层 | `transactions` FIFO 队列 + `promiseTransaction` 递归回调串行提交 | 同一编辑器的操作按顺序提交（在途仅一个 HTTP） | [transaction.ts L64-L86](file:///d:/fz/0601/solo-dogfeeding/code/297-siyuan/app/src/protyle/wysiwyg/transaction.ts#L64-L86) |
+| HTTP 传输层 | TCP 保证顺序 | 单个请求内的字节流顺序 | TCP 协议 |
+| 后端中间件 | `ControlConcurrency` 按 API 路径加互斥锁 | `/api/transactions` 的所有请求串行执行（同一 API 路径仅一个 goroutine 在处理） | [session.go L456-L507](file:///d:/fz/0601/solo-dogfeeding/code/297-siyuan/kernel/model/session.go#L456-L507) |
+| 事务层 | `WaitForCommit` + `FlushTxQueue` | 推送发生在所有持久化完成之后，避免推送了但文件未写入 | [transaction.go](file:///d:/fz/0601/solo-dogfeeding/code/297-siyuan/kernel/api/transaction.go) |
+| WebSocket 层 | TCP 保证顺序 + melody 单连接串行 `session.Write` | 单个 WebSocket 连接内消息按发送顺序到达 | TCP 协议 + melody 内部 Write 序列化 |
 
-> **仍有的漏洞**：不同 type 的连接之间（如 main 和 protyle）没有全局顺序保证。比如 `rename` 先到 main 再到 protyle 是常见情况，但因为是不同连接，顺序不保证。
+**无法保证的范围**：
+- 不同 `type` 连接之间（如 main 与 protyle）的消息到达顺序，因为是不同的 TCP 连接
+- 重连期间丢失的消息，因为没有重放机制
+- 后端 `BroadcastByType` 遍历过程中新加入/离开的连接，遍历快照可能不含该连接
 
 ---
 
@@ -816,9 +832,9 @@ func pushTransactions(app, session string, transactions []*model.Transaction) {
          ▼                   │
       onclose ◄──────────────┘
          │
-         ├─ reason 含 "unauthenticated"  ──► 永久停止（鉴权失败）
-         ├─ reason 含 "close websocket"  ──► 永久停止（正常主动关闭）
-         └─ 其他原因                           │
+         ├─ reason 包含 "unauthenticated"  ──► 永久停止（鉴权失败）
+         ├─ reason 包含 "close websocket"  ──► 永久停止（正常主动关闭）
+         └─ 其他（不含上述两串）                │
                │ 3000ms setTimeout             │
                └──────► connect() 重连 ◄──────┘
                          （新 WebSocket 对象）
@@ -956,7 +972,7 @@ ws.onmessage = (event) => {
 #### 6.6.3 消息重复与竞态边界
 
 **同一事件多次投递**：
-- 一个 `rename` 事件会同时推送给 main、prototype、filetree、outline、backlink、graph 等多种 type
+- 一个 `rename` 事件会同时推送给 main、protyle、filetree、outline、backlink、graph 等多种 type
 - 前端不同模块独立处理，可能产生重复的 UI 更新（如标题更新同时被 main 和 protyle 处理）
 
 **跨连接顺序不一致**：
@@ -978,9 +994,9 @@ ws.onmessage = (event) => {
 5. **JSON 解析错误**：直接返回 `code=-1, msg="Bad Request"` 给发送方
 
 #### 前端层面：
-1. **onerror 处理**：仅 main 连接错误时展示 `kernelError()` 对话框
+1. **onerror 处理**：仅 `type=main` 连接 `readyState=3` 时展示 `kernelError()` 对话框
 2. **消息过滤**：`processMessage` 对 `code<0` 统一转提示消息
-3. **重连恢复**：非主动关闭时 3 秒后自动重连，重连成功时触发 `reloadSync` 数据重新同步
+3. **重连恢复**：非主动关闭时 3 秒后自动重连；**仅当存在 errorLog 对话框时**，重连成功才触发 `reloadSync` 数据重新同步；正常重连不触发数据同步
 
 ### 7.2 资源释放
 
