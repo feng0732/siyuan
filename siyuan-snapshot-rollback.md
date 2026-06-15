@@ -25,7 +25,7 @@ SiYuan 采用 **双层版本管理体系**，L1 层面向文件级快速回滚�
 | 历史调度器 | `kernel/model/history.go` | 定时生成、四类回滚、历史索引、过期清理 |
 | 仓库管理器 | `kernel/model/repository.go` | dejavu 封装、快照 CRUD、Diff 计算、Checkout、云同步 |
 | 事务协调器 | `kernel/model/transaction.go` | FlushTxQueue、事务内历史触发 |
-| API 层 - 历史 | `kernel/api/history.go` | 11 个 HTTP 端点、参数校验 |
+| API 层 - 历史 | `kernel/api/history.go` | 10 个 HTTP 端点、参数校验 |
 | API 层 - 仓库 | `kernel/api/repo.go` | 23 个 HTTP 端点、权限检查 |
 | 历史数据库 | `kernel/sql/history.go` | FTS5 全文索引、查询、批量插入 |
 | 历史队列 | `kernel/sql/queue_history.go` | 异步索引、失败自愈重建 |
@@ -521,7 +521,7 @@ confirmDialog("⚠️ " + window.siyuan.languages.rollback,
 
 ## 六、API 端点完整清单
 
-### 6.1 History API（11 个）
+### 6.1 History API（10 个）
 
 **路由位置**：`kernel/api/router.go:153-162`
 
@@ -567,7 +567,7 @@ confirmDialog("⚠️ " + window.siyuan.languages.rollback,
 | 9 | POST | `/api/repo/removeRepoTagSnapshot` | 删除本地标签快照 |
 | 10 | POST | `/api/repo/diffRepoSnapshots` | 双快照差异计算 |
 
-#### 回滚操作（3 个）
+#### 回滚与文件操作（4 个）
 
 | # | 方法 | 路径 | 功能 |
 |---|------|------|------|
@@ -576,7 +576,7 @@ confirmDialog("⚠️ " + window.siyuan.languages.rollback,
 | 13 | POST | `/api/repo/openRepoSnapshotFile` | 快照文件预览 |
 | 14 | POST | `/api/repo/getRepoFile` | 快照文件二进制下载 |
 
-#### 云端操作（6 个）
+#### 云端操作（5 个）
 
 | # | 方法 | 路径 | 功能 |
 |---|------|------|------|
@@ -586,7 +586,7 @@ confirmDialog("⚠️ " + window.siyuan.languages.rollback,
 | 18 | POST | `/api/repo/downloadCloudSnapshot` | 下载云端快照 |
 | 19 | POST | `/api/repo/removeCloudRepoTagSnapshot` | 删除云端标签快照 |
 
-#### 清理配置（3 个）
+#### 清理与配置（4 个）
 
 | # | 方法 | 路径 | 功能 |
 |---|------|------|------|
@@ -882,7 +882,7 @@ TxErrCodePushMsg         = 4  // 普通错误（用户消息）
 | 历史模型层 | 1 个主文件 | ~1,100 行 | 20+ 导出函数 |
 | 仓库模型层 | 1 个主文件 | ~2,000 行 | 30+ 导出函数 |
 | SQL 层 | 2 个文件 | ~300 行 | 10+ 导出函数 |
-| API 层 | 2 个文件 | ~800 行 | 34 个端点 |
+| API 层 | 2 个文件 | ~800 行 | 33 个端点 |
 | 前端历史 | 3 个文件 | ~1,000 行 | 多个组件 |
 | **合计** | **9 个核心文件** | **~5,200 行** | **80+ 导出函数** |
 
@@ -943,5 +943,5 @@ HistoryTypeDatabase = 4  // 数据库
 
 > **生成时间**：2026-06-15
 > **分析版本**：SiYuan v3.6.5 (kernel)
-> **分析范围**：9 个核心文件 / ~5,200 行代码 / 34 个 API 端点
+> **分析范围**：9 个核心文件 / ~5,200 行代码 / 33 个 API 端点
 > **代码引用数量**：80+ 处可点击跳转
