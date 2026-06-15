@@ -286,7 +286,104 @@ if strings.HasPrefix(symArticleHref, "https://ld246.com/article/") {
 - 同样执行文件名过滤 + ID 后缀
 - 通过 `filelock.Copy()` 复制而非下载
 
-#### 2.3.4 Base64 图片处理
+#### 2.3.4 资源本地化替换覆盖面（五类资源差异对比）
+
+资源本地化功能覆盖 **五类资源节点**，通过 `onlyImg` 参数控制处理范围。`netImg2LocalAssets` 仅处理图片，`netAssets2LocalAssets` 处理全部五类。
+
+**核心提取函数**：`getRemoteAssetsLinkDests()` in [assets.go](kernel/model/assets.go#L1542-L1621)
+**核心替换函数**：`setAssetsLinkDest()` in [assets.go](kernel/model/assets.go#L1494-L1540)
+
+| 资源类型 | AST 节点类型 | onlyImg 处理 | 提取来源 | 替换目标字段 | 去重键 | 保存方式 | 计数统计 |
+|---------|-------------|-------------|---------|-------------|--------|---------|---------|
+| **图片** | `NodeLinkDest` + `ParentIs(NodeImage)` | ✅ 处理 | `node.Tokens` | `node.Tokens`（字节替换） | URL 字符串 | HTTP 下载 / 文件复制 | ✅ 计入 files & size |
+| **普通链接** | `NodeLinkDest`（非图片父节点） | ❌ 跳过 | `node.Tokens` | `node.Tokens`（字节替换） | URL 字符串 | HTTP 下载 / 文件复制 | ✅ 计入 files & size |
+| **超链接 TextMark** | `IsTextMarkType("a")` | ❌ 跳过 | `node.TextMarkAHref` | `node.TextMarkAHref`（字符串替换） | URL 字符串 | HTTP 下载 / 文件复制 | ✅ 计入 files & size |
+| **音频/视频** | `NodeAudio` / `NodeVideo` | ❌ 跳过 | `treenode.GetNodeSrcTokens(node)` | `node.Tokens` + `node.TextMarkAHref` | URL 字符串 | HTTP 下载 / 文件复制 | ✅ 计入 files & size |
+| **属性视图资源字段** | `NodeAttributeView` + `KeyTypeMAsset` | 仅 `AssetTypeImage` | `value.MAsset[].Content` | `asset.Content`（对象属性替换） | URL 字符串 | HTTP 下载 / 文件复制 | ✅ 计入 files & size |
+
+**各类型详细差异**：
+
+1. **图片（Image）**
+   - Markdown 语法：`![alt](url)`
+   - 提取条件：`NodeLinkDest` 节点且父节点是 `NodeImage`
+   - `onlyImg=true` 时**唯一**被处理的链接型资源
+   - 属性视图中仅 `AssetTypeImage` 类型的资源被处理
+
+2. **普通链接（Link）**
+   - Markdown 语法：`[text](url)`
+   - 提取条件：`NodeLinkDest` 节点且**非**图片父节点
+   - 仅 `onlyImg=false`（`netAssets2LocalAssets`）时处理
+   - 与图片共享相同的 `NodeLinkDest` 节点类型，通过父节点类型区分
+
+3. **超链接 TextMark（TextMark A）**
+   - SiYuan 特有的行级标记格式
+   - 提取条件：`node.IsTextMarkType("a")` 为 true
+   - 仅 `onlyImg=false` 时处理
+   - 存储字段为 `node.TextMarkAHref`（字符串类型，非 Tokens）
+
+4. **音频/视频（Audio/Video）**
+   - 块级媒体元素
+   - 提取条件：`NodeAudio` 或 `NodeVideo` 节点类型
+   - 仅 `onlyImg=false` 时处理
+   - 同时更新 `node.Tokens` 和 `node.TextMarkAHref` 两个字段
+   - 通过 `treenode.GetNodeSrcTokens()` 提取源地址
+
+5. **属性视图资源字段（Attribute View MAsset）**
+   - 数据库视图中的资源类型列
+   - 提取条件：`NodeAttributeView` 节点 + `KeyTypeMAsset` 键类型
+   - `onlyImg=true` 时仅处理 `AssetTypeImage` 类型
+   - `onlyImg=false` 时处理所有资源类型（含 `AssetTypeFile` 等）
+   - 替换需调用 `av.SaveAttributeView()` 持久化属性视图数据
+   - 替换时遍历 `keyValues → values → MAsset` 三层嵌套结构
+
+**本地文件链接的特殊处理（五类通用）**：
+- 由 `util.FileURLToLocalPath(dest)` 识别（`file:///` 协议或本地绝对路径）
+- 三类跳过条件：文件不存在 / 是目录 / 敏感路径
+- 复制使用 `filelock.Copy()` 而非 HTTP 下载
+- 大小通过 `gulu.File.GetFileSize()` 获取
+- 同样执行文件名过滤 + `network-asset-` 前缀 + ID 后缀
+
+#### 2.3.5 四类场景对计数、提示和文档内容的影响
+
+资源本地化过程中，不同的执行结果对 **成功计数**、**用户可见提示** 和 **文档内容** 三方面的影响各不相同：
+
+| 场景 | 成功计数 (files/size) | 用户可见提示 | 文档内容变化 | 触发条件 |
+|------|----------------------|-------------|-------------|---------|
+| **重复资源命中**（同批次） | ❌ 不计入 | 无提示，静默复用 | ✅ 链接被替换为本地路径 | 同一 URL 在文档中出现多次 |
+| **下载成功** | ✅ 计入 files++ & size+= | 最终汇总成功提示 | ✅ 链接被替换为本地路径 | HTTP 200 + 写入磁盘成功 |
+| **防盗链失败** (403/401) | ❌ 不计入 | 🔴 红色错误提示："目标站点启用了防盗链，[N] 个资源无法下载" | ❌ 保留原始 URL | `forbiddenCount++` 统计，结束时统一提示 |
+| **其他下载失败** (网络错误/非200/超大/HTML等) | ❌ 不计入 | ⚠️ 无显式提示（仅日志） | ❌ 保留原始 URL | reqErr / 非 200 / >96MB / text/html |
+| **本地文件复制失败** | ❌ 不计入 | ⚠️ 无显式提示（仅日志 Error） | ❌ 保留原始路径 | Copy 出错 / 文件不存在 / 目录 / 敏感路径 |
+| **无网络资源** | 0 | ℹ️ 信息提示："该文档中不存在网络文件"（3s） | ❌ 无变化 | `files==0 && forbiddenCount==0` |
+| **部分成功 + 防盗链** | 仅成功数计入 | ✅ 成功提示 + 🔴 防盗链警告（两条消息） | ✅ 成功的替换，失败的保留 | 混合场景 |
+
+**详细说明**：
+
+1. **重复资源命中**
+   - 去重缓存键：`assetsMap[url] = filename`（内存 map，单次调用内有效）
+   - 命中后直接调用 `setAssetsLinkDest()` 替换链接
+   - 不计入 `files` 和 `size`（避免重复统计）
+   - 文档内容会被替换（所有出现处都指向同一个本地文件）
+
+2. **防盗链统计**
+   - 检测条件：`resp.StatusCode == 403 || resp.StatusCode == 401`
+   - 计数器：`forbiddenCount++`（单独统计，不计入失败总数）
+   - 提示时机：全部下载完成后统一弹出（红色错误样式，5 秒）
+   - 防盗链资源**不替换**文档链接，保留原始 URL
+
+3. **部分下载失败**
+   - 非防盗链的其他失败（网络错误、超时、非 200、超大文件、HTML 内容）**无单独提示**
+   - 仅通过 `logging.LogErrorf()` / `LogWarnf()` 记录日志
+   - 用户需自行对比前后内容判断是否有遗漏
+   - 失败的资源保留原始 URL，文档内容部分变化
+
+4. **成功计数与提示**
+   - 成功提示：`"下载完毕，一共 [N] 个文件，共占用 [X] 磁盘空间"`
+   - 提示形式：`PushUpdateMsg()` 更新"正在写入"消息为成功消息
+   - `files == 0 && forbiddenCount == 0` → 显示"不存在网络文件"
+   - `files > 0 && forbiddenCount > 0` → 同时显示成功消息 + 防盗链警告（两条独立消息）
+
+#### 2.3.6 Base64 图片处理
 
 **处理函数**：`processBase64Img()` in [import.go](kernel/model/import.go#L1250-L1328)
 
@@ -599,15 +696,24 @@ if strings.HasPrefix(symArticleHref, "https://ld246.com/article/") {
 
 ### 4.3 重复内容识别
 
-#### 4.3.1 资源去重机制
+#### 4.3.1 两种去重机制对比
+
+SiYuan 的资源去重分为两套独立机制，分别应用于不同场景：
+
+| 机制 | 应用场景 | 去重键 | 缓存层 | 跨调用持久化 |
+|------|---------|--------|--------|-------------|
+| **内容哈希去重** | `Upload()` 文件上传 | ETag 内容哈希 | 内存 `assetHashCache` + SQL 数据库 | ✅ 跨调用生效 |
+| **URL 内存去重** | `NetAssets2LocalAssets()` 网络资源本地化 | URL 字符串 | 内存 `assetsMap`（单次调用内） | ❌ 仅单次调用内 |
+
+#### 4.3.2 资源上传去重（内容哈希）
 
 ```
-文件上传 / 网络资源本地化
+文件上传
     ↓
-计算内容哈希（ETag） 或 同批次 URL 匹配
+计算内容哈希（ETag）
     ↓
 ┌────────────────────────────────────────┐
-│ 内存缓存（assetHashCache / assetsMap） │
+│ 内存缓存（assetHashCache）             │
 │  ├─ 命中 → 验证文件存在 → 返回已有路径 │
 │  └─ 未命中 → 查询 SQL 数据库           │
 │        ├─ 命中 → 写入缓存 → 返回已有路径│
@@ -618,10 +724,33 @@ if strings.HasPrefix(symArticleHref, "https://ld246.com/article/") {
 **注意事项**：
 - 哈希相同但文件名不同 → 强制重新保存（避免文件名误导）
 - 空文件 → 使用随机哈希（避免所有空文件冲突）
-- PDF 标注场景 → 支持文件名模式匹配去重
-- 网络资源同批次 URL → `assetsMap` 内存字典去重（避免重复下载同一链接）
+- PDF 标注场景 → 支持文件名模式匹配去重（`skipIfDuplicated` + Glob）
 
-#### 4.3.2 缓存一致性保证
+#### 4.3.3 网络资源本地化去重（URL 内存级）
+
+```
+遍历文档所有远程资源链接
+    ↓
+每类节点调用 getRemoteAssetsLinkDests() 提取 URL
+    ↓
+assetsMap[url] 内存字典查询
+    ├─ 命中 → 直接 setAssetsLinkDest() 替换，不计入计数
+    └─ 未命中 → 下载/复制 → 写入 assetsMap → 替换链接
+```
+
+**五类资源节点共享同一去重字典**：
+- 图片链接（`NodeLinkDest` + `NodeImage`）
+- 普通链接（`NodeLinkDest` 非图片）
+- TextMark 超链接（`IsTextMarkType("a")`）
+- 音频/视频（`NodeAudio` / `NodeVideo`）
+- 属性视图资源字段（`NodeAttributeView` + `MAsset`）
+
+**去重特点**：
+- 仅在单次 `NetAssets2LocalAssets()` 调用内有效
+- 跨多次调用同一 URL 会被重复下载（无持久化 URL 去重）
+- 同一份文件在不同 URL 下不会被识别为重复（无内容哈希校验）
+
+#### 4.3.4 缓存一致性保证
 
 - 写入后立即更新缓存
 - 文件系统事件监听实时同步
@@ -698,8 +827,15 @@ if strings.HasPrefix(symArticleHref, "https://ld246.com/article/") {
    - 多栏布局退化
 
 3. **错误处理完备性**：
-   - 网络资源本地化中单个文件失败用户无显式提示（仅防盗链有统计警告）
-   - 文件名被过滤重命名后用户无感知
+   - 网络资源本地化中，除防盗链（403/401）外其他失败**无用户提示**，仅日志记录
+   - 文件名被 `FilterUploadFileName` 过滤重命名后用户无感知
+   - `onlyImg` 模式下仅图片被替换，普通链接/音视频/属性视图文件仍为远程链接，用户可能误判
+   - 属性视图资源字段替换后需单独 `av.SaveAttributeView()` 持久化，失败无独立提示
+
+4. **去重机制覆盖不足**：
+   - 网络资源本地化仅同批次 URL 去重，跨多次调用重复下载同一 URL
+   - 同内容不同 URL 的资源不会被去重（无内容哈希校验）
+   - 上传与本地化两套去重机制互不相通
 
 ### 5.4 错误处理缺陷
 
@@ -722,6 +858,9 @@ if strings.HasPrefix(symArticleHref, "https://ld246.com/article/") {
 3. **数学公式安全**：MathJax/KaTeX 渲染是否存在 XSS 风险？
 4. **并发安全**：资源缓存的 `sync.Mutex` 是否足以应对高并发上传场景？
 5. **网络资源下载超时**：`NewCustomReqClient()` 是否配置了合理的超时时间？
+6. **属性视图资源替换原子性**：`av.SaveAttributeView()` 失败时是否会导致文档树与属性视图不一致？
+7. **音视频替换完整性**：`NodeAudio`/`NodeVideo` 的替换是否同时更新了 `Tokens` 和 `TextMarkAHref` 所有引用位置？
+8. **本地文件链接识别**：`FileURLToLocalPath()` 的判定逻辑是否覆盖所有本地路径格式（Windows/Unix）？
 
 ### 6.2 优化方向
 
@@ -730,6 +869,9 @@ if strings.HasPrefix(symArticleHref, "https://ld246.com/article/") {
 3. **预览机制**：剪藏内容插入前的预览与编辑
 4. **模板支持**：剪藏内容的格式化模板选择
 5. **失败详情**：网络资源本地化中，将单文件失败原因汇总展示给用户
+6. **两类去重机制融合**：网络资源本地化完成后是否应写入内容哈希缓存，避免后续上传时重复保存？
+7. **onlyImg 模式提示**：仅图片模式下，对未处理的链接/音视频/资源字段给予用户提示
+8. **失败计数统计**：补充总失败数、按错误类型分类统计
 
 ---
 
@@ -757,13 +899,18 @@ if strings.HasPrefix(symArticleHref, "https://ld246.com/article/") {
 | `Upload` | [upload.go](kernel/model/upload.go) | L131 | 文件上传处理 |
 | `NetAssets2LocalAssets` | [assets.go](kernel/model/assets.go) | L229 | 网络资源本地化主入口 |
 | `netAssets2LocalAssets0` | [assets.go](kernel/model/assets.go) | L254 | 网络资源下载与替换核心实现 |
+| `getRemoteAssetsLinkDestsInTree` | [assets.go](kernel/model/assets.go) | L1623 | 遍历整棵树提取远程资源节点 |
+| `getRemoteAssetsLinkDests` | [assets.go](kernel/model/assets.go) | L1542 | 从单节点提取远程资源 URL（五类资源） |
+| `setAssetsLinkDest` | [assets.go](kernel/model/assets.go) | L1494 | 替换节点中的资源链接地址 |
 | `GetAssetPathByHash` | [assets.go](kernel/model/assets.go) | L72 | 哈希查找资源路径 |
 | `FilterUploadFileName` | [file.go](kernel/util/file.go) | L225 | 上传文件名过滤 |
+| `IsAssetLinkDest` | [path.go](kernel/util/path.go) | L293 | 判断是否为本地资源链接 |
 | `NewLute` | [lute.go](kernel/util/lute.go) | L50 | Lute 引擎初始化 |
 | `PushMsg` | [websocket.go](kernel/util/websocket.go) | L230 | 普通提示推送 |
 | `PushErrMsg` | [websocket.go](kernel/util/websocket.go) | L246 | 错误提示推送 |
 | `PushUpdateMsg` | [websocket.go](kernel/util/websocket.go) | L226 | 更新已存在提示 |
 | `PushClearMsg` | [websocket.go](kernel/util/websocket.go) | L319 | 关闭指定提示 |
+| `BroadcastByType` | [websocket.go](kernel/util/websocket.go) | L82 | WebSocket 底层广播原语 |
 | `paste` | [paste.ts](app/src/protyle/util/paste.ts) | L249 | 前端粘贴主函数 |
 | `fetchPost` | [fetch.ts](app/src/util/fetch.ts) | L8 | 前端 API 请求封装 |
 | `processMessage` | [processMessage.ts](app/src/util/processMessage.ts) | L10 | 前端 WebSocket/HTTP 消息统一处理 |
