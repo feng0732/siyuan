@@ -128,28 +128,32 @@ fetchPost(/api/system/getConf)
 
 ```
 {WorkspaceDir}/
-├── .lock                  # flock 独占锁文件
-├── conf/
-│   ├── conf.json          # 全局配置
-│   └── appearance/        # 用户主题、图标
-├── data/
+├── .lock                  # flock 独占锁文件（不同步）
+├── conf/                  # 全局配置目录（不同步，同步根是 data/）
+│   ├── conf.json          # 全局 AppConf（不同步）
+│   └── appearance/        # 用户主题、图标（不同步）
+├── data/                  # ⭐ 同步根目录（dejavu.NewRepo 第一个参数 util.DataDir）
+│   ├── .siyuan/
+│   │   ├── syncignore     # 用户自定义同步忽略规则（已同步）
+│   │   └── conf.json      # 旧版同步配置（已废弃，被忽略规则排除）
 │   ├── {boxID}/
 │   │   ├── .siyuan/
-│   │   │   └── conf.json  # 笔记本配置
-│   │   └── {path}/**.sy   # 文档数据（JSON）
-│   ├── assets/            # 图片、附件等
-│   ├── templates/         # 模板
-│   ├── widgets/           # 挂件
-│   ├── plugins/           # 插件
-│   ├── snippets/          # 代码片段
-│   └── public/            # 公开访问
-├── history/               # 历史版本（自动生成）
-├── repo/                  # 数据仓库索引（dejavu 快照树）
-└── temp/                  # 临时目录（每次启动重建）
-    ├── siyuan.db          # 主 SQLite 数据库
-    ├── history.db         # 历史数据库
-    ├── blocktree.db       # 块树数据库
-    └── asset_content.db   # 资源内容数据库
+│   │   │   └── conf.json  # 笔记本 BoxConf（已同步）
+│   │   └── {path}/**.sy   # 文档数据（已同步）
+│   ├── assets/            # 图片、附件等（已同步）
+│   ├── templates/         # 模板（已同步）
+│   ├── widgets/           # 挂件（已同步）
+│   ├── plugins/           # 插件（已同步）
+│   ├── snippets/          # 代码片段（已同步）
+│   ├── storage/           # 闪卡、插件存储等（已同步）
+│   └── public/            # 公开访问（已同步）
+├── history/               # 历史版本（不同步，仅本地）
+├── repo/                  # 数据仓库索引 dejavu 快照树（不同步，仅本地）
+└── temp/                  # 临时目录（不同步，每次启动重建）
+    ├── siyuan.db
+    ├── history.db
+    ├── blocktree.db
+    └── asset_content.db
 ```
 
 ---
@@ -445,7 +449,50 @@ if ContainerIOS == Container && strings.Contains(d, "/Documents/") {
 }
 ```
 
-### 8.3 同步 Provider 与四种触发时机
+### 8.3 同步根目录与忽略规则（已核实）
+
+#### 8.3.1 同步根目录：仅 `data/`
+
+同步的根目录由 `util.DataDir` 定义，即 **`{WorkspaceDir}/data/`**（[util/working.go#L302](kernel/util/working.go#L302)）。`dejavu.NewRepo` 的第一个参数明确传入 `util.DataDir`（[model/repository.go#L2027](kernel/model/repository.go#L2027)）：
+
+```go
+ret, err = dejavu.NewRepo(
+    util.DataDir,        // ← 同步根：仅 {WorkspaceDir}/data/
+    util.RepoDir,        // 本地快照索引目录（不参与上传/下载）
+    util.HistoryDir,     // 历史版本目录
+    util.TempDir,        // 临时目录
+    Conf.System.ID,      // 设备 ID（元数据，标识提交者）
+    Conf.System.Name,    // 设备名（元数据，显示在同步记录中）
+    Conf.System.OS,      // 设备 OS（元数据）
+    Conf.Repo.Key,       // 仓库加密密钥
+    ignoreLines,         // 忽略规则列表
+    cloudRepo,
+)
+```
+
+**结论（关键核实）：**
+
+- **`conf/` 目录不参与同步** — `conf/` 位于 `{WorkspaceDir}/conf/`，在 `data/` 之外，**完全不在同步根目录范围内**。因此 `conf.json`、`System.ID`、`System.WorkspaceDir`、主题、图标等**不会**被同步到其他设备。
+- **`repo/`、`history/`、`temp/` 不参与同步** — 这三个目录作为参数传入 dejavu，但用于本地索引与历史快照生成，不作为上传数据的一部分。
+- **实际同步内容**：仅 `data/` 目录下的所有文件，包括 `.sy` 文档、`assets/`、`templates/`、`widgets/`、`plugins/`、`snippets/`、`public/`、`storage/`（闪卡/插件存储）、以及每个笔记本下的 `.siyuan/conf.json`（笔记本级配置，非全局 conf.json）。
+
+#### 8.3.2 忽略规则：syncignore + 内置忽略项
+
+忽略规则由两部分组成（[model/sync.go#L668-L700](kernel/model/sync.go#L668-L700) + [model/repository.go#L2025-L2027](kernel/model/repository.go#L2025-L2027)）：
+
+| 来源 | 规则 | 说明 |
+|------|------|------|
+| 用户自定义文件 | `data/.siyuan/syncignore` | 每行一条 glob 规则，由用户编辑。首次启动时创建为空文件 |
+| 内置硬编码 | `20210808180117-6v0mkxr/**/*` | 忽略用户指南笔记本 1（内置示例） |
+| 内置硬编码 | `20210808180117-czj9bvb/**/*` | 忽略用户指南笔记本 2 |
+| 内置硬编码 | `20211226090932-5lcq56f/**/*` | 忽略用户指南笔记本 3 |
+| 内置硬编码 | `20240530133126-axarxgx/**/*` | 忽略用户指南笔记本 4 |
+| 内置硬编码 | `/storage/av/{多个用户指南AV文件名}` | 忽略用户指南相关的音视频存储文件 |
+| 内置硬编码（repository.go） | `/.siyuan/conf.json` | 忽略旧版同步配置文件（`data/.siyuan/conf.json`，已废弃） |
+
+**注意**：`/.siyuan/conf.json` 忽略的是 **`data/.siyuan/` 下的旧版同步配置**，不是 `{WorkspaceDir}/conf/conf.json`（后者本来就不在同步根目录内）。`Conf.System.ID` 作为参数传入 dejavu，仅用于标识提交者设备（类似 git commit author），**不作为文件内容被同步或被其他设备覆盖**。
+
+### 8.4 同步 Provider 与四种触发时机
 
 `Sync` 配置支持四种 Provider（[conf/sync.go#L73-L78](kernel/conf/sync.go#L73-L78)）：
 1. **`ProviderSiYuan = 0`**：SiYuan 官方云（需订阅 Pro）
@@ -461,7 +508,7 @@ if ContainerIOS == Container && strings.Contains(d, "/Documents/") {
 
 此外连续 8 次自动同步失败 → 推迟 64 分钟再同步（[model/sync.go#L265-L270](kernel/model/sync.go#L265-L270)）。
 
-### 8.4 同步主流程（syncRepo）
+### 8.5 同步主流程（syncRepo）
 
 三种同步入口都汇到 dejavu 库的 API：
 
@@ -488,7 +535,7 @@ dataChanged = nil == beforeIndex || beforeIndex.ID != afterIndex.ID || mergeResu
 ```
 即只要本地索引变了或 dejavu 认为发生了数据变更，就会通过 WS 通知其他设备。
 
-### 8.5 冲突处理策略（已核实代码证据）
+### 8.6 冲突处理策略（已核实代码证据）
 
 冲突处理的核心在 [model/repository.go#L1632-L1681](kernel/model/repository.go#L1632-L1681) `processSyncMergeResult()`：
 
@@ -519,13 +566,13 @@ mergeResult.Removes     // 需要删除的文件列表
 
 > **冲突检测在 dejavu 外部库中完成，内核仅负责暴露可选的「冲突副本保留」机制。默认情况下（GenerateConflictDoc=false），冲突文件的最终版本完全由 dejavu 的内部算法决定（未知且不可配置）。**
 
-### 8.6 感知同步（WebSocket 触发）
+### 8.7 感知同步（WebSocket 触发）
 
 当 `Sync.Perception = true` 时（Docker 强制为 false），内核维护一个额外的 WebSocket 连接 `webSocketConn` 到 SiYuan 云端：
 - 其他设备同步完成 → 云端推送 `{"cmd":"synced","synced":...}` → 本地触发 `SyncData(false)`
 - 本地同步完成且数据有变更 → 向云端发送 `synced` 消息 → 云端广播到其他在线设备
 
-### 8.7 固定端口代理服务
+### 8.8 固定端口代理服务
 
 桌面端反代 6806 端口至内核随机端口，保证：
 - 移动端固定连接 6806
@@ -600,11 +647,11 @@ mergeResult.Removes     // 需要删除的文件列表
    - **建议验证**：两台设备分别修改同一文档的不同段落，观察默认模式下的最终版本
    - 此问题需查阅 `siyuan-note/dejavu` 仓库的 `Sync()` / `SyncDownload()` 实现
 
-5. **Q5：conf/ 目录是否纳入同步范围？**
-   - `conf/conf.json` 中含 `System.ID`（设备唯一标识）、`System.WorkspaceDir`（绝对路径）
-   - 若同步这些字段会覆盖另一台设备的本地值
-   - **建议验证**：检查 dejavu 的 SyncIgnore 规则，确认 `conf/`、`repo/`、`temp/` 是否在忽略列表
-   - 从代码中看有 `getSyncIgnoreLines()` → `repo.SetIgnore()` 的调用链但未看到具体内容
+5. **Q5（已核实）：conf/ 目录是否纳入同步范围？**
+   - **核实结论：不纳入同步**。同步根目录是 `util.DataDir = {WorkspaceDir}/data/`（[model/repository.go#L2027](kernel/model/repository.go#L2027)），`{WorkspaceDir}/conf/`、`repo/`、`history/`、`temp/` 均在 `data/` 之外，**完全不在 dejavu 的扫描范围内**
+   - `Conf.System.ID` 仅作为 dejavu 的元数据参数传入（类似 git commit author），用于标识提交者设备，**不作为文件内容被同步或覆盖**
+   - 实际同步内容：`.sy` 文档、`assets/`、`templates/`、`widgets/`、`plugins/`、`snippets/`、`public/`、`storage/`、以及每个笔记本下的 `.siyuan/conf.json`（笔记本级配置，非全局 conf.json）
+   - 忽略规则：用户自定义 `data/.siyuan/syncignore` + 内置 4 个用户指南笔记本 + 旧版 `data/.siyuan/conf.json`（详见 8.3.2 节）
 
 6. **Q6：GenerateConflictDoc 与 Upserts 的重复判定？**
    - 冲突文件既在 `Conflicts` 中，是否也会出现在 `Upserts` 中？
@@ -670,8 +717,8 @@ mergeResult.Removes     // 需要删除的文件列表
 | **系统 API** | [api/system.go](kernel/api/system.go) | getConf / setUILayout / getEmojiConf / bootProgress |
 | **工作空间 API** | [api/workspace.go](kernel/api/workspace.go) | switchWorkspace / getWorkspacesPath |
 | **笔记本 API 与模型** | [api/notebook.go](kernel/api/notebook.go) + [model/box.go](kernel/model/box.go) | setNotebookConf / ListNotebooks（含损坏笔记本检测） |
-| **同步主流程** | [model/sync.go](kernel/model/sync.go) | SyncData / BootSyncData / syncData / checkSync / SetSyncProvider\* |
-| **同步冲突处理与仓库** | [model/repository.go](kernel/model/repository.go) | syncRepo / bootSyncRepo / processSyncMergeResult / newRepository / syncRepoDownload / syncRepoUpload |
+| **同步主流程** | [model/sync.go](kernel/model/sync.go) | SyncData / BootSyncData / syncData / checkSync / SetSyncProvider\* / **getSyncIgnoreLines** |
+| **同步冲突处理与仓库初始化** | [model/repository.go](kernel/model/repository.go) | syncRepo / bootSyncRepo / processSyncMergeResult / **newRepository**（`dejavu.NewRepo(util.DataDir, ...)` 确定同步根为 data/）/ syncRepoDownload / syncRepoUpload |
 | **配置结构体定义** | [conf/\*.go](kernel/conf/) | 20+ 子配置结构体 + New\*() 默认值构造函数（含 Sync.BoxConf.Layout 等） |
 | **CMD 异步命令框架** | [cmd/cmd.go](kernel/cmd/cmd.go) | Cmd 接口、`Exec()` goroutine 异步执行框架 |
 | **启动入口** | [main.go](kernel/main.go) | 8 步启动全流程编排（util.Boot → util.SetBooted） |
@@ -702,4 +749,4 @@ SiYuan 的配置与工作空间体系设计体现了 **「多层防御、渐进�
 其主要改进空间集中在三个方向：
 1. **配置版本化备份**：conf.json 损坏前自动备份为 `conf.json.bak.{timestamp}`，提升恢复能力
 2. **同步冲突策略透明化**：GenerateConflictDoc 默认开启，或至少在 UI 中高亮最近冲突
-3. **跨端配置隔离**：`System.ID`、`System.WorkspaceDir`、`System.OS` 等平台强绑定字段不应参与 dejavu 同步；UILayout 按平台分别持久化（桌面端大布局 ≠ 移动端窄屏布局）
+3. **跨端配置隔离（非同步层面，需额外实现）**：`conf/` 目录已天然不在同步根目录 `data/` 内（见 8.3 节），但 `System.ID`、`System.WorkspaceDir`、`System.OS` 等平台强绑定字段存在于 conf.json 中无需担心同步覆盖；仍需改进的是 **UILayout 按平台分别持久化**（桌面端大布局 ≠ 移动端窄屏布局，当前两者共用同一份 conf.json 中的 UILayout）
