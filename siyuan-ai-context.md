@@ -280,14 +280,14 @@ func ChatGPTWithAction(ids []string, action string) (ret string) {
 
 | 信息 | 存储位置 | 传输方式 |
 |------|----------|----------|
-| `apiKey` | **运行时配置文件** `conf/conf.json`，明文存储 | HTTPS 请求头 `Authorization: Bearer <key>` |
-| `UserToken` | 内存中 `Conf.User.UserToken`（`UserData` 加密存储于 `conf/conf.json`） | HTTPS Cookie |
-| 文档块内容 | 工作空间 `.sy` 数据文件 | HTTPS 请求体 |
+| `apiKey` | **工作空间配置** `WorkspaceDir/conf/conf.json`，明文存储。`ConfDir` 随 `WorkspaceDir` 变化（桌面端默认位置因系统而异） | HTTPS 请求头 `Authorization: Bearer <key>` |
+| `UserToken` | 内存中 `Conf.User.UserToken`（`UserData` 加密存储于同一 `WorkspaceDir/conf/conf.json`） | HTTPS Cookie |
+| 文档块内容 | 工作空间 `WorkspaceDir/data/` 下的 `.sy` 数据文件 | HTTPS 请求体 |
 
 > **重要区分**：
 > - **结构定义**：[conf/ai.go](kernel/conf/ai.go) 是 Go 源码文件，定义 `AI` 和 `OpenAI` 结构体的字段布局，不含任何用户配置值
 > - **运行时配置**：`conf/conf.json` 是实际的配置文件，JSON 格式，包含用户设置的真实 API Key 等值，路径为 `filepath.Join(util.ConfDir, "conf.json")`
-> - `util.ConfDir` 的值：桌面端为 `~/.siyuan/conf`，移动端为 `WorkspaceDir/conf`
+> - **`util.ConfDir` 的来源**：桌面端和移动端逻辑完全一致，均为 `WorkspaceDir/conf`。区别仅在于默认 `WorkspaceDir` 的位置（详见 §4.0）
 
 #### 边界分析
 
@@ -306,20 +306,46 @@ ginServer.Handle("POST", "/api/ai/chatGPTWithAction", model.CheckAuth, model.Che
 
 **风险点**:
 - [conf.go](kernel/model/conf.go) L567-L584 中，系统启动时会记录除 API Key 外的所有配置（包含代理地址、模型名等）
-- API Key 明文存储在 `conf/conf.json` 运行时配置文件中，无加密保护
+- API Key 明文存储在 `WorkspaceDir/conf/conf.json` 工作空间配置文件中，无加密保护
 
 ---
 
 ## 4. 设置保存与运行时读取的协作关系
 
-### 4.0 重要概念区分：结构定义 vs 运行时配置
+### 4.0 重要概念区分：结构定义、两级配置目录与运行时配置文件
 
-在分析之前，先明确两个容易混淆的概念：
+在分析之前，先明确三个容易混淆的概念：
+
+#### 1) 配置结构定义 vs 运行时配置
 
 | 概念 | 类型 | 路径 | 内容 |
 |------|------|------|------|
 | **配置结构定义** | Go 源码 | `kernel/conf/ai.go` | 定义 `AI`、`OpenAI` 结构体的字段名称、类型、JSON tag，以及默认值和环境变量加载逻辑。不含任何用户真实配置值。 |
-| **运行时配置文件** | JSON 文件 | `filepath.Join(util.ConfDir, "conf.json")` | 实际存储用户设置的文件，包含真实的 API Key 等敏感数据。桌面端路径通常为 `~/.siyuan/conf/conf.json`，移动端为 `WorkspaceDir/conf/conf.json`。 |
+| **运行时配置文件** | JSON 文件 | `filepath.Join(util.ConfDir, "conf.json")` | 实际存储用户设置的文件，包含真实的 API Key 等敏感数据。**桌面端和移动端路径结构完全一致**：均为 `WorkspaceDir/conf/conf.json`。 |
+
+#### 2) SiYuan 的两级配置目录体系
+
+SiYuan 存在两个层级的配置目录，分工不同：
+
+| 层级 | 变量名/位置 | 桌面端路径 | 移动端路径 | 存放内容 |
+|------|------------|-----------|-----------|----------|
+| **用户主目录配置** | `userHomeConfDir`（函数内局部变量） | `HomeDir/.config/siyuan/` | `HomeDir/.config/siyuan/` | `workspace.json`（工作空间列表）、`kernel.log`、`shortcuts/` |
+| **工作空间配置** | `util.ConfDir`（全局变量） | `WorkspaceDir/conf/` | `WorkspaceDir/conf/` | **`conf.json`（含 AI 配置）**、`appearance/`、`themes/`、`icons/` |
+
+> 关键区分：**AI 配置（API Key 等）存放在工作空间配置层**，即 `WorkspaceDir/conf/conf.json`，而非用户主目录配置层。`~/.config/siyuan/` 仅存放工作空间索引，不存放 AI 配置。
+
+#### 3) 桌面端默认 WorkspaceDir 的平台差异
+
+桌面端和移动端的 `ConfDir` 来源逻辑**完全一致**（均为 `WorkspaceDir/conf`），区别仅在于默认 `WorkspaceDir` 的位置：
+
+| 平台 | 默认 `WorkspaceDir` 路径 | 代码位置 |
+|------|--------------------------|----------|
+| Windows | `%USERPROFILE%\SiYuan` | [working.go](kernel/util/working.go) L259-L263 |
+| macOS | `~/Library/Application Support/SiYuan` | [working.go](kernel/util/working.go) L264-L267 |
+| Linux / 其他 | `~/SiYuan` | [working.go](kernel/util/working.go) L258 |
+| 移动端 | `workspaceBaseDir/siyuan` | [working_mobile.go](kernel/util/working_mobile.go) L113 |
+
+`WorkspaceDir` 可通过 `workspace.json` 或命令行参数 `--workspace` 自定义，非固定路径。
 
 **`conf.json` 中 AI 配置的实际存储格式**（JSON 片段）：
 ```json
@@ -883,7 +909,7 @@ kernel 启动 → InitConf() [model/conf.go L123]
 
 | 风险 | 等级 | 说明 | 代码位置 |
 |------|------|------|----------|
-| API Key 明文存储 | ⚠️ 中 | `conf/conf.json` 中明文保存，无加密。配置文件路径为 `filepath.Join(util.ConfDir, "conf.json")`，未做任何加密或权限控制 | [model/conf.go](kernel/model/conf.go) L878-L899 |
+| API Key 明文存储 | ⚠️ 中 | `WorkspaceDir/conf/conf.json` 中明文保存，无加密。`ConfDir` 随 `WorkspaceDir` 变化（桌面端默认位置因系统而异），未做任何加密或文件权限控制 | [model/conf.go](kernel/model/conf.go) L878-L899, [working.go](kernel/util/working.go) L301 |
 | 全局上下文泄漏 | ⚠️ 高 | `cachedContextMsg` 全局单例，多用户环境下上下文交叉污染 | [model/ai.go](kernel/model/ai.go) L54 |
 | 文档内容外泄 | ⚠️ 高 | 用户文档内容直接发送给第三方 AI，无脱敏选项 | [getBlocksContent()](kernel/model/ai.go) |
 | 无速率限制 | ⚠️ 中 | API 端点无速率限制，可能导致意外高额费用 | [api/ai.go](kernel/api/ai.go) |
