@@ -148,7 +148,8 @@ func isAttr(name string) bool {
 | `delete_id` | 删除单个文档 | 按 root_id 删除 |
 | `rename` | 文档重命名 | 更新 hpath 和文档标题 |
 | `move` | 文档移动 | 更新 path |
-| `update_refs` | 引用索引刷新 | 增量更新 refs 表 |
+| `update_refs` | 引用锚文本变更/反向链接刷新/启动引用索引 | **仅重建 refs + file_annotation_refs，不涉及其他表** |
+| `delete_refs` | 删除文档引用 | 仅删除 refs + file_annotation_refs |
 | `index_node` | 单块内容重索引 | 仅更新单块 content 字段 |
 
 #### 队列去重优化
@@ -241,7 +242,97 @@ insertTree0(tx, tree, context, blocks, spans, assets, attributes, refs, fileAnno
 
 > **设计权衡**：只有主表 blocks 做增量，子表全部全量重建。这种「主表精细化 + 子表简单化」的设计，在保证主要性能收益的同时，大大降低了子表增量 diff 的实现复杂度和出错概率。
 
-### 4.3 标签索引的两级结构
+### 4.3 引用索引的单独刷新（update_refs）
+
+> ⚠️ **修正**：之前将 `update_refs` 描述为「增量更新 refs 表」是不准确的。实际上 `update_refs` 只涉及 refs 和 file_annotation_refs 两个引用表的**全量删除+全量插入**，且**完全不涉及 blocks/spans/assets/attributes 表**。
+
+#### upsertRefs 的执行逻辑
+
+`kernel/sql/block_ref.go` 中 `upsertRefs` 的实现非常简洁：
+
+```go
+func upsertRefs(tx *sql.Tx, tree *parse.Tree) (err error) {
+    deleteRefsByPath(tx, tree.Box, tree.Path)           // 删除旧引用
+    deleteFileAnnotationRefsByPath(tx, tree.Box, tree.Path) // 删除旧文件标注引用
+    insertRefs(tx, tree)                                 // 从文档树重新提取并插入
+}
+```
+
+关键特征：
+- **只操作 refs + file_annotation_refs 两张表**，不影响 blocks/spans/assets/attributes
+- **全量删除+全量插入**（按 path 删除后重新提取）
+- **不受索引忽略配置影响**（`upsertRefs` 中没有 `getIndexIgnoreLines` 检查）
+- **与 upsert 操作的独立性**：`upsertTree` 中也会重建 refs，两者路径不同但最终效果相同
+
+#### update_refs 的三种触发场景
+
+| 触发路径 | 入口函数 | 场景 |
+|---------|---------|------|
+| **反向链接手动刷新** | `kernel/model/backlink.go` → `refreshRefsByDefID(defID)` | 用户点击「刷新」反向链接按钮，按 defID 查找所有引用该定义块的文档，逐文档入 `UpdateRefsTreeQueue` |
+| **动态锚文本级联更新** | `kernel/model/push_reload.go` → `refreshDynamicRefTexts0()` | 定义块内容变化后，级联更新引用该块的所有文档中的动态锚文本。对受影响的引用文档同时入 `UpdateRefsTreeQueue` + `indexWriteTreeUpsertQueue`（两个操作分别入队） |
+| **启动时引用索引构建** | `kernel/model/index.go` → `IndexRefs()` | 启动时两阶段构建：先扫描所有含引用的文档 rootID，再逐文档 `UpdateRefsTreeQueue` |
+
+#### update_refs 与 upsert 的协作与竞态
+
+在动态锚文本更新场景中，同一文档可能同时进入队列两个操作：`update_refs` + `upsert`。由于队列去重只针对**同 action** 的同文档操作（`update_refs` 和 `upsert` 是不同 action，不会互相覆盖），两者都会被执行：
+
+1. 如果 `update_refs` 先执行：重建 refs → 随后 `upsert` 执行时会**再次删除并重建 refs**（upsertTree 步骤 2 中的 `deleteRefsByPathTx`），等于 `update_refs` 的结果被 `upsert` 覆盖
+2. 如果 `upsert` 先执行：完整重建所有表 → 随后 `update_refs` 只重建 refs（删了再插），但此时 refs 内容与 upsert 结果一致，属于冗余操作但不会出错
+
+> **一致性影响**：无论哪种执行顺序，最终 refs 都与文档树一致。但 `update_refs` 的「仅刷引用」语义在遇到同文档 `upsert` 时会被降级为冗余操作。
+
+### 4.4 索引忽略配置的影响范围
+
+SiYuan 支持通过 `{DataDir}/.siyuan/indexignore` 文件配置忽略索引的文档路径（对应 issue #9198）。索引忽略的检查位于 `insertTree0` 函数开头：
+
+```go
+func insertTree0(tx *sql.Tx, tree *parse.Tree, ...) (err error) {
+    if ignoreLines := getIndexIgnoreLines(); 0 < len(ignoreLines) {
+        matcher := ignore.CompileIgnoreLines(ignoreLines...)
+        if matcher.MatchesPath("/" + path.Join(tree.Box, tree.Path)) {
+            return  // 命中忽略规则，跳过所有插入
+        }
+    }
+    // ... 实际插入 blocks/spans/assets/attributes/refs
+}
+```
+
+#### 各操作类型受索引忽略影响的情况
+
+| 操作 | 是否受索引忽略影响 | 影响 |
+|------|-------------------|------|
+| `index`（indexTree） | **是**（通过 `insertTree0`） | 全量索引时跳过被忽略文档，**无副作用**（因为 indexTree 不做前置删除） |
+| `upsert`（upsertTree） | **是**（通过 `insertTree0`） | ⚠️ **有副作用**：upsertTree 先执行了子表全量删除，再调 `insertTree0`，如果此时命中忽略规则，插入被跳过但删除已执行，**造成 spans/assets/attributes/refs 数据丢失** |
+| `update_refs`（upsertRefs） | **否** | `upsertRefs` 直接操作 refs 表，无索引忽略检查 |
+| 其他操作 | **否** | `delete`/`rename`/`move` 等不经过 `insertTree0` |
+
+#### upsert 命中索引忽略时的数据丢失路径
+
+```
+upsertTree 执行流程（命中忽略时）：
+  1. 计算 blocks 增量                                ← 已执行
+  2. deleteBlocksByIDs(toRemoves)                    ← 已执行：blocks 被删
+  3. deleteSpansByRootID(tree.ID)                    ← 已执行：spans 被删
+  4. deleteAssetsByRootID(tree.ID)                   ← 已执行：assets 被删
+  5. deleteAttributesByRootID(tree.ID)               ← 已执行：attributes 被删
+  6. deleteRefsByPathTx(tree.Box, tree.Path)         ← 已执行：refs 被删
+  7. deleteFileAnnotationRefsByPathTx(...)           ← 已执行
+  8. insertTree0 → getIndexIgnoreLines → 命中! → return ← 插入全部跳过
+                                                     ← 结果：该文档的索引数据被清空
+```
+
+> **一致性影响**：如果被忽略文档此前已被索引过（索引忽略配置是后加的），一旦触发 upsert，该文档的 spans（标签索引）、attributes（属性索引）、refs（引用索引）将全部丢失。但 blocks 表中 Hash 未变化的旧块不会受影响（步骤 2 只删了变化的块），而变化的块被删后也不再插入。这意味着被忽略文档在 upsert 后将**几乎完全从索引中消失**——这是预期行为（配置忽略的目的就是如此），但实现方式不是「不索引」而是「删了不插」。
+
+> **注意**：`update_refs` 不受索引忽略影响，意味着即使文档被配置为忽略索引，当其他文档引用它时，引用关系仍然会被更新到 refs 表。这在索引忽略场景下可能导致 refs 中存在「指向一个索引中不存在块」的悬挂引用。
+
+#### 索引忽略配置的生效机制
+
+- 配置文件路径：`{DataDir}/.siyuan/indexignore`
+- 匹配规则：使用 gitignore 语法（`go-gitignore` 库），匹配路径格式为 `/{boxID}/{docPath}`
+- 缓存机制：首次读取后设置 `IndexIgnoreCached = true`，后续直接返回缓存结果
+- 缓存失效：`FullReindex()` 中显式设置 `sql.IndexIgnoreCached = false`，触发重新加载
+
+### 4.5 标签索引的两级结构
 
 标签在数据库中存在**两级索引**，分别服务于不同查询场景：
 
@@ -257,7 +348,7 @@ insertTree0(tx, tree, context, blocks, spans, assets, attributes, refs, fileAnno
 - 作用：标签面板构建、精确标签搜索、标签统计计数
 - **更新方式**：随 spans 表整文档全量重建
 
-### 4.4 索引更新触发链路
+### 4.6 索引更新触发链路
 
 以属性修改为例，完整链路如下：
 
@@ -563,6 +654,9 @@ SQL 索引队列（`kernel/sql/queue.go`）中，**同一 tree.ID 的同类操�
 | **缓存与 DB 不一致** | 低 | `PutBlockIAL` 在入队前直接更新缓存，若后续 upsert 失败则缓存脏读，但概率极低（DB 事务失败会有日志） |
 | **队列溢出** | 低 | txQueue buffer=7，大量连续操作可能阻塞；dbQueueOperation 无显式长度限制，极端情况内存增长 |
 | **批量操作中断** | 中 | RenameTag/RemoveTag 逐文档循环，中途中断会导致部分文档已更新、部分未更新（无全局事务回滚） |
+| **索引忽略导致 upsert 数据丢失** | 高 | upsertTree 先删后插，如果 `insertTree0` 中命中 `indexignore` 规则，子表数据（spans/attributes/refs）已被删除但不会被重新插入，导致标签、属性、引用索引全部丢失 |
+| **update_refs 与 upsert 竞态冗余** | 低 | 同一文档可能同时入队 `update_refs` 和 `upsert`，两者都会操作 refs 表但互不感知，存在冗余删除+插入，最终结果正确但浪费 IO |
+| **索引忽略悬挂引用** | 低 | `update_refs` 不受 `indexignore` 影响，被忽略文档的 refs 仍会被更新，但该文档的 blocks/spans/attributes 已被删除，导致 refs 中存在「指向索引中不存在块」的悬挂引用 |
 
 ### 11.2 性能风险
 
@@ -608,6 +702,9 @@ SQL 索引队列（`kernel/sql/queue.go`）中，**同一 tree.ID 的同类操�
 | V-08 | upsert 增量正确性 | 文档有 100 个块，仅修改 1 个块的内容后保存 | blocks 表仅变化 1 块的 Hash，spans/assets/attributes 全部重建 |
 | V-09 | 标签嵌套计数准确性 | 标签 `a/b/c` 有 2 个块，`a/b` 有 1 个块，`a` 有 1 个块 | 标签树中：a.Count=4，a/b.Count=3，a/b/c.Count=2 |
 | V-10 | 只读模式属性保护 | 以只读角色登录，调用 setBlockAttrs API | 被拒绝，无任何修改 |
+| V-11 | update_refs 隔离性 | 对文档 A 触发 `update_refs`，检查 blocks/spans/attributes 表 | blocks/spans/attributes 不受影响，仅 refs 和 file_annotation_refs 被重建 |
+| V-12 | 索引忽略 + upsert 数据完整性 | 先索引文档 A，再在 `indexignore` 中添加 A 的路径，然后编辑保存 A | A 的 spans/attributes/refs 被清空，标签面板和属性搜索不再出现 A 的内容 |
+| V-13 | 索引忽略悬挂引用 | 文档 B 引用文档 A，A 被 `indexignore` 忽略，对 B 触发 `update_refs` | refs 表中仍存在 B→A 的引用记录，但 A 的 blocks 表中无对应行（悬挂引用） |
 
 ### 12.2 性能与压力测试
 
@@ -632,6 +729,8 @@ SQL 索引队列（`kernel/sql/queue.go`）中，**同一 tree.ID 的同类操�
 | E-06 | 属性值超长 | custom 属性值 100KB 字符串 | 正常存储、搜索不崩溃 |
 | E-07 | 删除不存在的标签 | removeTag 传入从未使用过的标签名 | 静默成功，无副作用 |
 | E-08 | upsert 事务中断 | 在 upsertTree 执行到一半时模拟崩溃 | 重启后数据完整，无半写状态 |
+| E-09 | indexignore 配置热更新 | 运行中修改 `indexignore` 文件添加/删除规则 | 需执行 `FullReindex` 才能生效（`IndexIgnoreCached` 机制） |
+| E-10 | update_refs 对被忽略文档 | 文档 A 在 `indexignore` 中，其他文档引用了 A 的块，触发引用刷新 | refs 表仍被更新（`upsertRefs` 无忽略检查），但 A 的 blocks 无对应行 |
 
 ---
 
@@ -645,13 +744,16 @@ SQL 索引队列（`kernel/sql/queue.go`）中，**同一 tree.ID 的同类操�
 | `kernel/model/index.go` | 全量/增量索引调度、Box.Index、嵌入块索引 | L49-L442 |
 | `kernel/model/file.go` | writeTreeUpsertQueue、indexWriteTreeUpsertQueue 关键链路函数 | L944-L994 |
 | `kernel/sql/queue.go` | SQL 异步队列、操作去重合并、FlushQueue | L37-L437 |
-| `kernel/sql/upsert.go` | upsertTree 核心实现、blocks Hash 增量、子表全量重建 | L399-L493 |
+| `kernel/sql/upsert.go` | upsertTree 核心实现、blocks Hash 增量、子表全量重建、索引忽略检查 | L399-L541 |
+| `kernel/sql/block_ref.go` | upsertRefs/deleteRefs/insertRefs：引用索引独立刷新逻辑 | L40-L70 |
 | `kernel/sql/span.go` | 标签 Span 查询：QueryTagSpans* 系列函数 | L40-L173 |
 | `kernel/sql/database.go` | fromTree、tagFromNode、buildAttributeFromNode、isAttr、各表删除函数 | L520-L615, L968-L1140 |
 | `kernel/sql/attribute.go` | Attribute 结构体定义 | L19-L28 |
 | `kernel/cache/ial.go` | Ristretto 缓存实现：blockIALCache、docIALCache | L25-L79 |
 | `kernel/api/tag.go` | 标签 HTTP 接口：getTag/renameTag/removeTag | L28-L110 |
 | `kernel/api/attr.go` | 属性 HTTP 接口：setBlockAttrs/batchSetBlockAttrs 等 | L31-L196 |
+| `kernel/model/backlink.go` | 反向链接刷新：refreshRefsByDefID | L41-L62 |
+| `kernel/model/push_reload.go` | 动态锚文本级联更新：refreshDynamicRefTexts0 | L260-L358 |
 | `app/src/layout/dock/Tag.ts` | 前端标签面板：Tree 渲染、事件订阅、排序、刷新 | L15-L204 |
 | `app/src/menus/tag.ts` | 标签右键菜单：重命名、删除 | L10-L42 |
 
@@ -659,4 +761,6 @@ SQL 索引队列（`kernel/sql/queue.go`）中，**同一 tree.ID 的同类操�
 
 **文档生成时间**：2026-06-15
 **分析范围**：SiYuan kernel（Go）+ app（TypeScript）核心源码
-**修正记录**：v2 - 修正 upsertTree 增量更新理解：仅 blocks 表做 Hash 增量，spans/assets/attributes/refs 均为整文档全量重建
+**修正记录**：
+- v2 - 修正 upsertTree 增量更新理解：仅 blocks 表做 Hash 增量，spans/assets/attributes/refs 均为整文档全量重建
+- v3 - 修正 update_refs 理解：仅重建 refs+file_annotation_refs，不涉及其他表；补充索引忽略配置对 upsert 的副作用分析（先删后忽略=数据丢失）、update_refs 与 upsert 的竞态分析
