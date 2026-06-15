@@ -526,7 +526,7 @@ defer func() {
 
 | 分支模式 | 适用格式 | 等待提示位置 | 成功后动作 | 关键实现文件 |
 |---------|---------|------------|-----------|-------------|
-| **A. 简单异步** | `.sy.zip`、Markdown `.zip`、ReST、AsciiDoc、DocBook、EPUB、ODT 等 | 调用 API 前 | `hideMessage` + `openByMobile` 下载 | [commonMenuItem.ts](app/src/menus/commonMenuItem.ts#L608-L725) |
+| **A. 简单异步** | `.sy.zip`、Markdown `.zip`、ReST、AsciiDoc、Textile、OPML、Org-Mode、MediaWiki、ODT、RTF、EPUB 等 | 调用 API 前 | `hideMessage` + `openByMobile` 下载 | [commonMenuItem.ts](app/src/menus/commonMenuItem.ts#L608-L785) |
 | **B. 路径选择 + 本地保存** | 桌面端 HTML(SiYuan/Markdown)、Word `.docx` | 用户选择目录后 | `afterExport`（6s Toast + "显示在文件夹"） | [index.ts saveExport/getExportPath](app/src/protyle/export/index.ts#L690-L749) |
 | **C. 浏览器二次请求** | 浏览器端 HTML(SiYuan/Markdown) | 调用 API 前 | `hideMessage` + `window.open` + Toast | [index.ts saveExport](app/src/protyle/export/index.ts#L34-L61) |
 | **D. PDF 预览 + IPC** | 桌面端 PDF | 预览窗口内 | IPC 发送给主进程静默生成 | [index.ts renderPDF](app/src/protyle/export/index.ts#L138-L688) |
@@ -617,48 +617,93 @@ PDF 导出在独立窗口内执行，用户点击"确认"后：
 
 #### 5.7.4 浏览器导出二次请求的失败处理
 
-**分支 C** 是唯一包含**两次后端请求**的路径，也是唯一**显式检查 code === -1** 的分支：
+**分支 C** 是唯一包含**两次后端请求**的路径。但由于 `fetchPost` + `processMessage` 的全局拦截机制，代码中显式的 `if (zipResponse.code === -1)` 分支实际上是**死代码**。
 
-```typescript
-// [index.ts:L34-L61] saveExport 浏览器环境（BROWSER 编译宏）
-if (["html", "htmlmd"].includes(option.type)) {
-    const msgId = showMessage(window.siyuan.languages.exporting, -1);
-    // 第 1 次请求：生成资源 + 返回内容 HTML 片段
-    fetchPost(url, {id, pdf:false, removeAssets:false, merge:true, savePath:""},
-      async exportResponse => {
-        // 前端本地组装完整 HTML（注入主题、插件样式、snippet、protyle-render）
-        const html = await onExport(exportResponse, undefined, "", option);
-        // 第 2 次请求：将完整 HTML 和资源打包为 ZIP
-        fetchPost("/api/export/exportBrowserHTML", {
-            folder: exportResponse.data.folder,
-            html: html,           // 完整 HTML 字符串回传
-            name: exportResponse.data.name
-        }, zipResponse => {
-            hideMessage(msgId);                    // 无论成功失败都先关提示
-            // ── 二次请求失败的显式错误分支 ──
-            if (zipResponse.code === -1) {
-                // _kernel[14] = "导出 HTML 失败：%s"
-                showMessage(
-                    window.siyuan.languages._kernel[14].replace("%s", zipResponse.msg),
-                    0,          // timeout=0：必须手动关闭，防止用户错过
-                    "error"     // 红色样式
-                );
-                return;         // 中断，不执行下载
-            }
-            // 成功：window.open 触发浏览器原生下载弹窗
-            window.open(zipResponse.data.zip);
-            showMessage(window.siyuan.languages.exported);
-        });
-    });
-    return;
-}
+##### 拦截机制的三层嵌套
+
+```
+fetchPost 调用链
+    ↓
+[fetch.ts:L88-L91] 统一拦截点
+    if (typeof response === "object" 
+        && typeof response.msg === "string" 
+        && typeof response.code === "number") {
+        if (processMessage(response) && cb) {  // ← 关键短路逻辑
+            cb(response);                     // 仅 processMessage 返回真值时才执行回调
+        }
+    }
+    ↓
+[processMessage.ts:L70-L74] code<0 处理
+    if (response.code < 0) {
+        showMessage(response.msg, ..., response.code === -1 ? "error" : "info");
+        return false;   // ← 返回 false → cb 永远不会被调用！
+    }
+    return response;     // code ≥ 0 时返回原对象 → cb 正常执行
 ```
 
-**二次请求可能失败的场景：**
+**结论：`code < 0` 的响应在 `fetchPost` 内部就被 `processMessage` 拦截了，回调函数 `cb` 永远不会被执行。**
+
+##### 完整的错误流程时序
+
+```
+用户点击导出 HTML
+    ↓
+msgId = showMessage("导出中", -1)  // 永不自动关闭
+    ↓
+第 1 次 fetchPost("/api/export/exportHTML", ...)
+    ├─ 成功（code=0）→ onExport() 组装 HTML → 第 2 次请求
+    └─ 失败（code=-1）→ processMessage 拦截
+            ├─ 自动 showMessage(红色错误 Toast)
+            ├─ return false
+            └─ cb 不执行 → hideMessage(msgId) 不调用 → "导出中"Toast 残留
+    ↓
+第 2 次 fetchPost("/api/export/exportBrowserHTML", ...)
+    ├─ 成功（code=0）→ cb 执行 → hideMessage + window.open + 成功 Toast
+    └─ 失败（code=-1）→ processMessage 拦截
+            ├─ 自动 showMessage(红色错误 Toast)
+            ├─ return false
+            └─ cb 不执行 → 以下代码永远不执行：
+               - hideMessage(msgId)
+               - if (zipResponse.code === -1) { ... }  ← 死代码
+               - window.open(...)
+```
+
+##### 源码中的死代码
+
+代码中显式编写的错误分支永远不会被执行：
+
+```typescript
+// [index.ts:L34-L61] saveExport 浏览器环境
+fetchPost("/api/export/exportBrowserHTML", {...}, zipResponse => {
+    hideMessage(msgId);                  // ← code<0 时不会走到这里
+    // ── 以下是死代码，永远不会执行 ──
+    if (zipResponse.code === -1) {
+        showMessage(
+            window.siyuan.languages._kernel[14].replace("%s", zipResponse.msg),
+            0, "error"
+        );
+        return;
+    }
+    window.open(zipResponse.data.zip);   // ← 也不会走到这里（失败时）
+    showMessage(window.siyuan.languages.exported);
+});
+```
+
+##### 潜在 UX Bug
+
+当两次请求中任意一次失败时，用户界面会出现**两个 Toast 同时存在**：
+1. **错误 Toast**（红色）：由 `processMessage` 自动弹出，描述具体错误原因（`timeout=0`，需手动关闭）
+2. **"导出中"Toast**：由于回调未执行，`hideMessage(msgId)` 从未被调用，**永久显示**
+
+用户必须手动关闭错误 Toast 后，才能看到卡住的"导出中"Toast，且无法自动消除。
+
+##### 失败场景
+
+二次请求可能失败的场景：
 1. **临时目录写满**：`exportBrowserHTML` 写入 ZIP 时磁盘空间不足
-2. **HTML 体积过大**：`zipResponse.data.zip` URL 超出浏览器 `window.open` 限制
-3. **临时资源已清理**：第 1 次请求与第 2 次请求间隔过长，`exportResponse.data.folder` 被定时任务回收
-4. **session 过期**：两次请求之间鉴权失效
+2. **HTML 体积过大**：`zipResponse.data.zip` URL 超出浏览器限制
+3. **临时资源已清理**：第 1 次与第 2 次请求间隔过长，`exportResponse.data.folder` 被定时任务回收
+4. **session 过期**：两次请求之间鉴权失效（401 时 `fetch.ts` 会直接 `location.reload()`）
 
 #### 5.7.5 文件打开：`openByMobile` 的 4 平台分发
 
@@ -1036,6 +1081,16 @@ treenode.IndexBlockTree(tree)         // 块树缓存更新
 3. **脚注定义泄漏**
    - Mode 4 块引导出时，`resolveFootnotesDefs` 生成的脚注定义块可能包含未引用项
    - 需验证 `Improve focus export` 逻辑在聚焦导出场景下的覆盖率
+
+4. **浏览器 HTML 导出死代码**
+   - [index.ts:L639-L646](app/src/protyle/export/index.ts#L639-L646) 中 `if (zipResponse.code === -1)` 分支为死代码
+   - 由于 `fetchPost` + `processMessage` 全局拦截 `code < 0`，回调永远执行不到该分支
+   - 需移除冗余代码，或重构为在调用 `fetchPost` 前 `hideMessage(msgId)`
+
+5. **浏览器 HTML 导出 UX Bug**
+   - 第 1/2 次请求失败时，`hideMessage(msgId)` 不会被调用，导致"导出中"Toast 永久残留
+   - 用户会同时看到红色错误 Toast + 卡住的"导出中"Toast，体验不佳
+   - 修复方案：在调用 `fetchPost` 前注册 `finally` 逻辑，或使用 `failCallback` 参数兜底
 
 ### 11.4 兼容性验证
 
