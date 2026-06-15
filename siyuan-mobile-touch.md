@@ -144,34 +144,177 @@ public static readonly PROTYLE_TOOLBAR: string[] = isMobile() ? [
 
 `window.siyuan.config.system.container` 的取值来源：**内核 `/api/system/getConf` 返回**，由后端 Go 代码根据实际运行环境设置。
 
-### 2.2 响应式布局的"硬边界"
+### 2.2 三种响应式机制的分工与边界
 
-SiYuan 的移动端与桌面端之间采用的是**编译入口硬切换**，而非 CSS 媒体查询的软响应式。
+SiYuan 的响应式不是单一机制，而是 **端间硬切换、局部 CSS 断点、横竖屏 JS 监听** 三层独立机制的叠加。三者各自负责不同的粒度范围，互不重叠：
 
-**边界判定特征：**
+```
+┌────────────────────────────────────────────────────────────────────┐
+│ Layer 1: 端间硬切换（编译入口级）                                    │
+│ 粒度：桌面端 vs 移动端 = 两套完全独立的 HTML/CSS/JS 包体             │
+│ 机制：webpack.desktop.js  ↔ webpack.mobile.js  +  ifdef 宏裁剪      │
+│ 切换时机：发布/构建时（一次性，非运行时）                             │
+│ 覆盖范围：                                                         │
+│   ✓ 面板体系（Dock/Layouter  ↔  #sidebar/#menu/#model）            │
+│   ✓ 窗口系统（多 Tab  ↔  单 #editor）                               │
+│   ✓ 整体 UI 框架（desktop.scss  ↔  mobile.scss）                   │
+│   ✗ 不处理端内的屏幕尺寸差异                                        │
+└────────────────────────────────────────────────────────────────────┘
+                              ↓
+┌────────────────────────────────────────────────────────────────────┐
+│ Layer 2: 局部 CSS 媒体查询断点（组件/内容级）                         │
+│ 粒度：端内视口宽度变化 → 特定组件的微调整                            │
+│ 机制：@media (max-width: Npx) 在双端 SCSS 中共用                     │
+│ 切换时机：运行时视口 resize 触发（纯 CSS，无需 JS）                  │
+│ 断点与作用范围：                                                    │
+│   620px — superblock 横列 ↔ 竖排 切换（mobile/_mobile.scss）        │
+│   750px — 设置面板 Tab 文字隐藏、历史面板上下分栏、卡片表单换行       │
+│            （util/_responsive.scss，双端共用）                      │
+│   535~1199px — PDF.js 工具栏元素分级隐藏（第三方库自带断点）          │
+│   767/991/1199px — Viewer.js 分级隐藏（第三方库自带断点）            │
+└────────────────────────────────────────────────────────────────────┘
+                              ↓
+┌────────────────────────────────────────────────────────────────────┐
+│ Layer 3: 横竖屏 JS 监听（状态级）                                    │
+│ 粒度：屏幕方向变化 → 键盘/卡片等 JS 状态更新                         │
+│ 机制：window.matchMedia("(orientation:portrait)").addEventListener  │
+│ 切换时机：物理方向切换 / 软件键盘弹出引发 resize                     │
+│ 作用范围：                                                          │
+│   ✓ 键盘高度缓存 height1/height2 的 portait/landscape 分离          │
+│   ✓ 卡片视图 card__icon 图标显隐（updateCardHV）                    │
+│   ✗ 不改变 DOM 结构与布局方式（仅修改 class / 状态变量）             │
+└────────────────────────────────────────────────────────────────────┘
+```
 
-1. **无 CSS 断点**：`_mobile.scss` 中不使用 `@media` 查询做端间切换，仅使用 `100vw`、`100vh` 做屏幕自适应
-2. **固定 UI 结构**：移动端 HTML 模板（`app/src/assets/template/mobile/index.tpl`）包含四个核心面板：
-   - `#sidebar`（`.side-panel`）：**左侧**侧栏，CSS 默认 `translateX(-100vw)` 隐藏于屏幕左侧
-   - `#menu`（`.b3-menu.b3-menu--fullscreen`）：**右侧**主菜单，CSS 默认 `translateX(100vw)` 隐藏于屏幕右侧
-   - `#editor`：中央编辑区
-   - `#model`（`.side-panel.side-panel--all`）：设置等模态弹窗，CSS 默认 `translateY(-200vh)` 隐藏于屏幕上方
-3. **横竖屏检测**：使用 `window.matchMedia("(orientation: portrait/landscape)")` 仅用于更新卡片尺寸和键盘高度缓存，不触发布局重排
+#### 2.2.1 Layer 1 — 端间硬切换
 
-**面板 CSS 默认值对照（已从模板与样式文件交叉验证）：**
+桌面端与移动端之间是**编译入口级硬切换**，不存在运行时"同一套布局自适应两端"。
+
+**硬切换的判定依据：**
+
+1. **双入口 HTML 模板**：`app/src/assets/template/desktop/index.tpl` ↔ `app/src/assets/template/mobile/index.tpl`，DOM 结构从根级开始就不同
+2. **双入口 JS 启动**：`app/src/index.ts`（App 桌面类）↔ `app/src/mobile/index.ts`（App 移动类）
+3. **双入口 SCSS**：`app/src/assets/scss/base.scss` ↔ `app/src/assets/scss/mobile.scss`
+4. **ifdef 条件编译**：`MOBILE` 宏控制桌面端重型模块（Dock/Layouter/Tab）不进入移动端包体
+
+**移动端核心面板（与桌面端完全不同的 DOM 结构）：**
 
 | 面板 | HTML class | CSS 默认 transform | 展开时 transform | 隐藏方向 |
 |------|-----------|-------------------|-----------------|---------|
 | `#sidebar` | `side-panel fn__flex-column` | `translateX(-100vw)` | `translateX(0px)` | 隐藏于左侧 |
 | `#menu` | `b3-menu b3-menu--fullscreen` | `translateX(100vw)` | `translateX(0px)` | 隐藏于右侧 |
 | `#model` | `side-panel side-panel--all fn__flex-column` | `translateY(-200vh)` | `translateY(0px)` | 隐藏于上方 |
+| `#editor` | — | — | 中央编辑区 | — |
 
 > **注意**：`#menu` 与 `#sidebar`/`#model` 使用不同的 CSS 类。`#sidebar` 和 `#model` 共用 `side-panel` 基类（`position:fixed; transform:translateX(-100vw)`），而 `#menu` 使用 `b3-menu--fullscreen`（`position:fixed; left:0; right:0; width:100%`），其 `translateX(100vw)` 由 `#menu` 专属 CSS 规则在 `_mobile.scss` 中单独定义。
 
+#### 2.2.2 Layer 2 — 局部 CSS 媒体查询断点
+
+**确实存在 @media 断点**，只是它们作用于**端内组件级微调**而非端间切换。所有断点清单如下（从 SCSS 文件交叉验证）：
+
+| 断点宽度 | 文件位置 | 生效端 | 影响内容 |
+|---------|---------|--------|---------|
+| **620px** | `app/src/assets/scss/main/_mobile.scss` | **仅移动端** | Superblock `[data-sb-layout="col"]` 横列布局 → 强制竖排：`flex-direction: column`；子元素 `margin-right: 0` |
+| **750px** | `app/src/assets/scss/util/_responsive.scss` | **双端共用** | 设置面板 Tab 栏隐藏文字（只留图标）、表单标签全宽换行、历史面板左右分栏→上下分栏（左栏固定40%高）、快捷键面板键位输入框全宽居中 |
+| **535px** | `app/src/assets/scss/pdf/_pdf.scss` | **双端共用** (PDF.js) | PDF.js 缩放选择器隐藏 |
+| **640px** | `app/src/assets/scss/pdf/_pdf.scss` | **双端共用** (PDF.js) | PDF.js 小型视图元素及子节点全部隐藏 |
+| **700px** | `app/src/assets/scss/pdf/_pdf.scss` | **双端共用** (PDF.js) | PDF.js 中型视图元素隐藏 |
+| **770px** | `app/src/assets/scss/pdf/_pdf.scss` | **双端共用** (PDF.js) | PDF.js 大型视图元素隐藏 |
+| **840px** | `app/src/assets/scss/pdf/_pdf.scss` | **双端共用** (PDF.js) | PDF.js 侧栏展开时不预留左侧空间（覆盖 left 属性） |
+| **767px** | `app/src/assets/scss/viewerjs/_viewer.scss` | **双端共用** (Viewer.js) | Viewer.js `hide-xs-down` 类生效 |
+| **991px** | `app/src/assets/scss/viewerjs/_viewer.scss` | **双端共用** (Viewer.js) | Viewer.js `hide-sm-down` 类生效 |
+| **1199px** | `app/src/assets/scss/viewerjs/_viewer.scss` | **双端共用** (Viewer.js) | Viewer.js `hide-md-down` 类生效 |
+
+**620px 断点对 superblock 横列布局的影响（最核心的业务断点）：**
+
+默认 superblock 列布局（`app/src/assets/scss/protyle/_wysiwyg.scss`）：
+```scss
+.sb[data-sb-layout="col"] {
+    flex-direction: row;    // 横向排列（多列并排）
+    flex-wrap: wrap;
+    justify-content: space-between;
+    column-gap: 1.5em;
+}
+```
+
+当 `max-width: 620px` 时（移动端小屏触发，`_mobile.scss`）：
+```scss
+.protyle-wysiwyg [data-node-id].sb[data-sb-layout="col"] {
+    flex-direction: column; // 强制纵向排列（单列竖排）
+    flex-wrap: initial;
+    & > div {
+        margin-right: 0;    // 清除列间距
+    }
+}
+```
+
+**含义**：用户在桌面端创建了一个"左右并排"的 superblock 列布局，在移动端（屏幕 < 620px）浏览时会**自动变为上下堆叠**，保证窄屏可读性。这是纯 CSS 驱动的运行时响应式，不需要 JS 介入。
+
+**750px 断点（双端通用，最广覆盖的业务断点）：**
+
+覆盖 4 类组件：
+1. **设置面板 Tab 栏**：`.config__panel > .b3-tab-bar` 的 `.b3-list-item__text` 隐藏，仅保留图标，`width: auto` → 避免标签文字挤压换行
+2. **设置项表单**：`.config__item > *`（输入框/按钮/下拉/滑块）全部 `width: 100%` + `margin-top: 8px` → 从"标签-控件横排"变为"标签-控件竖排"
+3. **历史面板**：`.history__panel` 从左右分栏变为上下分栏（左 Tab 栏 `height: 40%`，`width: auto`，底部加 border）
+4. **快捷键定义**：`.config-keymap__key` 键位输入框 `width: 100%` + 居中对齐
+
+**设计意图**：750px 断点作用于**弹出对话框/浮动面板**（#model 设置面板、Dialog 对话框）。这些组件在桌面端可能以较小的宽度弹出（或窗口本身就窄），在移动端则要占满屏幕。通过同一个 @media 规则覆盖双端的窄屏场景，避免重复写 CSS。
+
+#### 2.2.3 Layer 3 — 横竖屏 JS 监听
+
+横竖屏监听完全由 **JS 驱动**，不触发 DOM 结构变化，只修改状态变量和少量 class：
+
+**监听点 1 — index.ts 的 orientation:portrait 监听**：
+```javascript
+window.matchMedia("(orientation:portrait)").addEventListener("change", () => {
+    updateCardHV();   // 卡片模式图标显隐
+    activeBlur();     // 方向变化时收起键盘
+});
+```
+
+`updateCardHV()` 实现（`app/src/card/util.ts`）：
+- 竖屏：移除 `.card__action .card__icon` 的 `fn__none` → 卡片操作图标正常显示
+- 横屏：添加 `fn__none` → 卡片操作图标全部隐藏（为 PDF/文档阅读留出更多横向空间）
+
+**监听点 2 — keyboardToolbar.ts 的 resize 监听**：
+```javascript
+window.addEventListener("resize", () => {
+    window.siyuan.mobile.size.isLandscape = matchMedia("(orientation: landscape)").matches;
+    if (isLandscape) {
+        if (!size.landscape) size.landscape = {height1, height2};
+        // 更新 landscape.height1/height2
+    } else {
+        if (!size.portrait) size.portrait = {height1, height2};
+        // 更新 portrait.height1/height2
+    }
+    // 高度差 -100px 判定键盘弹起/收起
+});
+```
+
+这里 `orientation: landscape` 的作用是**将键盘高度缓存分为两套**，因为横屏和竖屏的 `window.innerHeight` 基准完全不同。同一个"弹出键盘"动作，竖屏时视口减少 ~320px，横屏时可能只减少 ~180px（键盘更矮更宽）。如果不分两套缓存，方向切换后的键盘高度估算会完全失效。
+
+#### 2.2.4 三种响应式机制的对比总结
+
+| 维度 | Layer 1: 端间硬切换 | Layer 2: CSS @media 断点 | Layer 3: 横竖屏 JS 监听 |
+|------|-------------------|-------------------------|------------------------|
+| **切换粒度** | 桌面端 ↔ 移动端 | 端内视口宽度变化 | 屏幕方向变化 |
+| **实现机制** | 双 webpack 入口 + ifdef 宏 + 双 HTML 模板 | `@media (max-width: Npx)` CSS 规则 | `matchMedia("orientation")` + JS 状态/样式修改 |
+| **切换时机** | 构建发布时（一次性） | 运行时 viewport resize（纯 CSS） | 物理方向旋转/键盘弹起时 resize（JS 驱动） |
+| **改变范围** | DOM 根结构、包体内容、模块裁剪 | 特定组件的 CSS 属性（flex-direction / width / display） | 状态变量 + 少量 class（键盘缓存、卡片图标） |
+| **核心断点** | N/A（是/否移动端二选一） | 620px / 750px（业务）；535~1199px（第三方库） | portrait ↔ landscape（无中间态） |
+| **影响 superblock 列布局** | 间接（移动端才加载 `_mobile.scss` 中的 620px 规则） | **直接**：620px 时横列→竖排 | 无直接影响 |
+| **影响键盘工具栏** | 直接（工具栏只有移动端才有） | 无直接 CSS 影响 | **直接**：height1/height2 缓存分离 |
+| **桌面端可用** | N/A（属于桌面端侧） | 是（750px 断点桌面端窗口缩窄时也生效） | 否（`updateCardHV()` 被 `/// #if MOBILE` 包裹） |
+
 **相关代码：**
-- 侧栏/模型面板样式在 `app/src/assets/scss/main/_mobile.scss` 的 `.side-panel` 规则
-- 菜单全屏样式在 `app/src/assets/scss/component/_menu.scss` 的 `.b3-menu--fullscreen` 规则
-- `#menu` 专属偏移在 `app/src/assets/scss/main/_mobile.scss` 的 `#menu { transform: translateX(100vw); top: 0; }` 规则
+- 侧栏/模型面板样式：`app/src/assets/scss/main/_mobile.scss` `.side-panel` 规则
+- 菜单全屏样式：`app/src/assets/scss/component/_menu.scss` `.b3-menu--fullscreen` 规则
+- `#menu` 专属偏移：`app/src/assets/scss/main/_mobile.scss` `#menu { transform: translateX(100vw); top: 0; }`
+- superblock 620px 断点：`app/src/assets/scss/main/_mobile.scss` 第 510~518 行
+- superblock 默认列布局：`app/src/assets/scss/protyle/_wysiwyg.scss` 第 277~282 行
+- 750px 通用断点：`app/src/assets/scss/util/_responsive.scss` 全文
+- 卡片横竖屏切换：`app/src/card/util.ts` `updateCardHV()`
+- 键盘高度横竖屏分离缓存：`app/src/mobile/util/keyboardToolbar.ts` resize 监听
 
 ---
 
@@ -964,12 +1107,16 @@ touchend 触发
 
 ## 10. 总结
 
-SiYuan 移动端的设计在**工程可维护性**和**双端复用率**之间做出了明确取舍：
+SiYuan 移动端的设计在**工程可维护性**和**双端复用率**之间做出了明确取舍，其响应式体系呈现清晰的**三层叠加结构**：
 
 - **高复用：** Protyle 编辑器核心、菜单/对话框生成逻辑、设置配置项定义、Protyle 插件机制 100% 共用，保证功能一致性
 - **重适配：** UI 布局、手势交互、键盘处理、面板承载完全独立实现，以 `mobile/` 目录为适配层，通过条件编译和运行时检测与桌面端切割
 - **强耦合：** 手势、键盘、编辑器滚动、面板切换通过全局 `window.siyuan.mobile` 共享状态紧密协作，效率高但可测试性/可调试性较弱
-- **硬边界：** 双端入口级分离而非 CSS 响应式断点，避免了"一套布局适配所有设备"的复杂度，但也损失了折叠屏/平板形态下的中间态可能性
+- **三层响应式而非单一机制：**
+  - **Layer 1 端间硬切换（编译入口级）**：双 HTML 模板 + 双 JS/SCSS 入口 + ifdef 宏裁剪，实现桌面端/移动端包体级分离
+  - **Layer 2 局部 CSS @media 断点（组件级）**：620px 控制 superblock 横列→竖排（移动端独有）、750px 控制设置/历史/快捷键面板的窄屏适配（双端共用），以及 535~1199px 第三方库（PDF.js/Viewer.js）自带断点
+  - **Layer 3 横竖屏 JS 监听（状态级）**：`matchMedia("orientation")` 驱动键盘高度缓存分离（portrait/landscape 各存一套）和卡片图标显隐，不触发布局结构性变化
 - **非对称面板布局：** `#sidebar`（左侧，`side-panel`）与 `#menu`（右侧，`b3-menu--fullscreen`）使用不同的 CSS 类和隐藏方向（`-100vw` vs `+100vw`），手势处理代码需要针对两个面板分别计算 transform
+- **superblock 620px 断点是关键业务响应式**：用户在桌面端创建的多列并列 superblock，在移动端窄屏（<620px）时纯 CSS 自动变为上下堆叠，保证跨端内容可读性，此机制独立于端间硬切换，是"移动/桌面同内容不同展示"的核心手段
 
-对于后续迭代，**最值得投入的改进方向**是：将 `touch.ts` 中的模块级全局变量封装为 TouchState 类、引入 `requestAnimationFrame` 节流、统一 `#sidebar` 与 `#menu` 的 CSS 基类以减少手势代码中的分支、并建立"折叠屏/平板中间布局模式"以覆盖越来越多的混合形态设备。
+对于后续迭代，**最值得投入的改进方向**是：将 `touch.ts` 中的模块级全局变量封装为 TouchState 类、引入 `requestAnimationFrame` 节流、统一 `#sidebar` 与 `#menu` 的 CSS 基类以减少手势代码中的分支、建立"折叠屏/平板中间布局模式"以覆盖越来越多的混合形态设备，并探索将 620px/750px 断点整合为统一的设计 tokens（如 `--b3-breakpoint-xs: 620px` / `--b3-breakpoint-sm: 750px`）以便于响应式规则的一致性演进。
