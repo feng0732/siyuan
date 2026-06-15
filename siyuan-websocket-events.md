@@ -95,6 +95,25 @@ interface IWebSocketData {
 type TWS = "main" | "filetree" | "protyle" | "backlink" | "bookmark" | "graph" | "outline" | "tag"
 ```
 
+#### 八种连接类型定位差异
+
+| 类型 | 定位 | 实例数量 | 订阅范围 | 核心命令集 |
+|------|------|----------|----------|------------|
+| **main** | 全局主控通道 | 1/应用 | 全局事件、系统状态、进度通知 | 20+ 种：logoutAuth/setAppearance/reloadPlugin/progress/syncing/backgroundtask/rename/closeBox/... |
+| **filetree** | 文件树导航 | 1/应用（Dock） | 笔记本和文档树的增删改查 | reloadFiletree/moveDoc/mount/createnotebook/closeBox/removeBox/create/rename/... |
+| **protyle** | 编辑器通道 | N/应用（每个打开的文档） | 特定文档的编辑事务、重载指令 | transactions/reload/addLoading/unfoldHeading/readonly/heading2doc/rename/moveDoc/... |
+| **backlink** | 反链面板 | N/应用 | 反链关联文档的生命周期事件 | rename/closeBox/removeBox/removeDoc（仅判断自身存在性，无反链内容实时更新） |
+| **outline** | 大纲面板 | N/应用 | 大纲标题变更、文档保存 | savedoc(触发 onTransaction 更新大纲)/rename/closeBox/removeDoc |
+| **bookmark** | 书签面板 | 1/应用（Dock） | 书签属性变更、文档存在性 | transactions(检测 bookmark class)/closeBox/removeBox/removeDoc/mount |
+| **tag** | 标签面板 | 1/应用（Dock） | 标签属性变更、文档存在性 | transactions(检测 tag data-type)/closeBox/removeBox/removeDoc/mount |
+| **graph** | 图关系视图 | N/应用 | 图关联的文档/笔记本变更 | mount/rename/closeBox/removeBox/removeDoc |
+
+**订阅模式分类**：
+- **全局级**（1个实例）：main、filetree、bookmark、tag —— 全量接收该 type 的所有广播
+- **文档级**（N个实例，每文档一个）：protyle、outline、backlink、graph —— 通过 `blockId/rootId` 在前端过滤自身相关消息
+
+> **重要边界**：后端 `BroadcastByType` 是按 `type` 全量广播，**不做文档级过滤**。文档级过滤全部在前端 `msgCallback` 中通过 `if (this.blockId === data.data.id)` 等判断完成。这意味着打开 10 个文档时，每个 protyle 连接都会收到所有文档的 transactions 推送，大部分被前端丢弃。
+
 ---
 
 ## 3. 后端实现分析
@@ -333,33 +352,31 @@ public send(cmd: string, param: Record<string, unknown>, process = false) {
 #### 4.3.1 桌面端
 [index.ts](file:///d:/fz/0601/solo-dogfeeding/code/297-siyuan/app/src/index.ts#L69-L214)
 
+桌面端 main 连接处理 **20+ 种命令**，是所有连接中最复杂的：
+
+| 命令分类 | 具体命令 |
+|----------|----------|
+| 系统控制 | `logoutAuth`、`exit`、`readonly`、`setConf`、`setPublish` |
+| 外观主题 | `setAppearance`、`setSnippet`、`refreshtheme` |
+| 插件扩展 | `reloadPlugin`、`reloadEmojiConf` |
+| 文档操作 | `reloaddoc`、`rename`、`closeBox`、`removeBox`、`removeDoc`、`openFileById` |
+| 进度状态 | `progress`、`statusbar`、`downloadProgress`、`txerr`、`backgroundtask` |
+| 同步相关 | `syncing`、`syncMergeResult` |
+| 引用/标签 | `setRefDynamicText`、`setDefRefCount`、`reloadTag` |
+| 存储 | `setLocalStorageVal`、`setLocalShorthandCount` (浏览器) |
+
 ```typescript
 ws: new Model({
     app: this,
     id: genUUID(),
     type: "main",
     msgCallback: (data) => {
-        // 1. 插件事件总线广播
+        // 1. 插件事件总线广播（所有插件都能收到 main 消息）
         this.plugins.forEach((plugin) => {
             plugin.eventBus.emit("ws-main", data);
         });
         // 2. 内置命令分发 switch-case
-        switch (data.cmd) {
-            case "logoutAuth":         redirectToCheckAuth();
-            case "setAppearance":      updateAppearance(data.data);
-            case "reloadPlugin":       reloadPlugin(this, data.data);
-            case "reloaddoc":          reloadSync(...);
-            case "progress":           progressLoading(data);
-            case "statusbar":          progressStatus(data);
-            case "downloadProgress":   downloadProgress(data.data);
-            case "txerr":              transactionError(data.msg);
-            case "syncing":            processSync(data, this.plugins);
-            case "backgroundtask":     progressBackgroundTask(data.data.tasks);
-            case "rename":             遍历 Tab 更新标题;
-            case "closeBox":           遍历 Tab 关闭笔记本;
-            case "removeDoc":          遍历 Tab 关闭文档;
-            // ... 共 20+ 种命令
-        }
+        switch (data.cmd) { /* 20+ 种 */ }
     }
 })
 ```
@@ -370,6 +387,8 @@ ws: new Model({
 移动端主连接只做两件事：
 1. 插件 `ws-main` 事件广播
 2. 调用 `onMessage(this, data)`（移动端专用消息处理器）
+
+移动端没有桌面端完整的 Tab 系统，因此 `rename`/`closeBox`/`removeDoc` 等命令由 `onMessage` 统一适配。
 
 ### 4.4 编辑器连接 protyle
 
@@ -445,11 +464,92 @@ super({
 });
 ```
 
+### 4.6 各订阅端处理差异汇总
+
+#### 4.6.1 命令覆盖度对比
+
+| 命令 | main | protyle | filetree | backlink | outline | bookmark | tag | graph |
+|------|:----:|:-------:|:--------:|:--------:|:-------:|:--------:|:---:|:-----:|
+| transactions | ✗ | ✓ 核心 | ✗ | ✗ | ✓ (savedoc触发) | ✓ 检测属性 | ✓ 检测标签 | ✗ |
+| reload | ✗ | ✓ (rootID过滤) | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| rename | ✓ (遍历Tab) | ✓ (path匹配) | ✓ | ✓ (rootID过滤) | ✓ | ✗ | ✗ | ✓ (box+rootID) |
+| closeBox/removeBox | ✓ (遍历Tab) | ✓ | ✓ | ✓ (local型) | ✓ | ✓ 整体刷新 | ✓ 整体刷新 | ✓ |
+| removeDoc | ✓ (遍历Tab) | ✓ | ✓ | ✓ (local型) | ✓ | ✓ 整体刷新 | ✓ 整体刷新 | ✓ (local型) |
+| mount | ✗ | ✗ | ✓ | ✗ | ✗ | ✓ (code=1时跳过) | ✓ (code=1时跳过) | ✓ (global型) |
+| progress/statusbar | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| readonly | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| reloadui | 全局(预处理) | - | - | - | - | - | - | - |
+
+#### 4.6.2 文档级订阅的过滤模式差异
+
+后端统一按 type 广播，前端各订阅端有三种过滤策略：
+
+1. **全量消费**（bookmark、tag、filetree）：
+   - 收到命令后直接触发 `this.update()` 整体刷新
+   - 实现简单但性能较差，每次变更都全量重渲染
+
+2. **ID 匹配消费**（prototype、backlink、outline、graph - local型）：
+   ```typescript
+   if (data.data === this.protyle.block.rootID) { reloadProtyle(...) }  // protyle
+   if (data.data.ids.includes(this.rootId) && this.type === "local") {  // backlink
+       this.parent.parent.removeTab(this.parent.id);
+   }
+   ```
+   - 精确匹配自身关注的文档 ID，不匹配直接丢弃
+   - 消息流量浪费：10 个文档时每条推送被 9 个连接丢弃
+
+3. **全局无过滤**（main）：
+   - 所有消息都处理
+   - 通过遍历所有 Tab 来找到受影响的实例
+
+### 4.7 移动端主动保活机制
+
+#### 4.7.1 reconnectWebSocket 全局函数
+[mobile/index.ts](file:///d:/fz/0601/solo-dogfeeding/code/297-siyuan/app/src/mobile/index.ts#L214-L220)
+
+移动端特有、桌面端没有的主动保活机制（Issue #8441）：
+
+```typescript
+window.reconnectWebSocket = () => {
+    window.siyuan.ws.send("ping", {});                  // main 连接
+    window.siyuan.mobile.docks.file.send("ping", {});   // filetree 连接
+    window.siyuan.mobile.editor.protyle.ws.send("ping", {});  // 当前编辑器
+    window.siyuan.mobile.popEditor?.protyle.ws.send("ping", {});  // 弹窗编辑器
+};
+```
+
+**特点**：
+- 不是真正的"重连"，而是向所有活跃连接发送 `ping` 命令
+- 由原生 App 层定期调用（通常是应用从后台切回前台时）
+- 目的：**探测连接是否存活** + **触发 NAT/防火墙的会话保活**
+- 若连接已断开，`send()` 会抛出异常并触发 `onerror`/`onclose`，进而启动自动重连
+
+#### 4.7.2 后端 ping 命令
+[ping.go](file:///d:/fz/0601/solo-dogfeeding/code/297-siyuan/kernel/cmd/ping.go#L19-L32)
+
+后端的 `ping` 命令是空操作：
+```go
+func (cmd *ping) Exec() {
+    // 空实现，仅用于保活和连接探测
+}
+func (cmd *ping) IsRead() bool {
+    return true
+}
+```
+
+- `IsRead() = true`：只读命令，不受只读模式限制
+- 无返回值，不产生任何推送
+- 本质上是**客户端→服务端的单向心跳**，服务端不回复 pong
+
+> **注意**：无自动定时器。ping 仅在移动端切前台等特定时机被动触发，桌面端完全没有应用层心跳。这是连接假死风险的核心来源。
+
 ---
 
 ## 5. 完整流程追踪（以编辑事务为例）
 
-这是最典型也最复杂的实时事件链路：
+这是最典型也最复杂的实时事件链路。
+
+### 5.1 总览流程
 
 ```
 用户输入文字
@@ -500,15 +600,195 @@ super({
 用户看到实时更新
 ```
 
-**消息顺序保证**：
-1. HTTP 请求层面由 `model.ControlConcurrency` 中间件保证 **串行化**执行
-2. 同一事务的 `WaitForCommit()` 确保文件 IO 完成才推送
-3. 前端 `transactionsTimeout` 防抖确保批量提交的顺序性
-4. WebSocket 层使用 TCP 保证消息按发送顺序到达
+### 5.2 前端防抖合并详细时序
+
+[transaction.ts](file:///d:/fz/0601/solo-dogfeeding/code/297-siyuan/app/src/protyle/wysiwyg/transaction.ts#L1364-L1460)
+
+#### 5.2.1 防抖合并条件
+
+```typescript
+const TIMEOUT_INPUT = 256;  // Constants.TIMEOUT_INPUT = 256ms
+
+let needDebounce = false;
+if (lastTransaction && 
+    lastTransaction.doOperations.length === 1 && 
+    lastTransaction.doOperations[0].action === "update" &&
+    doOperations.length === 1 && 
+    doOperations[0].action === "update" &&
+    lastTransaction.doOperations[0].id === doOperations[0].id &&
+    protyle.transactionTime - time < Constants.TIMEOUT_INPUT) {
+    needDebounce = true;
+}
+```
+
+**5 个条件必须同时满足**才能合并：
+1. 上一个事务存在
+2. 上一个事务只有 1 个 operation 且是 `update` 类型
+3. 当前事务也只有 1 个 operation 且是 `update` 类型
+4. 两次操作的 **块 ID 相同**（同一块连续编辑）
+5. 时间间隔 < 256ms
+
+满足条件时，**原地替换** `window.siyuan.transactions` 数组中最后一个元素的 `doOperations`，不新增条目。
+
+#### 5.2.2 防抖提交流程
+
+```
+t=0ms   用户输入字符 'a'
+        → transaction() 被调用
+        → lastTransaction 不存在，needDebounce=false
+        → transactions.push({doOperations: [{action:'update', id:'xxx', data:'a'}]})
+        → protyle.transactionTime = time
+        → transactionsTimeout = setTimeout(promiseTransaction, 512ms)
+        (注意: TIMEOUT_INPUT * 2 = 512ms，不是 256ms!)
+
+t=100ms 用户输入字符 'b'
+        → transaction() 被调用
+        → 5个条件都满足，needDebounce=true
+        → 原地替换：transactions[last].doOperations = [{action:'update', id:'xxx', data:'ab'}]
+        → protyle.transactionTime = time
+        → clearTimeout(transactionsTimeout)
+        → transactionsTimeout = setTimeout(promiseTransaction, 512ms)
+        (防抖重置：再等 512ms)
+
+t=612ms 定时器触发
+        → promiseTransaction() 执行
+        → 取出 transactions[0] 发送 HTTP 请求
+        → transactions.splice(0, 1)
+```
+
+**关键点**：
+- 防抖窗口是 **TIMEOUT_INPUT * 2 = 512ms**，不是 256ms
+- 每次输入都重置定时器（典型的 debounce trailing 模式）
+- `transactions` 数组是 **FIFO 队列**，`promiseTransaction` 按顺序逐个提交
+
+#### 5.2.3 promiseTransaction 串行提交
+
+[transaction.ts](file:///d:/fz/0601/solo-dogfeeding/code/297-siyuan/app/src/protyle/wysiwyg/transaction.ts#L64-L140)
+
+```typescript
+const promiseTransaction = () => {
+    if (window.siyuan.transactions.length === 0) return;
+    
+    // 取出队首事务
+    const protyle = window.siyuan.transactions[0].protyle;
+    const doOperations = window.siyuan.transactions[0].doOperations;
+    
+    // 立即从队列中移除（不等 HTTP 返回）
+    // 重要：不能放入回调中，否则防抖合并会出问题
+    window.siyuan.transactions.splice(0, 1);
+    
+    fetchPost("/api/transactions", { ... }, (response) => {
+        // 回调中如果队列还有事务，继续提交下一个
+        if (window.siyuan.transactions.length === 0) {
+            countBlockWord([], protyle.block.rootID, true);
+        } else {
+            promiseTransaction();  // 递归调用，串行提交
+        }
+        
+        // 本地 DOM 优化处理（fold/update/delete/append 等）
+        response.data[0].doOperations.forEach(...);
+    });
+};
+```
+
+**串行保证**：
+- 同一时间只有一个 HTTP 请求在途
+- 当前请求返回后才发送下一个
+- 队列中积压的事务依次顺序提交
+
+#### 5.2.4 旁路：直接提交（不防抖）
+
+以下操作 **跳过防抖**，直接发送 HTTP 请求：
+
+```typescript
+// 折叠、属性视图设置等操作需要即时响应
+if (doOperations.length === 1 && (
+    doOperations[0].action === "unfoldHeading" || 
+    doOperations[0].action === "setAttrViewBlockView" ||
+    (doOperations[0].action === "setAttrs" && doOperations[0].data.startsWith('{"fold":'))
+) || (doOperations.length === 2 && doOperations[0].action === "insertAttrViewBlock")) {
+    protyle.transactionTime = time + Constants.TIMEOUT_INPUT * 2;  // 阻止合并
+    fetchPost("/api/transactions", ...);
+    return;
+}
+```
+
+### 5.3 后端串行化保证
+
+#### 5.3.1 ControlConcurrency 中间件
+
+[session.go](file:///d:/fz/0601/solo-dogfeeding/code/297-siyuan/kernel/model/session.go#L456-L507)
+
+```go
+func ControlConcurrency(c *gin.Context) {
+    // WebSocket 升级请求不控制
+    if websocket.IsWebSocketUpgrade(c.Request) {
+        c.Next()
+        return
+    }
+    
+    // 静态资源、读接口直接放行
+    if strings.HasPrefix(reqPath, "/stage/") || ... ||
+       strings.HasPrefix(function, "get") || strings.HasPrefix(function, "list") ||
+       strings.HasPrefix(function, "search") || strings.HasPrefix(function, "render") {
+        c.Next()
+        return
+    }
+    
+    // 写接口：按路径粒度加锁
+    requestingLock.Lock()
+    mutex := requesting[reqPath]
+    if nil == mutex {
+        mutex = &sync.Mutex{}
+        requesting[reqPath] = mutex
+    }
+    requestingLock.Unlock()
+    
+    mutex.Lock()       // 同一 API 路径串行执行
+    defer mutex.Unlock()
+    c.Next()
+}
+```
+
+**锁粒度**：**按 API 路径（reqPath）** 加互斥锁，不是全局锁。
+
+- `/api/transactions` 是同一个路径，所以所有事务请求串行执行
+- 不同 API 路径（如 `/api/filetree/createDoc` 和 `/api/transactions`）可以并行
+- 读接口（get/list/search/render 开头）完全不加锁
+
+#### 5.3.2 事务内顺序保证
+
+[transaction.go](file:///d:/fz/0601/solo-dogfeeding/code/297-siyuan/kernel/api/transaction.go#L94-L124)
+
+```go
+func pushTransactions(app, session string, transactions []*model.Transaction) {
+    model.FlushTxQueue()   // 刷新文件写入队列
+    tx.WaitForCommit()     // 等待事务提交完成
+    
+    // 然后才推送
+    util.PushEvent(evt)
+}
+```
+
+- `FlushTxQueue()`：确保文件系统写入完成
+- `WaitForCommit()`：确保所有事务操作提交完毕
+- 推送发生在**所有持久化完成之后**，避免推送了但文件没写入的竞态
+
+### 5.4 消息顺序的多层保证总结
+
+| 层级 | 机制 | 保证范围 |
+|------|------|----------|
+| 前端防抖层 | `transactions` FIFO 队列 + `promiseTransaction` 串行递归 | 同一编辑器的操作按顺序提交 |
+| HTTP 传输层 | TCP 保证顺序 | 单个请求内的字节流顺序 |
+| 后端中间件 | `ControlConcurrency` 按 API 路径加锁 | `/api/transactions` 的所有请求串行执行 |
+| 事务层 | `WaitForCommit` + `FlushTxQueue` | 推送发生在持久化之后 |
+| WebSocket 层 | TCP 保证顺序 + melody 单连接串行 Write | 单个连接内消息按发送顺序到达 |
+
+> **仍有的漏洞**：不同 type 的连接之间（如 main 和 protyle）没有全局顺序保证。比如 `rename` 先到 main 再到 protyle 是常见情况，但因为是不同连接，顺序不保证。
 
 ---
 
-## 6. 连接生命周期管理
+## 6. 连接生命周期与断线恢复
 
 ### 6.1 完整生命周期状态图
 
@@ -536,15 +816,95 @@ super({
          ▼                   │
       onclose ◄──────────────┘
          │
-         ├─ reason 含 "unauthenticated"  ──► 停止
-         ├─ reason 含 "close websocket"  ──► 停止（正常关闭）
+         ├─ reason 含 "unauthenticated"  ──► 永久停止（鉴权失败）
+         ├─ reason 含 "close websocket"  ──► 永久停止（正常主动关闭）
          └─ 其他原因                           │
                │ 3000ms setTimeout             │
                └──────► connect() 重连 ◄──────┘
                          （新 WebSocket 对象）
 ```
 
-### 6.2 主动关闭流程
+### 6.2 重连触发边界
+
+[Model.ts](file:///d:/fz/0601/solo-dogfeeding/code/297-siyuan/app/src/layout/Model.ts#L65-L85)
+
+**不重连的两种情况**：
+```typescript
+if (0 <= ev.reason.indexOf("unauthenticated")) {
+    return;  // 鉴权失败，不重连
+}
+if (0 > ev.reason.indexOf("close websocket")) {
+    // 原因中不包含 "close websocket" → 异常关闭 → 重连
+    setTimeout(() => { this.connect(...) }, 3000);
+}
+// 原因中包含 "close websocket" → 主动正常关闭 → 不重连
+```
+
+**重连判定边界**：
+- ✅ **自动重连**：网络断开、超时、服务器重启、NAT 会话过期
+- ❌ **不重连**：鉴权失败（unauthenticated）、主动关闭（close websocket）
+- ⚠️ **灰区**：`onerror` 不直接触发重连，但错误通常会导致 `onclose`，由 onclose 逻辑决定
+
+### 6.3 重连恢复的边界与局限
+
+#### 6.3.1 重连后的恢复动作
+
+[Model.ts](file:///d:/fz/0601/solo-dogfeeding/code/297-siyuan/app/src/layout/Model.ts#L41-L56)
+
+```typescript
+ws.onopen = () => {
+    if (options.callback) {
+        options.callback.call(this);
+    }
+    // 如果有 errorLog 对话框（内核中断后产生）
+    const logElement = document.getElementById("errorLog");
+    if (logElement) {
+        reloadSync(this.app, {upsertRootIDs: [], removeRootIDs: []});
+        // 关闭错误对话框
+        window.siyuan.dialogs.find(item => { ... }).destroy();
+    }
+};
+```
+
+**恢复动作仅在有 errorLog 对话框时触发**：
+- `reloadSync()` 重新同步文档数据
+- 关闭错误对话框
+
+**正常重连（无 errorLog）时**：仅调用 `callback()`，**没有任何数据同步动作**。
+
+> 这意味着：大多数情况下的短时间断开重连，重连期间丢失的推送消息**不会被补偿**，UI 可能处于陈旧状态。
+
+#### 6.3.2 消息延迟消费边界
+
+[Model.ts](file:///d:/fz/0601/solo-dogfeeding/code/297-siyuan/app/src/layout/Model.ts#L57-L64)
+
+```typescript
+ws.onmessage = (event) => {
+    if (options.msgCallback &&
+        // 等待 config 加载完成才接受推送
+        window.siyuan.config) {
+        const data = processMessage(JSON.parse(event.data));
+        options.msgCallback.call(this, data);
+    }
+};
+```
+
+**消息丢弃条件**：`window.siyuan.config` 未加载时，所有消息直接丢弃。
+
+对应 Issue #17508：应用启动初期 WebSocket 可能先于配置建立，此时消息会被丢弃，等待配置加载完成后才开始消费。
+
+#### 6.3.3 重连期间丢失的消息类型
+
+| 消息类型 | 丢失后的影响 | 是否有恢复机制 |
+|----------|-------------|---------------|
+| transactions | 编辑器内容与后端不一致 | ❌ 无（只能靠 reloadSync 全量同步当前打开的文档） |
+| rename | Tab 标题、面包屑陈旧 | ❌ 无 |
+| closeBox/removeDoc | 已删除的文档仍显示在 Tab 中 | ❌ 无（用户点击时才会发现不存在） |
+| progress/statusbar | 进度条状态错误 | ❌ 无（瞬时状态，丢失就丢失了） |
+| msg/cmsg | 通知消息丢失 | ❌ 无（瞬时消息） |
+| reloadui | UI 未刷新 | ❌ 无（下一次操作会触发） |
+
+### 6.4 主动关闭流程
 
 1. **前端销毁 Protyle**：[destroy.ts](file:///d:/fz/0601/solo-dogfeeding/code/297-siyuan/app/src/protyle/util/destroy.ts#L26-L29)
    ```typescript
@@ -562,7 +922,7 @@ super({
 
 3. **HandleDisconnect 回调**：`util.RemovePushChan(s)` 清理 sessions Map
 
-### 6.3 发布服务特殊关闭
+### 6.5 发布服务特殊关闭
 
 [websocket.go](file:///d:/fz/0601/solo-dogfeeding/code/297-siyuan/kernel/util/websocket.go#L509-L550) 中的 `ClosePublishServiceSessions`：
 
@@ -571,6 +931,38 @@ super({
 3. `time.Sleep(500ms)` 等待消息发送 + 客户端页面刷新准备
 4. 用 `"  close websocket: publish service closed"` 作为关闭消息，客户端停止重连
 5. 调用 `RemovePushChan` 清理
+
+### 6.6 多连接订阅的边界条件
+
+#### 6.6.1 连接创建的时机
+
+| 连接类型 | 创建时机 | 销毁时机 |
+|----------|----------|----------|
+| main | App 构造时（应用启动） | 应用关闭 |
+| filetree | Dock Files 初始化时 | 应用关闭（Dock 不销毁） |
+| bookmark | Dock Bookmark 初始化时 | 应用关闭 |
+| tag | Dock Tag 初始化时 | 应用关闭 |
+| protyle | Protyle 实例化时（打开文档） | Protyle destroy 时（关闭文档） |
+| outline | Outline Tab 打开时 | Tab 关闭时 |
+| backlink | Backlink Tab 打开时 | Tab 关闭时 |
+| graph | Graph Tab 打开时 | Tab 关闭时 |
+
+#### 6.6.2 连接隔离性
+
+- **每个连接独立鉴权**：各自在 URL 中携带 app/id/type，后端分别注册到 sessions Map
+- **每个连接独立生命周期**：一个连接断开不影响其他连接
+- **每个连接独立重连**：各连接的 onclose 独立触发 3 秒重连定时器，不同步
+
+#### 6.6.3 消息重复与竞态边界
+
+**同一事件多次投递**：
+- 一个 `rename` 事件会同时推送给 main、prototype、filetree、outline、backlink、graph 等多种 type
+- 前端不同模块独立处理，可能产生重复的 UI 更新（如标题更新同时被 main 和 protyle 处理）
+
+**跨连接顺序不一致**：
+- 后端 `BroadcastByType` 按 type 分别遍历发送
+- 不同 type 的连接是不同的 TCP 连接，到达顺序无保证
+- 例如：`transactions`（推给 protyle）和 `savedoc`（推给 outline）之间没有全局顺序
 
 ---
 
@@ -634,20 +1026,26 @@ super({
 
 ## 9. 潜在风险点
 
-| 风险类别 | 具体描述 | 影响范围 | 建议 |
-|----------|----------|----------|------|
-| **连接风暴** | 每个编辑器建立独立 WS 连接，打开 30+ Tab 时连接数剧增；重连时同时建立大量连接 | 内存、文件描述符耗尽 | 考虑多路复用（单一连接，消息路由时增加 type 字段判断） |
-| **消息顺序** | 重连期间丢失的推送不会重放；`reloadSync` 仅部分恢复；多个 HTTP 请求并发（尽管 ControlConcurrency 已大部分避免） | 数据不一致/UI 陈旧 | 增加消息序号，重连后 catch-up 拉取缺失事件 |
-| **内存泄漏** | sessions sync.Map 中若 HandleDisconnect 未及时触发（网络异常无 TCP FIN），僵尸连接堆积；BroadcastChannels 未正确清理 | 内存缓慢增长 | 增加心跳超时检测，周期性清理无响应 session |
-| **广播放大** | `Broadcast(msg)` 全量遍历 sessions → N² 复杂度，高并发时 CPU 飙升 | 延迟、CPU 占用 | 按 type 建立索引 Map（`map[type][]session`），避免全量遍历 |
-| **消息大小** | 事务推送包含完整 `doOperations`，大块文档编辑时单条消息可达数 MB，超出 melody 的 8MB MaxMessageSize（上行），下行不受限但带宽压力大 | 推送失败、丢包 | 增量 diff 传输；大事务拆分为多次推送 |
-| **重连数据同步** | `reloadSync` 仅执行 upsert/remove rootIDs，重连期间的非事务消息（statusbar/msg/progress）永久丢失 | UI 状态不一致 | 消息持久化 + 重放机制；按时间戳拉取近期事件队列 |
-| **权限绕过** | WebSocket 鉴权仅在 HandleConnect 时执行，长连接期间权限变更（角色降级/注销）不会失效 | 已降级用户仍能接收推送 | 敏感推送增加二次校验；支持服务端主动踢人下线 |
-| **鉴权重连** | reason 含 "unauthenticated" 时不重连，但 Cookie 过期后页面刷新才能重新登录 | 用户体验差 | 检测到 unauthenticated 时自动跳转 `/check-auth` 页面 |
-| **ping/pong 缺失** | melody 有 Pong 回调但无应用层心跳；仅前端 `reconnectWebSocket` 全局函数手动发送 ping，无定时器自动执行 | 连接假死（NAT/防火墙丢弃空闲连接） | 应用层 30s 定时 ping/pong，超时主动关闭触发重连 |
-| **发布服务竞态** | `ClosePublishServiceSessions` 中 `time.Sleep(500ms)` 是硬编码等待，高负载下消息可能未发出就关闭连接 | 部分客户端收不到关闭通知 | 使用 Write 回调 + WaitGroup 替代 sleep |
-| **transactionsTimeout** | 256ms 防抖期间若 WebSocket 断开，本地事务未提交但可能已有推送基于旧状态 | 数据丢失 | 提交失败时事务回滚 + 本地重做队列 |
-| **BroadcastByType 原子性** | 遍历 sync.Map 过程中若新 session 加入/离开，遍历快照可能不包含该 session | 消息漏发/重复 | 使用不可变快照 + 版本号确认 |
+| # | 风险类别 | 具体描述 | 影响范围 | 严重程度 | 建议 |
+|---|----------|----------|----------|----------|------|
+| 1 | **连接风暴** | 每个编辑器建立独立 WS 连接，打开 30+ Tab 时连接数剧增；重连时同时建立大量连接 | 内存、文件描述符耗尽 | 高 | 考虑多路复用（单一连接，消息路由时增加 type 字段判断） |
+| 2 | **消息顺序 - 跨连接** | 不同 type 的连接之间（main/protyle/filetree）没有全局顺序保证，同一事件多端推送可能乱序到达 | UI 状态不一致、闪烁 | 中 | 增加全局单调递增序号，前端按序号排队消费 |
+| 3 | **消息顺序 - 重连丢失** | 重连期间丢失的推送不会重放；`reloadSync` 仅部分恢复；多个 HTTP 请求并发（尽管 ControlConcurrency 已大部分避免） | 数据不一致/UI 陈旧 | 高 | 增加消息序号，重连后 catch-up 拉取缺失事件 |
+| 4 | **内存泄漏 - 僵尸连接** | sessions sync.Map 中若 HandleDisconnect 未及时触发（网络异常无 TCP FIN），僵尸连接堆积；BroadcastChannels 未正确清理 | 内存缓慢增长 | 中 | 增加心跳超时检测，周期性清理无响应 session |
+| 5 | **广播放大 - 全量遍历** | `BroadcastByType` 每次都全量遍历所有 app 的所有 session，O(N) 复杂度，高并发时 CPU 飙升 | 延迟、CPU 占用 | 中 | 按 type 建立索引 Map（`map[type][]session`），避免全量遍历 |
+| 6 | **广播放大 - 文档级浪费** | 后端按 type 全量广播，前端 90%+ 消息因 ID 不匹配被丢弃（打开 10 个文档时 protyle 连接浪费 90% 流量） | 带宽、前端 CPU | 中 | 后端支持按文档 ID 订阅（如 `/ws?type=protyle&rootId=xxx`） |
+| 7 | **消息大小** | 事务推送包含完整 `doOperations`，大块文档编辑时单条消息可达数 MB，超出 melody 的 8MB MaxMessageSize（上行），下行不受限但带宽压力大 | 推送失败、丢包 | 中 | 增量 diff 传输；大事务拆分为多次推送 |
+| 8 | **重连数据同步不足** | 正常重连（无 errorLog 对话框）时不触发 `reloadSync`，重连期间丢失的所有消息永久丢失 | UI 状态不一致 | 高 | 重连成功后统一触发全量同步；或引入事件溯源重放 |
+| 9 | **启动期消息丢弃** | `window.siyuan.config` 未加载时，所有 WebSocket 消息直接丢弃（Issue #17508） | 初始化状态不一致 | 低 | 消息缓存队列，config 加载后重放缓存消息 |
+| 10 | **权限绕过** | WebSocket 鉴权仅在 HandleConnect 时执行，长连接期间权限变更（角色降级/注销）不会失效 | 已降级用户仍能接收推送 | 中 | 敏感推送增加二次校验；支持服务端主动踢人下线 |
+| 11 | **鉴权重连体验差** | reason 含 "unauthenticated" 时不重连，但 Cookie 过期后页面刷新才能重新登录 | 用户体验差 | 低 | 检测到 unauthenticated 时自动跳转 `/check-auth` 页面 |
+| 12 | **心跳缺失 - 桌面端** | 桌面端完全没有应用层心跳，NAT/防火墙空闲超时会导致连接假死，只有用户操作触发 send 时才发现断开 | 连接假死、消息延迟 | 高 | 应用层 30s 定时 ping/pong，超时主动关闭触发重连 |
+| 13 | **心跳缺失 - 移动端** | 移动端仅被动触发 `reconnectWebSocket`（切前台时），无后台定时器；ping 是单向的，服务端不回复 pong | 后台时连接易断 | 中 | 增加定时 ping 定时器；服务端回复 pong 用于 RTT 计算 |
+| 14 | **发布服务竞态** | `ClosePublishServiceSessions` 中 `time.Sleep(500ms)` 是硬编码等待，高负载下消息可能未发出就关闭连接 | 部分客户端收不到关闭通知 | 低 | 使用 Write 回调 + WaitGroup 替代 sleep |
+| 15 | **事务防抖竞态** | 512ms 防抖期间若 WebSocket 断开，本地事务未提交但可能已有推送基于旧状态；`transactions` 队列在页面刷新时丢失 | 数据丢失 | 中 | 提交失败时事务回滚 + 本地重做队列；localStorage 持久化待提交事务 |
+| 16 | **BroadcastByType 原子性** | 遍历 sync.Map 过程中若新 session 加入/离开，遍历快照可能不包含该 session | 消息漏发/重复 | 低 | 使用不可变快照 + 版本号确认 |
+| 17 | **ControlConcurrency 死锁风险** | 按 API 路径粒度加锁，若处理函数内部调用另一个加锁 API（嵌套请求）会产生死锁 | 服务挂起 | 低 | 增加可重入检测；或明确禁止嵌套写请求 |
+| 18 | **多连接重复 UI 更新** | 同一事件（如 rename）同时推送给多个 type，前端多模块独立处理，可能产生重复渲染/闪烁 | UI 体验差 | 低 | 事件去重；或统一事件总线再分发 |
 
 ---
 
@@ -658,75 +1056,113 @@ super({
 1. **连接多路复用（Multiplexing）**：
    - 单一 WebSocket 连接承载所有 type 的消息，通过消息头增加 `targetTypes: ["main", "protyle:xxx"]` 字段路由
    - 预期收益：连接数减少 70%+，降低服务端和浏览器资源消耗
+   - 特别利好移动端，减少蜂窝网络下的连接开销
 
-2. **事件溯源（Event Sourcing）**：
-   - 建立事件日志（Append-Only Log），每条消息分配单调递增序号
+2. **后端按文档 ID 订阅**：
+   - 目前 protyle/outline/backlink 等文档级连接的消息 90%+ 被前端丢弃
+   - 研究支持 `rootId` 参数的订阅：`/ws?type=protyle&rootId=xxx`
+   - 后端按 rootId 建立索引，只推送相关文档的事务
+
+3. **事件溯源（Event Sourcing）**：
+   - 建立事件日志（Append-Only Log），每条消息分配单调递增全局序号
    - 重连时携带 `lastSeenSeq`，服务端按序号重放缺失事件
-   - 解决重连期间事件丢失问题
+   - 彻底解决重连期间事件丢失问题
 
-3. **增量事务传输**：
+4. **增量事务传输**：
    - 目前 transactions 推送包含完整 `doOperations` 数组
    - 研究基于 CRDT 的增量同步，或基于 OT（Operational Transform）的操作变换
    - 对多人实时协作至关重要
 
-4. **消息优先级队列**：
-   - 按重要性分级：`transactions`/`reloadui` 高优先级，`statusbar`/`progress` 低优先级
-   - 高负载时低优先级消息可合并或丢弃
+5. **统一事件总线**：
+   - 目前同一事件（如 rename）被分别推送到多个 type，前端多模块独立处理
+   - 建立全局事件总线，消息一次到达后分发给各订阅者
+   - 减少重复解析和重复渲染
 
 ### 10.2 可靠性增强方向
 
-5. **应用层心跳 + 连接健康度监控**：
+6. **应用层心跳 + 连接健康度监控**：
    - 前后端双向 30s ping/pong（非 TCP level，而是业务层命令）
+   - 服务端回复 pong 携带时间戳，用于计算 RTT
    - 连续 3 次无响应判定为死链，主动关闭 + 重连
-   - 导出 Prometheus 指标：连接数、消息速率、平均延迟
+   - 导出指标：连接数、消息速率、平均延迟、重连次数
 
-6. **背压（Backpressure）机制**：
+7. **重连数据补偿机制**：
+   - 重连成功后统一触发 `reloadSync`，而不仅是有 errorLog 时才触发
+   - 对非事务类消息（statusbar/progress）：丢失即丢失，不必补偿
+   - 对状态类消息（rename/closeBox/removeDoc）：通过全量同步补偿
+
+8. **背压（Backpressure）机制**：
    - 前端处理缓慢（长时间事务渲染）时通知后端降低推送频率
-   - 服务端发送缓冲区水位监控，超过阈值时触发 `BroadcastByType` 合并推送
+   - 服务端发送缓冲区水位监控，超过阈值时触发合并推送
 
-7. **消息持久化 + 离线补偿**：
+9. **消息持久化 + 离线补偿**：
    - 关键事件（文档创建/删除/重命名）写入 SQLite 事件表
    - 浏览器恢复网络时按时间窗口补齐
 
 ### 10.3 安全增强方向
 
-8. **消息签名/防篡改**：
-   - 敏感命令（如 `closeBox`/`removeDoc`）增加 HMAC 签名校验
-   - 防止 XSS 成功后伪造 WebSocket 消息执行破坏性操作
+10. **消息签名/防篡改**：
+    - 敏感命令（如 `closeBox`/`removeDoc`）增加 HMAC 签名校验
+    - 防止 XSS 成功后伪造 WebSocket 消息执行破坏性操作
 
-9. **会话绑定与踢人**：
-   - WebSocket 绑定 JWT 的 sessionId，JWT 失效时主动断开对应连接
-   - 用户修改密码/注销账号时遍历 sessions Map 踢掉所有关联连接
+11. **会话绑定与踢人**：
+    - WebSocket 绑定 JWT 的 sessionId，JWT 失效时主动断开对应连接
+    - 用户修改密码/注销账号时遍历 sessions Map 踢掉所有关联连接
 
 ### 10.4 可观测性方向
 
-10. **链路追踪**：
+12. **链路追踪**：
     - 请求入站时生成 TraceId，通过 HTTP Header → 事务 → WebSocket 消息 → 前端全链路透传
     - 便于排查 "用户 A 的修改为什么用户 B 没看到" 类问题
 
-11. **前端 WebSocket DevTools**：
+13. **前端 WebSocket DevTools**：
     - 开发模式下可视化展示：连接状态、消息队列、推送 cmd 统计、重连次数、平均延迟
     - 辅助插件开发者调试
+
+### 10.5 移动端专项优化
+
+14. **移动端后台连接管理**：
+    - 应用退到后台时主动维持一个最低限度的连接（仅 main）
+    - 关闭 protyle/filetree 等非关键连接，节省电量和流量
+    - 切回前台时批量恢复连接 + 同步数据
+
+15. **弱网适应**：
+    - 2G/3G 弱网下降低事务推送频率，合并为更大的批量
+    - 增加消息超时重传机制
 
 ---
 
 ## 11. 关键文件索引
 
+### 11.1 后端核心文件
+
 | 模块 | 文件 | 关键职责 |
 |------|------|----------|
-| 后端服务入口 | [serve.go](file:///d:/fz/0601/solo-dogfeeding/code/297-siyuan/kernel/server/serve.go#L697-L851) | WebSocket 服务器初始化、鉴权、消息接收、命令分发 |
-| 后端连接管理 | [websocket.go](file:///d:/fz/0601/solo-dogfeeding/code/297-siyuan/kernel/util/websocket.go) | 会话注册/注销、多种广播策略、30+ 种推送函数 |
-| 后端数据结构 | [result.go](file:///d:/fz/0601/solo-dogfeeding/code/297-siyuan/kernel/util/result.go) | Result 消息结构、6 种 PushMode 常量 |
-| 后端事务推送 | [transaction.go](file:///d:/fz/0601/solo-dogfeeding/code/297-siyuan/kernel/api/transaction.go) | 事务执行、pushTransactions 推送模式选择、rootIDs 提取 |
-| 后端独立广播 | [broadcast.go](file:///d:/fz/0601/solo-dogfeeding/code/297-siyuan/kernel/api/broadcast.go) | BroadcastChannels、SSE 支持、广播 API |
-| 后端命令执行 | [cmd/cmd.go](file:///d:/fz/0601/solo-dogfeeding/code/297-siyuan/kernel/cmd/cmd.go) | Cmd 接口定义、命令工厂、异步执行与 Recover |
-| 后端 closews 命令 | [cmd/closews.go](file:///d:/fz/0601/solo-dogfeeding/code/297-siyuan/kernel/cmd/closews.go) | 主动关闭 WebSocket 连接 |
-| 前端 Model 基类 | [Model.ts](file:///d:/fz/0601/solo-dogfeeding/code/297-siyuan/app/src/layout/Model.ts) | WebSocket 连接封装、重连逻辑、消息回调、send 方法 |
-| 前端消息预处理 | [processMessage.ts](file:///d:/fz/0601/solo-dogfeeding/code/297-siyuan/app/src/util/processMessage.ts) | msg/cmsg/cprogress/reloadui/closepublishpage 通用处理 |
-| 前端桌面主连接 | [index.ts](file:///d:/fz/0601/solo-dogfeeding/code/297-siyuan/app/src/index.ts#L69-L214) | 桌面端 main 连接，20+ 种命令分发 |
-| 前端移动端主连接 | [mobile/index.ts](file:///d:/fz/0601/solo-dogfeeding/code/297-siyuan/app/src/mobile/index.ts#L72-L82) | 移动端 main 连接，插件事件广播 |
-| 前端编辑器连接 | [protyle/index.ts](file:///d:/fz/0601/solo-dogfeeding/code/297-siyuan/app/src/protyle/index.ts#L127-L350) | Protyle 连接，transactions/reload 等编辑器命令 |
-| 前端文件树连接 | [layout/dock/Files.ts](file:///d:/fz/0601/solo-dogfeeding/code/297-siyuan/app/src/layout/dock/Files.ts#L44-L118) | filetree 连接，文档树/笔记本变更处理 |
-| 前端类型定义 | [types/index.d.ts](file:///d:/fz/0601/solo-dogfeeding/code/297-siyuan/app/src/types/index.d.ts#L3-L3) | TWS 类型、IWebSocketData 接口定义 |
-| 前端常量 | [constants.ts](file:///d:/fz/0601/solo-dogfeeding/code/297-siyuan/app/src/constants.ts#L20-L20) | SIYUAN_APPID 随机生成逻辑 |
-| 前端事务提交 | [protyle/wysiwyg/transaction.ts](file:///d:/fz/0601/solo-dogfeeding/code/297-siyuan/app/src/protyle/wysiwyg/transaction.ts) | 本地事务收集、防抖批量提交 |
+| 服务入口 | [serve.go](file:///d:/fz/0601/solo-dogfeeding/code/297-siyuan/kernel/server/serve.go#L697-L851) | WebSocket 服务器初始化、鉴权、消息接收、命令分发 |
+| 连接管理 | [websocket.go](file:///d:/fz/0601/solo-dogfeeding/code/297-siyuan/kernel/util/websocket.go) | 会话注册/注销、多种广播策略、30+ 种推送函数 |
+| 消息结构 | [result.go](file:///d:/fz/0601/solo-dogfeeding/code/297-siyuan/kernel/util/result.go) | Result 消息结构、6 种 PushMode 常量 |
+| 事务推送 | [transaction.go](file:///d:/fz/0601/solo-dogfeeding/code/297-siyuan/kernel/api/transaction.go) | 事务执行、pushTransactions 推送模式选择、rootIDs 提取 |
+| 并发控制 | [session.go](file:///d:/fz/0601/solo-dogfeeding/code/297-siyuan/kernel/model/session.go#L456-L507) | ControlConcurrency 中间件、按 API 路径加锁 |
+| 独立广播 | [broadcast.go](file:///d:/fz/0601/solo-dogfeeding/code/297-siyuan/kernel/api/broadcast.go) | BroadcastChannels、SSE 支持、广播 API |
+| 命令框架 | [cmd/cmd.go](file:///d:/fz/0601/solo-dogfeeding/code/297-siyuan/kernel/cmd/cmd.go) | Cmd 接口定义、命令工厂、异步执行与 Recover |
+| 关闭命令 | [cmd/closews.go](file:///d:/fz/0601/solo-dogfeeding/code/297-siyuan/kernel/cmd/closews.go) | 主动关闭 WebSocket 连接 |
+| 心跳命令 | [cmd/ping.go](file:///d:/fz/0601/solo-dogfeeding/code/297-siyuan/kernel/cmd/ping.go) | ping 保活命令（空操作） |
+
+### 11.2 前端核心文件
+
+| 模块 | 文件 | 关键职责 |
+|------|------|----------|
+| 连接基类 | [Model.ts](file:///d:/fz/0601/solo-dogfeeding/code/297-siyuan/app/src/layout/Model.ts) | WebSocket 连接封装、重连逻辑、消息回调、send 方法 |
+| 消息预处理 | [processMessage.ts](file:///d:/fz/0601/solo-dogfeeding/code/297-siyuan/app/src/util/processMessage.ts) | msg/cmsg/cprogress/reloadui/closepublishpage 通用处理 |
+| 桌面主连接 | [index.ts](file:///d:/fz/0601/solo-dogfeeding/code/297-siyuan/app/src/index.ts#L69-L214) | 桌面端 main 连接，20+ 种命令分发 |
+| 移动主连接 | [mobile/index.ts](file:///d:/fz/0601/solo-dogfeeding/code/297-siyuan/app/src/mobile/index.ts#L72-L220) | 移动端 main 连接、reconnectWebSocket 保活函数 |
+| 编辑器连接 | [protyle/index.ts](file:///d:/fz/0601/solo-dogfeeding/code/297-siyuan/app/src/protyle/index.ts#L127-L350) | Protyle 连接，transactions/reload 等编辑器命令 |
+| 文件树连接 | [layout/dock/Files.ts](file:///d:/fz/0601/solo-dogfeeding/code/297-siyuan/app/src/layout/dock/Files.ts#L44-L118) | filetree 连接，文档树/笔记本变更处理 |
+| 大纲连接 | [layout/dock/Outline.ts](file:///d:/fz/0601/solo-dogfeeding/code/297-siyuan/app/src/layout/dock/Outline.ts) | outline 连接，大纲标题变更处理 |
+| 反链连接 | [layout/dock/Backlink.ts](file:///d:/fz/0601/solo-dogfeeding/code/297-siyuan/app/src/layout/dock/Backlink.ts) | backlink 连接，反链面板生命周期事件 |
+| 书签连接 | [layout/dock/Bookmark.ts](file:///d:/fz/0601/solo-dogfeeding/code/297-siyuan/app/src/layout/dock/Bookmark.ts) | bookmark 连接，书签属性变更检测 |
+| 标签连接 | [layout/dock/Tag.ts](file:///d:/fz/0601/solo-dogfeeding/code/297-siyuan/app/src/layout/dock/Tag.ts) | tag 连接，标签属性变更检测 |
+| 图连接 | [layout/dock/Graph.ts](file:///d:/fz/0601/solo-dogfeeding/code/297-siyuan/app/src/layout/dock/Graph.ts) | graph 连接，图视图变更处理 |
+| 事务提交 | [protyle/wysiwyg/transaction.ts](file:///d:/fz/0601/solo-dogfeeding/code/297-siyuan/app/src/protyle/wysiwyg/transaction.ts) | 本地事务收集、512ms 防抖、promiseTransaction 串行提交 |
+| 类型定义 | [types/index.d.ts](file:///d:/fz/0601/solo-dogfeeding/code/297-siyuan/app/src/types/index.d.ts#L3-L3) | TWS 类型、IWebSocketData 接口定义 |
+| 常量定义 | [constants.ts](file:///d:/fz/0601/solo-dogfeeding/code/297-siyuan/app/src/constants.ts#L20-L302) | SIYUAN_APPID、TIMEOUT_INPUT=256 等常量 |
