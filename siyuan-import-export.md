@@ -518,6 +518,224 @@ defer func() {
 4. **多端消息统一**：桌面端（`index.ts`）、移动端（`onMessage.ts`）、独立窗口（`window/index.ts`）三个入口使用相同的 `progressLoading()` / `showMessage()` 函数，保证跨端体验一致
 5. **WebSocket 断连恢复**：`Model.ts` 中 `ws.onclose` 检测非主动关闭后，3 秒自动重连；重连成功后自动执行 `reloadSync()` 刷新数据并关闭 `kernelError` 弹窗
 
+### 5.7 导出侧前端反馈分支全景
+
+导出操作的前端反馈逻辑因格式而异，呈现 **5 种独立分支模式**，各自有不同的提示生命周期、文件打开方式和错误处理路径。
+
+#### 5.7.1 五种分支模式总览
+
+| 分支模式 | 适用格式 | 等待提示位置 | 成功后动作 | 关键实现文件 |
+|---------|---------|------------|-----------|-------------|
+| **A. 简单异步** | `.sy.zip`、Markdown `.zip`、ReST、AsciiDoc、DocBook、EPUB、ODT 等 | 调用 API 前 | `hideMessage` + `openByMobile` 下载 | [commonMenuItem.ts](app/src/menus/commonMenuItem.ts#L608-L725) |
+| **B. 路径选择 + 本地保存** | 桌面端 HTML(SiYuan/Markdown)、Word `.docx` | 用户选择目录后 | `afterExport`（6s Toast + "显示在文件夹"） | [index.ts saveExport/getExportPath](app/src/protyle/export/index.ts#L690-L749) |
+| **C. 浏览器二次请求** | 浏览器端 HTML(SiYuan/Markdown) | 调用 API 前 | `hideMessage` + `window.open` + Toast | [index.ts saveExport](app/src/protyle/export/index.ts#L34-L61) |
+| **D. PDF 预览 + IPC** | 桌面端 PDF | 预览窗口内 | IPC 发送给主进程静默生成 | [index.ts renderPDF](app/src/protyle/export/index.ts#L138-L688) |
+| **E. 图片渲染 + 上传** | PNG 图片 | 确认按钮点击时 | `hideMessage` + `openByMobile` | [util.ts exportImage](app/src/protyle/export/util.ts#L28-L188) |
+
+#### 5.7.2 导出前等待提示的统一模式
+
+所有分支的**前置提示**都使用 `showMessage(window.siyuan.languages.exporting, -1)`：
+- `-1` 作为 `timeout` 参数，表示**永不自动关闭**（需手动 `hideMessage(msgId)`）
+- 返回值 `msgId` 被保存用于后续精确关闭或内容更新
+
+**调用位置分类：**
+
+```
+┌─ 立即显示（API 调用前立刻锁定 UI）
+│  ├─ 分支 A：.sy.zip / Markdown.zip / ReST / AsciiDoc...
+│  │     msgId = showMessage(exporting, -1) → fetchPost(...)
+│  │
+│  ├─ 分支 C：浏览器 HTML
+│  │     msgId = showMessage(exporting, -1) → 2 次 fetchPost
+│  │
+│  └─ 分支 E：图片导出
+│        msgId = showMessage(exporting, 0) → addScript + toBlob
+│        (timeout=0 表示显示关闭按钮，用户可手动取消)
+│
+└─ 延迟显示（等待用户交互后才显示）
+   ├─ 分支 B：桌面端 HTML/Word
+   │     showOpenDialog（选路径）→ 确认后才 showMessage
+   │     （避免用户取消路径选择时出现多余提示）
+   │
+   └─ 分支 D：PDF
+         无前置 Toast → 改为新窗口内 <img loading-pure.svg> 渲染占位
+         （预览窗口本身就是等待态，无需全局提示）
+```
+
+#### 5.7.3 导出成功后提示关闭的四条路径
+
+##### 路径 1：直接关闭（分支 A、C、E）
+
+```typescript
+// 分支 A：Markdown .zip —— [commonMenuItem.ts:L624-L631]
+const msgId = showMessage(window.siyuan.languages.exporting, -1);
+fetchPost("/api/export/exportMd", {id}, response => {
+    hideMessage(msgId);                          // 1. 关闭等待提示
+    openByMobile(response.data.zip);             // 2. 打开下载
+    // 无额外成功提示：浏览器下载弹窗本身就是视觉反馈
+});
+```
+
+##### 路径 2：更新提示内容 + 自动关闭（分支 B：`afterExport`）
+
+```typescript
+// [util.ts:L16-L26] afterExport(exportPath, msgId)
+showMessage(
+  `${window.siyuan.languages.exported} ${escapeHtml(exportPath)}
+   <div class="fn__space"></div>
+   <button class="b3-button b3-button--white">${window.siyuan.languages.showInFolder}</button>`,
+  6000,    // 6 秒后自动关闭
+  "info",
+  msgId    // ← 关键：复用原 msgId，将「导出中」更新为「导出成功」
+);
+// 为按钮绑定事件：useShell("showItemInFolder") 调用系统文件管理器
+document.querySelector(`#message [data-id="${msgId}"] button`).addEventListener("click", () => {
+    useShell("showItemInFolder", path.join(exportPath));
+    hideMessage(msgId);
+});
+```
+
+**设计要点：** `showMessage` 传入已存在的 `msgId` 时会执行**更新而非新建**，实现无缝的状态切换动画。
+
+##### 路径 3：隐藏提示 + 独立成功提示（分支 C 浏览器 HTML）
+
+```typescript
+// [index.ts:L52-L59] 浏览器 HTML 二次请求成功
+hideMessage(msgId);                          // 关闭「导出中」
+if (zipResponse.code === -1) { /* 错误处理见 5.7.4 */ }
+window.open(zipResponse.data.zip);           // 触发浏览器下载
+showMessage(window.siyuan.languages.exported);  // 弹出新的短 Toast（2s）
+```
+
+##### 路径 4：无显式关闭（分支 D：PDF）
+
+PDF 导出在独立窗口内执行，用户点击"确认"后：
+- `actionElement.remove()` 移除控制面板（视觉上变为纯文档）
+- `previewElement.classList.add("exporting")` 调整样式
+- 通过 IPC `send(Constants.SIYUAN_EXPORT_PDF, config)` 将任务交给主进程
+- 主进程完成后通过系统通知回调，前端无需再 `hideMessage`
+
+#### 5.7.4 浏览器导出二次请求的失败处理
+
+**分支 C** 是唯一包含**两次后端请求**的路径，也是唯一**显式检查 code === -1** 的分支：
+
+```typescript
+// [index.ts:L34-L61] saveExport 浏览器环境（BROWSER 编译宏）
+if (["html", "htmlmd"].includes(option.type)) {
+    const msgId = showMessage(window.siyuan.languages.exporting, -1);
+    // 第 1 次请求：生成资源 + 返回内容 HTML 片段
+    fetchPost(url, {id, pdf:false, removeAssets:false, merge:true, savePath:""},
+      async exportResponse => {
+        // 前端本地组装完整 HTML（注入主题、插件样式、snippet、protyle-render）
+        const html = await onExport(exportResponse, undefined, "", option);
+        // 第 2 次请求：将完整 HTML 和资源打包为 ZIP
+        fetchPost("/api/export/exportBrowserHTML", {
+            folder: exportResponse.data.folder,
+            html: html,           // 完整 HTML 字符串回传
+            name: exportResponse.data.name
+        }, zipResponse => {
+            hideMessage(msgId);                    // 无论成功失败都先关提示
+            // ── 二次请求失败的显式错误分支 ──
+            if (zipResponse.code === -1) {
+                // _kernel[14] = "导出 HTML 失败：%s"
+                showMessage(
+                    window.siyuan.languages._kernel[14].replace("%s", zipResponse.msg),
+                    0,          // timeout=0：必须手动关闭，防止用户错过
+                    "error"     // 红色样式
+                );
+                return;         // 中断，不执行下载
+            }
+            // 成功：window.open 触发浏览器原生下载弹窗
+            window.open(zipResponse.data.zip);
+            showMessage(window.siyuan.languages.exported);
+        });
+    });
+    return;
+}
+```
+
+**二次请求可能失败的场景：**
+1. **临时目录写满**：`exportBrowserHTML` 写入 ZIP 时磁盘空间不足
+2. **HTML 体积过大**：`zipResponse.data.zip` URL 超出浏览器 `window.open` 限制
+3. **临时资源已清理**：第 1 次请求与第 2 次请求间隔过长，`exportResponse.data.folder` 被定时任务回收
+4. **session 过期**：两次请求之间鉴权失效
+
+#### 5.7.5 文件打开：`openByMobile` 的 4 平台分发
+
+所有非本地保存格式最终通过 `openByMobile(uri)` 触发文件下载/打开：
+
+```typescript
+// [compatibility.ts:L68-L99]
+export const openByMobile = (uri: string) => {
+    if (isInIOS()) {
+        if (uri.startsWith("assets/")) {
+            // iOS <16.7 特殊编码路径
+            webkit.messageHandlers.openLink.postMessage(origin + "/assets/" + encodeURIComponent(...));
+        } else if (uri.startsWith("/")) {
+            // 导出 zip 路径已 encode，直接拼接 origin
+            webkit.messageHandlers.openLink.postMessage(origin + uri);
+        } else {
+            // 外部 URL 尝试检测合法性，失败自动补 https://
+            try { new URL(uri); postMessage(uri); }
+            catch { postMessage("https://" + uri); }
+        }
+    } else if (isInAndroid()) {
+        window.JSAndroid.openExternal(uri);      // Android 原生桥
+    } else if (isInHarmony()) {
+        window.JSHarmony.openExternal(uri);      // HarmonyOS 原生桥
+    } else {
+        window.open(uri);                        // 桌面/浏览器：新标签页/下载
+    }
+};
+```
+
+**移动端附加的 `exportByMobile` 版本**（[compatibility.ts:L101-L114]）使用 `JSAndroid.exportByDefault` 强制走系统"导出文件"分享面板，而非直接打开。
+
+#### 5.7.6 分支 D（PDF）的独特反馈链
+
+PDF 导出是最复杂的分支，其反馈链路如下：
+
+```
+用户点击"导出 PDF"
+    │
+    ▼
+暗色模式？ ──是──→ confirmDialog 二次确认提示
+    │否
+    ▼
+renderPDF(id)
+    │
+    ├─ 前端本地生成完整预览 HTML（注入主题/插件/尺寸配置）
+    │
+    ├─ fetchPost("/api/export/exportTempContent", {html})
+    │      → 后端将 HTML 写入临时文件并返回 URL
+    │
+    └─ ipcRenderer.send(SIYUAN_EXPORT_NEWWINDOW, tempUrl)
+           │
+           ▼ 打开新的 Electron 窗口
+           │
+           ├─ 左侧：导出配置面板（纸张/边距/缩放/分栏/水印...）
+           │     └─ 任一配置变更 → refreshPreview() → fetchPost("/api/export/exportPreviewHTML")
+           │
+           └─ 用户点击「确认」按钮
+                │
+                ├─ actionElement.remove()    // 隐藏配置面板
+                ├─ preview.classList.add("exporting")  // 切换样式
+                │
+                └─ ipcRenderer.send(SIYUAN_EXPORT_PDF, config)
+                       │
+                       ▼ 主进程执行
+                       ├─ webContents.printToPDF(pdfOptions)
+                       ├─ showSaveDialog 选择路径
+                       └─ 写入文件后系统通知
+                              (前端无需反馈操作，IPC 单向)
+```
+
+**PDF 分支的独特设计：**
+- **全局无 `showMessage`**：避免独立窗口与主窗口 Toast 重叠
+- **独立窗口作为视觉反馈载体**：`fn__loading` SVG 动画、配置面板禁用态
+- **预览 → 导出的样式切换**：`.exporting` class 调整尺寸、移除滚动条
+- **单向 IPC 通信**：导出结果由系统通知/文件管理器体现，前端无回传状态
+
 ---
 
 ## 6. 格式差异处理
@@ -869,3 +1087,11 @@ treenode.IndexBlockTree(tree)         // 块树缓存更新
 | 前端 HTTP 封装 | `fetchPost` / `fetchSyncPost` | [app/src/util/fetch.ts](app/src/util/fetch.ts) |
 | 前端导入调用 | `importSY` / `importStdMd` / `importZipMd` | [app/src/menus/navigation.ts](app/src/menus/navigation.ts) |
 | 移动端消息分发 | `onMessage` | [app/src/mobile/util/onMessage.ts](app/src/mobile/util/onMessage.ts) |
+| 导出前端入口（5 分支） | `saveExport` | [app/src/protyle/export/index.ts:L33-L115](app/src/protyle/export/index.ts#L33-L115) |
+| PDF 预览窗口构建 | `renderPDF` | [app/src/protyle/export/index.ts:L138-L688](app/src/protyle/export/index.ts#L138-L688) |
+| 桌面端路径选择 | `getExportPath` | [app/src/protyle/export/index.ts:L690-L749](app/src/protyle/export/index.ts#L690-L749) |
+| HTML 完整渲染包装 | `onExport` | [app/src/protyle/export/index.ts:L752-L845](app/src/protyle/export/index.ts#L752-L845) |
+| 导出成功提示（显示在文件夹） | `afterExport` | [app/src/protyle/export/util.ts:L16-L26](app/src/protyle/export/util.ts#L16-L26) |
+| 图片导出流程 | `exportImage` | [app/src/protyle/export/util.ts:L28-L188](app/src/protyle/export/util.ts#L28-L188) |
+| 4 平台文件打开分发 | `openByMobile` | [app/src/protyle/util/compatibility.ts:L68-L99](app/src/protyle/util/compatibility.ts#L68-L99) |
+| 块菜单导出子菜单 | `exportMd` | [app/src/menus/commonMenuItem.ts:L528-L834](app/src/menus/commonMenuItem.ts#L528-L834) |
