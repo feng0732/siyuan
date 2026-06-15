@@ -722,55 +722,476 @@ func (conf *AppConf) SetUILayout(uiLayout *conf.UILayout) {
 
 ---
 
-## 七、跨窗口同步
+## 七、跨窗口同步机制
 
-### 7.1 通信架构
+SiYuan 的跨窗口同步采用 **双路通信架构**：
+1. **Electron IPC 通道**：用于窗口间控制消息（标签拖拽、锁屏、关闭同步）
+2. **WebSocket 通道**：用于后端数据推送（文档重命名、删除、笔记本关闭、插件事件）
+
+两种通道各司其职，共同实现多窗口间的状态一致性。
+
+### 7.1 通信架构全景
 
 ```
-┌─────────────────┐     ipcMain     ┌─────────────────┐
-│  主窗口渲染进程  │◄───────────────►│                 │
-│ (BrowserWindow) │  siyuan-cmd     │  Electron 主进程 │
-└─────────────────┘                 │   (main.js)     │
-         ▲                           │                 │
-         │ siyuan-send-windows       │                 │
-         ▼                           │                 │
-┌─────────────────┐     ipcMain     │                 │
-│  独立窗口渲染进程│◄───────────────►│                 │
-│ (BrowserWindow) │  siyuan-cmd     │                 │
-└─────────────────┘                 └─────────────────┘
-         │
-         │ WebSocket
-         ▼
-┌─────────────────┐
-│   Go 后端内核    │
-│  (单实例共享)    │
-└─────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│                    Electron 主进程                          │
+│  ┌──────────────────────────┐  ┌────────────────────────┐  │
+│  │  ipcMain (siyuan-send-   │  │  powerMonitor          │  │
+│  │      windows)             │  │  (lock-screen)        │  │
+│  └──────────────────────────┘  └────────────────────────┘  │
+│                      ▲                    ▲                  │
+│                      │ IPC                │                  │
+└──────────────────────┼────────────────────┼──────────────────┘
+                       │                    │
+┌──────────────────────┼────────────────────┼──────────────────┐
+│  主窗口渲染进程        │                    │                  │
+│  ┌────────────────────▼──────────┐  ┌────▼──────────────┐   │
+│  │  WebSocket (后端数据推送)     │  │  ipcRenderer       │   │
+│  │  (rename/removeDoc/...)       │  │  (control msgs)    │   │
+│  └───────────────────────────────┘  └───────────────────┘   │
+│                      ▲                                         │
+│                      │ WebSocket                               │
+└──────────────────────┼─────────────────────────────────────────┘
+                       │
+┌──────────────────────┼─────────────────────────────────────────┐
+│  独立窗口渲染进程      │                                         │
+│  ┌────────────────────▼──────────┐  ┌────────────────────┐   │
+│  │  WebSocket (后端数据推送)     │  │  ipcRenderer       │   │
+│  │  (与主窗口相同处理逻辑)       │  │  (control msgs)    │   │
+│  └───────────────────────────────┘  └────────────────────┘   │
+│                                                               │
+└───────────────────────────────────────────────────────────────┘
+                       │
+                       ▼
+┌─────────────────────────────────────────────────────────────┐
+│                    Go 后端内核 (单实例)                     │
+│  ┌───────────────────────────────────────────────────────┐  │
+│  │  WebSocket Hub + PushMode 广播机制                    │  │
+│  │  - rename / removeDoc / closeBox / reloadPlugin ...  │  │
+│  └───────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-### 7.2 IPC 消息分发入口
+### 7.2 后端 WebSocket 推送机制（pushMode）
 
-所有 IPC 消息的分发入口在 [onGetConfig.ts](app/src/boot/onGetConfig.ts#L175-L184)：
+后端通过 `PushMode` 精确控制消息的广播范围，定义在 [result.go](kernel/util/result.go#L24-L33)：
+
+```go
+type PushMode int
+
+const (
+    PushModeBroadcast                   PushMode = 0  // 所有应用所有会话广播
+    PushModeSingleSelf                  PushMode = 1  // 自我应用会话单播
+    PushModeBroadcastExcludeSelf        PushMode = 2  // 非自我会话广播
+    PushModeBroadcastExcludeSelfApp     PushMode = 4  // 非自我应用所有会话广播
+    PushModeBroadcastApp                PushMode = 5  // 单个应用内所有会话广播
+    PushModeBroadcastMainExcludeSelfApp PushMode = 6  // 非自我应用主会话广播
+)
+```
+
+**推送分发逻辑**在 [websocket.go](kernel/util/websocket.go#L383-L400)：
+
+```go
+func PushEvent(event *Result) {
+    msg := event.Bytes()
+    mode := event.PushMode
+    switch mode {
+    case PushModeBroadcast:
+        Broadcast(msg)                      // 推送到所有连接
+    case PushModeSingleSelf:
+        single(msg, event.AppId, event.SessionId)
+    case PushModeBroadcastExcludeSelf:
+        broadcastOthers(msg, event.SessionId)
+    case PushModeBroadcastExcludeSelfApp:
+        broadcastOtherApps(msg, event.AppId)
+    case PushModeBroadcastApp:
+        broadcastApp(msg, event.AppId)
+    case PushModeBroadcastMainExcludeSelfApp:
+        broadcastOtherAppMains(msg, event.AppId)
+    }
+}
+```
+
+**关键数据事件均使用 `PushModeBroadcast (0)`**，意味着主窗口和独立窗口会同时收到这些事件：
+
+| 事件 | 推送位置 | 数据 |
+|------|---------|------|
+| `rename` | [history.go#360](kernel/model/history.go#L360) / [file.go#1724](kernel/model/file.go#L1724) | `{box, id, path, title}` |
+| `removeDoc` | [heading.go#284](kernel/model/heading.go#L284) / [file.go#1635](kernel/model/file.go#L1635) | `{ids: [rootID, ...]}` |
+| `closeBox` / `removeBox` | [mount.go#185-193](kernel/model/mount.go#L185-L193) | `{box: notebookID}` |
+| `reloadPlugin` | 插件管理 API | `{uninstallPlugins, unloadPlugins, reloadPlugins, ...}` |
+
+---
+
+### 7.3 主窗口与独立窗口：WebSocket 推送处理对比
+
+**重要发现**：主窗口和独立窗口处理 WebSocket 推送的代码是**完全相同**的！
+
+两者都在 `App` 构造函数中注册了相同的 `msgCallback` 处理函数 [window/index.ts#L60-L163](app/src/window/index.ts#L60-L163)：
 
 ```typescript
-// 关闭保存消息
+new Model({
+    msgCallback(data) {
+        if (data.cmd === "error" && data.msg) {
+            showMessage(data.msg, 3000, "error");
+        }
+        if (data.reqId === this.reqId || 0 === data.reqId) {
+            switch (data.cmd) {
+                case "logoutAuth":         redirectToCheckAuth(); break;
+                case "setAppearance":      updateAppearance(data.data); break;
+                case "rename":             this.handleRename(data); break;
+                case "closeBox":
+                case "removeBox":          this.handleCloseBox(data); break;
+                case "removeDoc":          this.handleRemoveDoc(data); break;
+                case "reloadPlugin":       reloadPlugin(this, data.data); break;
+                // ... 其他 20+ 种事件
+            }
+        }
+    }
+})
+```
+
+**处理逻辑完全相同，但执行结果有差异**：
+
+| 差异点 | 主窗口 | 独立窗口 |
+|--------|-------|---------|
+| 文件树刷新 | ✅ 有文件树，`setNoteBook()` 会刷新 | ❌ 无文件树，`setNoteBook()` 无效 |
+| 侧边栏更新 | ✅ 有完整侧边栏，`allModels` 包含所有 Dock 面板 | ✅ 有标签面板，但可能缺少某些 Dock 面板 |
+| 插件实例 | ✅ 完整的插件实例集合 | ✅ 独立的插件实例集合（相同插件代码，独立实例） |
+| 窗口标题 | ✅ 会调用 `setTitle()` 更新 | ✅ 也会调用 `setTitle()` 更新 |
+
+---
+
+### 7.4 文档重命名事件同步流程
+
+**触发场景**：
+- 修改文档标题（标题块属性）
+- 移动文档到其他目录（更新 path）
+
+**后端推送**：
+```go
+evt := util.NewCmdResult("rename", 0, util.PushModeBroadcast)
+evt.Data = map[string]any{
+    "box":     boxID,
+    "id":      tree.Root.ID,      // 文档 rootID
+    "path":    tree.Path,
+    "title":   tree.Root.IALAttr("title"),
+}
+util.PushEvent(evt)
+```
+
+**前端同步流程**（所有窗口同时执行）：
+
+**第一步：处理未激活标签** [window/index.ts#L101-L113](app/src/window/index.ts#L101-L113)
+```typescript
+case "rename":
+    getAllTabs().forEach((tab) => {
+        if (tab.headElement) {
+            const initTab = tab.headElement.getAttribute("data-initdata");
+            if (initTab) {
+                const initTabData = JSON.parse(initTab);
+                // 只匹配 Editor 类型且 rootID 匹配的标签
+                if (initTabData.instance === "Editor" && initTabData.rootId === data.data.id) {
+                    tab.updateTitle(data.data.title);  // 更新标签头标题
+                }
+            }
+        }
+    });
+    break;
+```
+
+**第二步：处理已激活标签**（通过 `reloadSync` 间接处理）
+- 后端还会发送 `syncMergeResult` 或 `reloaddoc` 事件
+- 触发 `reloadSync()` 函数 [processSystem.ts#L79-L87](app/src/dialog/processSystem.ts#L79-L87)
+- 在 `reloadSync` 中遍历所有已激活的 Editor Model：
+```typescript
+allModels.editor.forEach(item => {
+    if (data.upsertRootIDs.includes(item.editor.protyle.block.rootID)) {
+        fetchPost("/api/block/getDocInfo", { id: item.editor.protyle.block.rootID },
+            (response) => {
+                // 1. 刷新编辑器内容
+                reloadProtyle(item.editor.protyle, false, updateReadonly);
+                // 2. 更新标签标题和编辑器标题栏
+                updateTitle(item.editor.protyle.block.rootID, item.parent, item.editor.protyle);
+            });
+    }
+});
+```
+
+**`updateTitle` 辅助函数** [processSystem.ts#L29-L38](app/src/dialog/processSystem.ts#L29-L38)：
+```typescript
+const updateTitle = (rootID: string, tab: Tab, protyle?: IProtyle) => {
+    fetchPost("/api/block/getDocInfo", { id: rootID }, (response) => {
+        tab.updateTitle(response.data.name);  // 更新标签头
+        if (protyle && protyle.title) {
+            // 更新编辑器内的标题栏
+            protyle.title.setTitle(response.data.name, 
+                response.data.ial[Constants.CUSTOM_SY_TITLE_EMPTY] === "true");
+        }
+    });
+};
+```
+
+**重命名同步完整链路**：
+```
+用户修改文档标题
+  ↓
+后端事务处理 → 更新数据库
+  ↓
+推送 rename 事件（PushModeBroadcast）
+  ↓
+所有窗口（主+独立）同时接收
+  │
+  ├─→ 未激活标签：直接更新 tab.headElement 标题
+  │    [window/index.ts#L101-L113]
+  │
+  └─→ 已激活标签：通过 reloadSync
+       ├─ 刷新编辑器内容
+       └─ 更新标签标题 + 编辑器标题栏
+          [processSystem.ts#L79-L87]
+```
+
+---
+
+### 7.5 文档删除事件同步流程
+
+**触发场景**：
+- 删除文档（heading.go）
+- 删除目录（file.go，包含所有子文档）
+
+**后端推送**：
+```go
+evt := util.NewCmdResult("removeDoc", 0, util.PushModeBroadcast)
+evt.Data = map[string]any{
+    "ids": []string{srcTree.ID},  // 支持批量删除
+}
+util.PushEvent(evt)
+```
+
+**前端同步流程**（所有窗口同时执行）：
+
+**第一步：处理未激活标签** [window/index.ts#L128-L140](app/src/window/index.ts#L128-L140)
+```typescript
+case "removeDoc":
+    getAllTabs().forEach((tab) => {
+        if (tab.headElement) {
+            const initTab = tab.headElement.getAttribute("data-initdata");
+            if (initTab) {
+                const initTabData = JSON.parse(initTab);
+                if (initTabData.instance === "Editor" 
+                    && data.data.ids.includes(initTabData.rootId)) {
+                    tab.parent.removeTab(tab.id);  // 直接关闭标签
+                }
+            }
+        }
+    });
+    break;
+```
+
+**第二步：处理已激活标签**（通过 `reloadSync`）
+- 在 `reloadSync` 中遍历所有已激活的 Model：
+```typescript
+allModels.editor.forEach(item => {
+    if (data.removeRootIDs.includes(item.editor.protyle.block.rootID)) {
+        // 关闭标签
+        item.parent.parent.removeTab(item.parent.id, false, false);
+        // 清理滚动位置缓存
+        delete window.siyuan.storage[Constants.LOCAL_FILEPOSITION]
+            [item.editor.protyle.block.rootID];
+        setStorageVal(Constants.LOCAL_FILEPOSITION, 
+            window.siyuan.storage[Constants.LOCAL_FILEPOSITION]);
+    }
+});
+```
+
+**不仅处理 Editor，还处理所有相关 Model 类型**：
+- Graph（本地关系图）
+- Outline（本地大纲）
+- Backlink（本地反链）
+
+**删除同步完整链路**：
+```
+用户删除文档
+  ↓
+后端事务处理 → 删除文件 → 更新数据库
+  ↓
+推送 removeDoc 事件（PushModeBroadcast）
+  ↓
+所有窗口（主+独立）同时接收
+  │
+  ├─→ 未激活标签：直接 removeTab 关闭
+  │    [window/index.ts#L128-L140]
+  │
+  └─→ 已激活标签：通过 reloadSync
+       ├─ Editor：关闭标签 + 清理滚动位置
+       ├─ Graph（本地）：关闭标签
+       ├─ Outline（本地）：关闭标签
+       ├─ Backlink（本地）：关闭标签
+       └─ 其他类型：刷新数据
+          [processSystem.ts#L88-L128]
+```
+
+---
+
+### 7.6 笔记本关闭/删除事件同步流程
+
+**触发场景**：
+- 卸载笔记本（`closeBox`）
+- 删除笔记本（`removeBox`）
+- 新手引导笔记本关闭（特殊逻辑）
+
+**后端推送** [mount.go#L185-L193](kernel/model/mount.go#L185-L193)：
+```go
+cmdName := "closeBox"
+if IsUserGuide(boxID) {
+    if err := RemoveBox(boxID); err == nil {
+        cmdName = "removeBox"  // 新手引导笔记本自动删除
+    }
+}
+evt := util.NewCmdResult(cmdName, 0, util.PushModeBroadcast)
+evt.Data = map[string]any{"box": boxID}
+util.PushEvent(evt)
+```
+
+**前端同步流程**（所有窗口同时执行）：
+
+**第一步：处理未激活标签** [window/index.ts#L114-L127](app/src/window/index.ts#L114-L127)
+```typescript
+case "closeBox":
+case "removeBox":
+    getAllTabs().forEach((tab) => {
+        if (tab.headElement) {
+            const initTab = tab.headElement.getAttribute("data-initdata");
+            if (initTab) {
+                const initTabData = JSON.parse(initTab);
+                if (initTabData.instance === "Editor" 
+                    && data.data.box === initTabData.notebookId) {
+                    tab.parent.removeTab(tab.id);  // 关闭该笔记本的所有标签
+                }
+            }
+        }
+    });
+    break;
+```
+
+**第二步：处理已激活标签**（同样通过 `reloadSync`）
+- 当笔记本关闭/删除时，会触发 `syncMergeResult` 事件
+- `reloadSync` 中检查 `removeRootIDs` 包含的文档并关闭标签
+
+**特殊说明**：
+- `closeBox` 和 `removeBox` 在前端处理逻辑完全相同
+- 区别仅在后端：`closeBox` 只卸载，`removeBox` 会删除物理文件
+- 前端只需关闭该笔记本下的所有标签即可
+
+---
+
+### 7.7 插件事件跨窗口同步
+
+**触发场景**：
+- 插件安装、卸载、启用、禁用
+- 插件代码变更（热重载）
+- 插件存储数据变更
+
+**后端推送**：
+```go
+evt := util.NewCmdResult("reloadPlugin", 0, util.PushModeBroadcast)
+evt.Data = map[string]any{
+    "uninstallPlugins":  [...],  // 已卸载的插件列表
+    "unloadPlugins":     [...],  // 已禁用的插件列表
+    "reloadPlugins":     [...],  // 需重载的插件列表
+    "dataChangePlugins": [...],  // 数据变更的插件列表
+}
+util.PushEvent(evt)
+```
+
+**前端同步流程**：
+
+**主窗口和独立窗口各自独立处理** [window/index.ts#L76-L78](app/src/window/index.ts#L76-L78)：
+```typescript
+case "reloadPlugin":
+    reloadPlugin(this, data.data);
+    break;
+```
+
+**`reloadPlugin` 完整处理逻辑** [loader.ts#L225-L299](app/src/plugin/loader.ts#L225-L299)：
+```typescript
+export const reloadPlugin = async (app: App, data: {
+    uninstallPlugins?: string[],
+    unloadPlugins?: string[],
+    reloadPlugins?: string[],
+    dataChangePlugins?: string[],
+} = {}) => {
+    const {uninstallPlugins, unloadPlugins, reloadPlugins, dataChangePlugins} = data;
+    
+    // 1. 禁用插件
+    unloadPlugins.forEach((item) => {
+        uninstall(app, item, true);  // 调用插件 onunload()
+    });
+    
+    // 2. 卸载插件
+    uninstallPlugins.forEach((item) => {
+        uninstall(app, item, false);  // 完全移除
+    });
+    
+    // 3. 重载插件（启用或代码变更）
+    for (const item of reloadPlugins) {
+        await loadPlugin(app, item);  // 重新加载插件代码
+    }
+    
+    // 4. 插件数据变更回调
+    dataChangePlugins.forEach((item) => {
+        const pluginInstance = app.plugins.find(p => p.name === item);
+        if (pluginInstance) {
+            fetchPost("/api/plugin/getSetting", { name: item }, 
+                (response) => {
+                    pluginInstance.data = response.data;  // 更新设置
+                    if (pluginInstance.onSetting) {
+                        pluginInstance.onSetting();  // 触发回调
+                    }
+                });
+        }
+    });
+};
+```
+
+**插件事件同步的关键特性**：
+
+1. **独立实例，独立处理**：
+   - 主窗口和独立窗口有各自的插件实例集合
+   - 每个窗口独立执行 `reloadPlugin`，互不影响
+   - 相同插件代码，但状态（`pluginInstance.data`）是隔离的
+
+2. **Custom 标签的自动处理**：
+   - 插件卸载时，类型为 `Custom` 且属于该插件的标签会被移除
+   - 这是在 `JSONToLayout` 时检查的，插件不存在则跳过创建
+
+3. **插件卸载顺序**：
+   - 先调用 `onunload()` 清理资源
+   - 然后移除 DOM 元素（Dock 面板、顶层块）
+   - 最后从 `app.plugins` 数组中移除
+
+---
+
+### 7.8 Electron IPC 通道同步（控制消息）
+
+除了 WebSocket 数据推送，窗口间还通过 Electron IPC 传递控制消息。
+
+**IPC 消息分发入口** [onGetConfig.ts#L175-L184](app/src/boot/onGetConfig.ts#L175-L184)：
+```typescript
 ipcRenderer.on(Constants.SIYUAN_SAVE_CLOSE, (event, close) => {
     if (isWindow()) {
-        closeWindow(app);    // 独立窗口
+        closeWindow(app);    // 独立窗口关闭
     } else {
-        winOnClose(close);   // 主窗口
+        winOnClose(close);   // 主窗口关闭
     }
 });
 
-// 跨窗口广播消息
 ipcRenderer.on(Constants.SIYUAN_SEND_WINDOWS, (e, ipcData: IWebSocketData) => {
-    onWindowsMsg(ipcData, app);
+    onWindowsMsg(ipcData, app);  // 跨窗口广播消息
 });
 ```
 
-### 7.3 主进程广播机制
-
-[main.js - siyuan-send-windows](app/electron/main.js#L1301-L1305)
-
+**主进程广播机制** [main.js#L1301-L1305](app/electron/main.js#L1301-L1305)：
 ```javascript
 ipcMain.on("siyuan-send-windows", (event, data) => {
     BrowserWindow.getAllWindows().forEach(item => {
@@ -779,52 +1200,21 @@ ipcMain.on("siyuan-send-windows", (event, data) => {
 });
 ```
 
-主进程作为消息中继，将一个渲染进程的消息广播给所有窗口。
+**渲染进程消息处理** [onWindowsMsg.ts#L13-L45](app/src/window/onWindowsMsg.ts#L13-L45)：
 
-### 7.4 渲染进程消息处理
+| 消息类型 | 用途 | 主窗口处理 | 独立窗口处理 |
+|---------|------|-----------|-------------|
+| `closetab` | 标签跨窗口拖拽后，关闭原窗口标签 | ✅ 移除指定标签 | ✅ 移除指定标签 |
+| `resetTabsStyle` | 拖拽时的样式同步（添加/移除拖拽区域样式） | ✅ 移除拖拽样式 | ✅ 移除拖拽样式 + 调整拖拽区域 |
+| `lockscreenByMode` | 系统锁屏事件同步 | ✅ 根据配置锁屏 | ✅ 根据配置锁屏 |
 
-[onWindowsMsg.ts](app/src/window/onWindowsMsg.ts#L13-L45)
+---
 
-```typescript
-export const onWindowsMsg = (ipcData: IWebSocketData, app: App) => {
-    switch (ipcData.cmd) {
-        case "closetab":
-            // 从其他窗口拖走标签后，关闭原窗口对应标签
-            const tab = getInstanceById(ipcData.data);
-            if (tab && tab instanceof Tab) {
-                tab.parent.removeTab(ipcData.data);
-            }
-            break;
-        case "resetTabsStyle":
-            // 拖拽时的样式同步
-            if (ipcData.data === "rmDragStyle") {
-                // 移除拖拽样式
-                document.querySelectorAll(".layout-tab-bars--drag").forEach(...);
-                document.querySelectorAll(".layout-tab-bar li[data-clone='true']").forEach(...);
-            } else if (isWindow()) {
-                // 独立窗口拖拽区域调整
-                document.querySelectorAll(".layout-tab-bar--readonly .fn__flex-1").forEach((item: HTMLElement) => {
-                    if (item.getBoundingClientRect().top <= 0) {
-                        (item.style as CSSStyleDeclarationElectron).WebkitAppRegion = 
-                            ipcData.data === "addRegionStyle" ? "drag" : "";
-                    }
-                });
-            }
-            break;
-        case "lockscreenByMode":
-            // 系统锁屏事件同步
-            if (window.siyuan.config.system.lockScreenMode === 1) {
-                lockScreen(app);
-            }
-            break;
-    }
-};
-```
+### 7.9 系统锁屏同步
 
-### 7.5 系统锁屏同步
+**触发**：操作系统锁屏事件
 
-[main.js - lock-screen](app/electron/main.js#L1416-L1420)
-
+**流程** [main.js#L1416-L1420](app/electron/main.js#L1416-L1420)：
 ```javascript
 powerMonitor.on("lock-screen", () => {
     writeLog("system lock-screen");
@@ -834,46 +1224,58 @@ powerMonitor.on("lock-screen", () => {
 });
 ```
 
-系统锁屏事件通过 `powerMonitor` 监听，然后广播给所有窗口，由各窗口根据配置决定是否锁屏。
-
-### 7.6 WebSocket 广播
-
-后端通过 WebSocket 的 `pushMode` 机制实现跨会话同步：
-
-[Model.ts - send()](app/src/layout/Model.ts#L89-L106)
-
+**各窗口独立判断** [onWindowsMsg.ts#L32-L38](app/src/window/onWindowsMsg.ts#L32-L38)：
 ```typescript
-// pushMode 说明：
-// 0: 所有应用所有会话广播
-// 1: 自我应用会话单播
-// 2: 非自我会话广播
-// 4: 非自我应用所有会话广播
-// 5: 单个应用内所有会话广播
-// 6: 非自我应用主会话广播
+case "lockscreenByMode":
+    if (window.siyuan.config.system.lockScreenMode === 1) {
+        lockScreen(app);  // 仅配置为 1 时才锁屏
+    }
+    break;
 ```
 
-所有窗口共享同一个后端内核，通过 WebSocket 推送实现数据实时同步：
-- 文档重命名 → 所有窗口标签标题更新
-- 文档删除 → 所有窗口对应标签关闭
-- 笔记本关闭 → 所有窗口相关标签关闭
+---
 
-### 7.7 标签跨窗口拖拽
+### 7.10 标签跨窗口拖拽同步
 
 ```
-从窗口 A 拖拽标签到窗口 B
+用户在窗口 A 拖拽标签到窗口 B
   ↓
-dragstart [Tab.ts#L84]: 设置 dataTransfer 数据，记录 tab ID
+dragstart [Tab.ts#L84]: 记录 tab ID 和布局数据
   ↓
-dragover: 窗口 B 显示放置预览
+dragover: 窗口 B 边缘高亮，显示放置预览
   ↓
-drop: 窗口 B 接收 JSONToCenter() 创建标签
+drop: 窗口 B 接收数据 → JSONToCenter() 创建标签
   ↓
-窗口 B 发送 ipcRenderer.send("siyuan-send-windows", {cmd: "closetab", data: tabId})
+窗口 B 发送 IPC 广播: 
+  ipcRenderer.send("siyuan-send-windows", {cmd: "closetab", data: tabId})
   ↓
 主进程广播到所有窗口 [main.js#L1301-L1305]
   ↓
-窗口 A 收到 closetab 命令 [onWindowsMsg.ts#L15-L16]，移除对应标签
+窗口 A 收到 closetab 命令 [onWindowsMsg.ts#L15-L16]
+  ↓
+tab.parent.removeTab(ipcData.data) → 移除原标签
 ```
+
+---
+
+### 7.11 同步机制总结
+
+| 同步类型 | 通道 | 推送范围 | 主窗口处理 | 独立窗口处理 |
+|---------|------|---------|-----------|-------------|
+| 文档重命名 | WebSocket | 所有应用所有会话 | ✅ 更新未激活标签标题 + reloadSync 处理已激活 | ✅ 相同逻辑 |
+| 文档删除 | WebSocket | 所有应用所有会话 | ✅ 关闭未激活标签 + reloadSync 关闭已激活 | ✅ 相同逻辑 |
+| 笔记本关闭 | WebSocket | 所有应用所有会话 | ✅ 关闭该笔记本所有标签 | ✅ 相同逻辑 |
+| 插件事件 | WebSocket | 所有应用所有会话 | ✅ 独立执行 reloadPlugin | ✅ 独立执行 reloadPlugin（独立插件实例） |
+| 标签拖拽关闭 | IPC | 所有窗口 | ✅ 移除对应标签 | ✅ 移除对应标签 |
+| 系统锁屏 | IPC | 所有窗口 | ✅ 根据配置锁屏 | ✅ 根据配置锁屏 |
+| 拖拽样式同步 | IPC | 所有窗口 | ✅ 更新样式 | ✅ 更新样式 + 调整拖拽区域 |
+
+**关键设计原则**：
+1. **数据同步走 WebSocket，控制同步走 IPC**
+2. **主窗口和独立窗口使用相同的处理代码**，确保行为一致
+3. **后端使用 PushMode 精确控制广播范围**，避免不必要的消息
+4. **未激活标签和已激活标签分开处理**，前者轻量更新，后者完整刷新
+5. **插件实例隔离**，各窗口独立管理自己的插件生命周期
 
 ---
 
@@ -1422,6 +1824,9 @@ Linux 系统下使用剪贴板管理特殊的粘贴事件拦截机制，通过 `
 1. **上传中断**：正在上传时窗口被强制关闭（任务管理器结束进程），上传状态不一致
 2. **网络异常**：exportLayout 的 fetchPost 失败可能导致布局未保存就关闭
 3. **并发关闭**：before-quit 事件遍历所有工作区发送 save-close，可能存在时序问题
+4. **事件时序竞态**：rename 事件和 syncMergeResult 事件到达顺序不确定，可能导致已激活标签标题重复更新
+5. **跨窗口状态不一致**：WebSocket 推送延迟可能导致不同窗口标签状态短暂不一致
+6. **插件事件同步失败**：独立窗口插件实例在 reloadPlugin 时出错，可能导致与主窗口插件状态不一致
 
 ### 12.4 性能风险
 
@@ -1453,6 +1858,12 @@ Linux 系统下使用剪贴板管理特殊的粘贴事件拦截机制，通过 `
 - [ ] 独立窗口关闭再重新打开后布局状态（预期：不可恢复，需重新创建）
 - [ ] 独立窗口多标签滚动位置保存与恢复
 - [ ] 独立窗口关闭时插件卸载的完整性
+- [ ] 文档重命名后所有窗口标签标题同步更新
+- [ ] 文档删除后所有窗口对应标签同步关闭
+- [ ] 笔记本关闭/删除后所有窗口相关标签同步关闭
+- [ ] 插件重载后主窗口和独立窗口插件状态一致性
+- [ ] 快速连续修改文档标题时各窗口状态一致性
+- [ ] 多窗口同时打开同一文档时，其中一个窗口删除文档的同步处理
 
 ### 13.2 性能验证
 
