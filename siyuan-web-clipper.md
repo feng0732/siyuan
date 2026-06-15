@@ -298,7 +298,7 @@ if strings.HasPrefix(symArticleHref, "https://ld246.com/article/") {
 | **图片** | `NodeLinkDest` + `ParentIs(NodeImage)` | ✅ 处理 | `node.Tokens` | `node.Tokens`（字节替换） | URL 字符串 | HTTP 下载 / 文件复制 | ✅ 计入 files & size | ✅ 一致 |
 | **普通链接** | `NodeLinkDest`（非图片父节点） | ❌ 跳过 | `node.Tokens` | `node.Tokens`（字节替换） | URL 字符串 | HTTP 下载 / 文件复制 | ✅ 计入 files & size | ✅ 一致 |
 | **超链接 TextMark** | `IsTextMarkType("a")` | ❌ 跳过 | `node.TextMarkAHref` | `node.TextMarkAHref`（字符串替换） | URL 字符串 | HTTP 下载 / 文件复制 | ✅ 计入 files & size | ✅ 一致 |
-| **音频/视频** | `NodeAudio` / `NodeVideo` | ❌ 跳过 | `GetNodeSrcTokens(node)` 解析 `Tokens` 中 `src="..."` | 仅 `node.Tokens`（字节替换）；**不更新 TextMarkAHref** | URL 字符串 | HTTP 下载 / 文件复制 | ✅ 计入 files & size | ❌ **严重不一致**，见下方分析 |
+| **音频/视频** | `NodeAudio` / `NodeVideo` | ❌ 跳过 | `GetNodeSrcTokens(node)` 解析 `Tokens` 中 `src="..."` | 仅 `node.Tokens`（字节替换）；TextMarkAHref**始终为空**无需更新 | URL 字符串 | HTTP 下载 / 文件复制 | ✅ 计入 files & size | ❌ **不一致**：`//` 前缀规范化操作了错误字段 |
 | **属性视图资源字段** | `NodeAttributeView` + `KeyTypeMAsset` | 仅 `AssetTypeImage` | `value.MAsset[].Content` | `asset.Content`（对象属性替换） | URL 字符串 | HTTP 下载 / 文件复制 | ✅ 计入 files & size | ✅ 一致 |
 
 **各类型详细差异与字段级分析**：
@@ -337,36 +337,48 @@ if strings.HasPrefix(symArticleHref, "https://ld246.com/article/") {
    - 提取条件：`NodeAudio` 或 `NodeVideo` 节点类型
    - 仅 `onlyImg=false` 时处理
    - 通过 `treenode.GetNodeSrcTokens(node)` 提取源地址（从 `Tokens` 解析 `src="..."` 属性）
-   - **节点数据结构**：
-     - `Tokens`：完整 HTML 标签，如 `<audio controls="controls" src="URL1" data-src="URL2"></audio>`
-     - `TextMarkAHref`：**创建时从未设置**（默认空字符串），可能在其他场景被赋值
-     - `src` 和 `data-src` 可存储**不同 URL**（从 guide 文档实证：`src` 指向压缩后文件，`data-src` 指向原始文件）
-   - **一致性验证（发现三个字段级 Bug）**：
+   - **节点数据结构实证**：
+     - `Tokens`：完整 HTML 标签，如 `<audio controls="controls" src="URL" data-src="URL"></audio>`
+     - 节点创建时（[file.go:1836](kernel/model/file.go#L1836)、[file.go:1842](kernel/model/file.go#L1842)），`src` 和 `data-src` **初始值为同一个 URL**
+     - `TextMarkAHref`：**始终为空字符串**，全局搜索未发现任何对 NodeAudio/NodeVideo 赋值该字段的代码
+     - 从 guide 文档可见，后续处理（如压缩、转码）可能会修改 `src` 指向压缩版本，此时 `src` 与 `data-src` 会变为不同 URL
+   - **一致性验证（发现一个确认 Bug，一个有条件风险，一个过度推断已排除）**：
 
-     **Bug 1：`//` 前缀规范化字段错误（致命）**
+     **确认 Bug：`//` 前缀规范化字段错位**
      ```go
-     // 实际代码
+     // setAssetsLinkDest 实际代码 [assets.go:1505-1509](kernel/model/assets.go#L1505-L1509)
      } else if ast.NodeAudio == node.Type || ast.NodeVideo == node.Type {
-         if strings.HasPrefix(node.TextMarkAHref, "//") {  // ❌ 检查的是 TextMarkAHref（空字符串）
+         if strings.HasPrefix(node.TextMarkAHref, "//") {  // ❌ 检查空字符串，永远为 false
              node.TextMarkAHref = "https:" + node.TextMarkAHref
          }
          node.Tokens = bytes.ReplaceAll(node.Tokens, []byte(oldDest), []byte(dest))
      }
      ```
-     - 问题：`TextMarkAHref` 是**空字符串**，`strings.HasPrefix("", "//")` 永远为 false
-     - 后果：`//` 开头的 URL 永远不会被规范化
-     - 叠加效应：`netAssets2LocalAssets0` 中 `dest = "https:" + dest` 已规范化 oldDest，但 `Tokens` 中仍是 `//example.com/...`
-     - **最终结果**：`//` 开头的音视频 URL **永远无法被替换**
+     - 问题根因：`TextMarkAHref` 为**空字符串**，`strings.HasPrefix("", "//")` 永远为 false
+     - 叠加效应：`netAssets2LocalAssets0` 在调用前已将 `dest`（即传入的 `oldDest`）规范化为 `https://...`，但 `Tokens` 中仍是原始 `//example.com/...`
+     - **最终影响链**：
+       1. **下载**：✅ 成功（使用规范化后的 URL `https://...` 发送请求）
+       2. **files 计数**：✅ +1（`files++` 在替换操作之后、`continue` 之前执行，替换失败不影响计数，见 [assets.go:416](kernel/model/assets.go#L416)）
+       3. **size 计数**：✅ 累加（同理，见 [assets.go:417](kernel/model/assets.go#L417)）
+       4. **重复命中缓存**：✅ 命中（`assetsMap` 以规范化后的 `https://...` 为键）
+       5. **重复命中替换**：❌ 仍失败（缓存命中后走相同的 `setAssetsLinkDest` 路径，同样的不匹配问题）
+       6. **成功提示**：✅ 显示（基于 `files>0` 判断，用户看到"下载完毕，一共 N 个文件"）
+       7. **文档内容**：❌ **未被替换**（`bytes.ReplaceAll` 在 `Tokens` 中查找 `https://...`，但实际存储的是 `//...`，不匹配）
+     - **用户感知**：前端提示"下载成功"，但点击播放仍从远程加载，**出现"显示成功但实际未本地化"的矛盾现象**
 
-     **Bug 2：`data-src` 属性未被提取和单独替换**
-     - 提取：`GetNodeSrcTokens()` 只解析 `src="..."` 的值，忽略 `data-src="..."`
-     - 替换：`bytes.ReplaceAll()` 只会替换与 `oldDest`（即 `src` 中的 URL）匹配的字符串
-     - 问题：如果 `data-src` 中的 URL 与 `src` 不同（如 guide 文档所示，分别指向压缩版和原始版），则 `data-src` **不会被替换**
-     - 后果：播放时可能仍从远程加载原始文件，本地化不彻底
+     **有条件风险：`data-src` 与 `src` 不同 URL 时未被替换**
+     - 提取时：`GetNodeSrcTokens()` 只解析 `src="..."` 的值
+     - 替换时：`bytes.ReplaceAll()` 会替换 Tokens 中所有与 `oldDest` 匹配的字符串
+     - **两种情况分析**：
+       - 情况 1（新建节点，`src` 与 `data-src` 相同）：✅ 两者同时被替换（字符串相同，ReplaceAll 全部命中）
+       - 情况 2（后续处理修改了其中一个，两者不同）：⚠️ 只有 `src` 被替换，`data-src` 保留原始 URL
+     - 触发条件：节点创建后被其他流程修改过（如压缩、转码、手动编辑）
+     - 后果：播放时根据前端播放器实现的优先级，可能仍从 `data-src` 指向的远程地址加载原始文件
 
-     **Bug 3：`TextMarkAHref` 未被同步更新**
-     - 如果 `TextMarkAHref` 在某些场景下被设置了 URL，替换时只更新了 `Tokens`，未更新 `TextMarkAHref`
-     - 后果：两个字段数据不一致，可能导致引用错乱
+     **已排除的过度推断：TextMarkAHref 未同步更新**
+     - 全局搜索 NodeAudio/NodeVideo 相关代码，**未发现任何路径会设置该字段**
+     - 节点创建时（[file.go](kernel/model/file.go#L1836-L1842)）只赋值 `Type` 和 `Tokens`，不涉及 `TextMarkAHref`
+     - 因此"两个字段数据不一致"的前提条件不存在，该风险不成立
 
 5. **属性视图资源字段（Attribute View MAsset）**
    - 数据库视图中的资源类型列
@@ -388,7 +400,7 @@ if strings.HasPrefix(symArticleHref, "https://ld246.com/article/") {
 - 大小通过 `gulu.File.GetFileSize()` 获取
 - 同样执行文件名过滤 + `network-asset-` 前缀 + ID 后缀
 
-#### 2.3.5 四类场景对计数、提示和文档内容的影响
+#### 2.3.5 场景对计数、提示和文档内容的影响矩阵
 
 资源本地化过程中，不同的执行结果对 **成功计数**、**用户可见提示** 和 **文档内容** 三方面的影响各不相同：
 
@@ -401,8 +413,8 @@ if strings.HasPrefix(symArticleHref, "https://ld246.com/article/") {
 | **本地文件复制失败** | ❌ 不计入 | ⚠️ 无显式提示（仅日志 Error） | ❌ 保留原始路径 | Copy 出错 / 文件不存在 / 目录 / 敏感路径 |
 | **无网络资源** | 0 | ℹ️ 信息提示："该文档中不存在网络文件"（3s） | ❌ 无变化 | `files==0 && forbiddenCount==0` |
 | **部分成功 + 防盗链** | 仅成功数计入 | ✅ 成功提示 + 🔴 防盗链警告（两条消息） | ✅ 成功的替换，失败的保留 | 混合场景 |
-| **音视频 `//` 前缀 URL** | ❌ 不计入 | ⚠️ 无提示，静默失败 | ❌ 保留原始 URL | 触发 **Bug 1**，`bytes.ReplaceAll` 不匹配 |
-| **音视频 `data-src` 不同 URL** | 仅 `src` 成功计入 | ✅ 显示成功提示（但不完整） | ⚠️ `src` 被替换，`data-src` 仍为远程 | 触发 **Bug 2**，`data-src` 未被提取 |
+| **音视频 `//` 前缀 URL** | ✅ **计入** files & size | ✅ **显示成功提示**（用户误以为本地化完成） | ❌ **保留原始 URL** | 触发确认 Bug：下载成功但 Tokens 与 oldDest 不匹配，替换无声失败 |
+| **音视频 `src`/`data-src` 已分化为不同 URL** | ✅ 计入（仅下载一份） | ✅ 显示成功提示 | ⚠️ `src` 被替换，`data-src` 仍为远程 | 触发有条件风险：节点被压缩/转码等流程修改过，两者不再相同 |
 
 **详细说明**：
 
@@ -411,6 +423,7 @@ if strings.HasPrefix(symArticleHref, "https://ld246.com/article/") {
    - 命中后直接调用 `setAssetsLinkDest()` 替换链接
    - 不计入 `files` 和 `size`（避免重复统计）
    - 文档内容会被替换（所有出现处都指向同一个本地文件）
+   - **音视频 `//` 前缀特殊情况**：重复命中后替换同样失败（走相同的不匹配路径）
 
 2. **防盗链统计**
    - 检测条件：`resp.StatusCode == 403 || resp.StatusCode == 401`
@@ -423,14 +436,19 @@ if strings.HasPrefix(symArticleHref, "https://ld246.com/article/") {
    - 仅通过 `logging.LogErrorf()` / `LogWarnf()` 记录日志
    - 用户需自行对比前后内容判断是否有遗漏
    - 失败的资源保留原始 URL，文档内容部分变化
-   - **音视频 `//` 前缀失败**：属于此类，无任何提示，用户无法感知
+   - **音视频 `//` 前缀替换失败**：属于此类中最隐蔽的情况——下载和计数都成功，只有文档替换静默失败
 
 4. **成功计数与提示**
    - 成功提示：`"下载完毕，一共 [N] 个文件，共占用 [X] 磁盘空间"`
    - 提示形式：`PushUpdateMsg()` 更新"正在写入"消息为成功消息
    - `files == 0 && forbiddenCount == 0` → 显示"不存在网络文件"
    - `files > 0 && forbiddenCount > 0` → 同时显示成功消息 + 防盗链警告（两条独立消息）
-   - **注意**：音视频 `data-src` 未替换时，成功计数是准确的（只下载了 `src` 对应的文件），但文档内容不完整
+   - **音视频 `//` 前缀场景的特殊矛盾**：提示显示成功（因为 files>0），但文档内容未变化，用户无法从界面判断出问题
+
+5. **音视频 `src`/`data-src` 分化场景**
+   - 该场景仅在节点被后续处理修改过 `src` 或 `data-src` 其中之一时才会发生
+   - 由于只提取了 `src` 中的 URL，只下载了一份文件，成功计数是准确的
+   - 但文档内容不完整，`data-src` 仍指向远程地址，播放行为取决于前端实现的读取优先级
 
 #### 2.3.6 Base64 图片处理
 
@@ -798,9 +816,10 @@ assetsMap[url] 内存字典查询
 - 仅在单次 `NetAssets2LocalAssets()` 调用内有效
 - 跨多次调用同一 URL 会被重复下载（无持久化 URL 去重）
 - 同一份文件在不同 URL 下不会被识别为重复（无内容哈希校验）
-- **音频/视频特殊问题**：
-  - 去重键为 `src` 属性的 URL，`data-src` 中的不同 URL 不会去重
-  - `//` 前缀的 URL 由于规范化 Bug，`oldDest` 被规范化为 `https://...`，但 `assetsMap` 键也为 `https://...`，理论上可命中去重；但由于 `Tokens` 仍为 `//...`，`setAssetsLinkDest` 中的 `bytes.ReplaceAll` 无法匹配，**导致去重命中但替换失败**
+- **音频/视频特殊情况**：
+  - 去重键为从 `src` 提取的 URL（规范化后的 `https://...`）
+  - `data-src` 中的不同 URL 不会被独立去重（当两者相同时无影响，当两者分化后仅 `src` 参与去重）
+  - `//` 前缀 URL：去重缓存层能正常命中（因为键是规范化后的 `https://...`），但替换层失败（`Tokens` 中仍是 `//...` 不匹配），**导致"去重命中、文件不下载、但文档也未替换"的特殊状态**——此时 files/size 不计入，成功提示取决于是否有其他成功下载的文件
 
 #### 4.3.4 缓存一致性保证
 
@@ -883,17 +902,18 @@ assetsMap[url] 内存字典查询
    - 文件名被 `FilterUploadFileName` 过滤重命名后用户无感知
    - `onlyImg` 模式下仅图片被替换，普通链接/音视频/属性视图文件仍为远程链接，用户可能误判
    - 属性视图资源字段替换后需单独 `av.SaveAttributeView()` 持久化，失败无独立提示
-   - **音视频 `//` 前缀 URL 完全静默失败**（Bug 1）：无提示、无日志、无法被替换
+   - **音视频 `//` 前缀 URL 显示成功但未替换**（确认 Bug）：提示"下载成功"、计数正常累加，但 Tokens 仍为远程 URL，用户无法察觉
 
 4. **去重机制覆盖不足**：
    - 网络资源本地化仅同批次 URL 去重，跨多次调用重复下载同一 URL
    - 同内容不同 URL 的资源不会被去重（无内容哈希校验）
    - 上传与本地化两套去重机制互不相通
+   - 音视频 `//` 前缀 URL：去重层命中但替换层失败，出现"去重成功、文件不下载、文档也未替换"的矛盾状态
 
-5. **音视频本地化不彻底（已确认 Bug）**：
-   - **Bug 1**：`//` 前缀的音视频 URL 永远无法被替换（规范化字段错误）
-   - **Bug 2**：`data-src` 属性中的不同 URL 不会被提取和替换，可能仍从远程加载原始文件
-   - **Bug 3**：`TextMarkAHref` 未被同步更新，存在字段不一致风险
+5. **音视频本地化问题（1 个确认 Bug + 1 个有条件风险，已排除 1 个过度推断）**：
+   - **确认 Bug**：`//` 前缀的音视频 URL "下载成功但文档未替换"——`netAssets2LocalAssets0` 层已规范化下载地址，但 `setAssetsLinkDest` 层规范化了错误字段（TextMarkAHref 空字符串），导致 Tokens 中原始 `//` URL 与规范化 oldDest 不匹配
+   - **有条件风险**：当节点被压缩/转码等后续流程修改，`src` 与 `data-src` 变为不同 URL 时，`data-src` 指向的地址不会被本地化
+   - **已排除的过度推断**：`TextMarkAHref` 字段不一致风险——全局搜索未发现任何对 NodeAudio/NodeVideo 赋值该字段的代码，该字段始终为空字符串
 
 ### 5.4 错误处理缺陷
 
@@ -917,9 +937,9 @@ assetsMap[url] 内存字典查询
 4. **并发安全**：资源缓存的 `sync.Mutex` 是否足以应对高并发上传场景？
 5. **网络资源下载超时**：`NewCustomReqClient()` 是否配置了合理的超时时间？
 6. **属性视图资源替换原子性**：`av.SaveAttributeView()` 失败时是否会导致文档树与属性视图不一致？
-7. **NodeAudio/NodeVideo 的 TextMarkAHref 使用场景**：该字段在哪些流程中会被赋值？（目前创建时未设置）
-8. **本地文件链接识别**：`FileURLToLocalPath()` 的判定逻辑是否覆盖所有本地路径格式（Windows/Unix）？
-9. **音视频 `data-src` 的实际用途**：前端播放时优先使用 `src` 还是 `data-src`？两者分别何时被更新？
+7. **本地文件链接识别**：`FileURLToLocalPath()` 的判定逻辑是否覆盖所有本地路径格式（Windows/Unix）？
+8. **音视频 `data-src` 实际读取优先级**：前端播放器播放时优先读取 `src` 还是 `data-src`？这决定了有条件风险的严重程度
+9. **`src`/`data-src` 分化触发条件**：除压缩/转码外，还有哪些流程会修改两者使其不同？
 
 ### 6.2 优化方向
 
@@ -931,11 +951,11 @@ assetsMap[url] 内存字典查询
 6. **两类去重机制融合**：网络资源本地化完成后是否应写入内容哈希缓存，避免后续上传时重复保存？
 7. **onlyImg 模式提示**：仅图片模式下，对未处理的链接/音视频/资源字段给予用户提示
 8. **失败计数统计**：补充总失败数、按错误类型分类统计
-9. **Bug 修复 - 音视频 `//` 前缀规范化**：将 `setAssetsLinkDest()` 中 `TextMarkAHref` 的规范化移至 `Tokens`，或在替换前先规范化 Tokens 中的 URL：
+9. **Bug 修复 - 音视频 `//` 前缀规范化**：将 `setAssetsLinkDest()` 中针对 `TextMarkAHref` 的规范化改为针对 `Tokens` 中的 `src` 和 `data-src` 属性：
    ```go
    // 修复方案示例
    } else if ast.NodeAudio == node.Type || ast.NodeVideo == node.Type {
-       // 先规范化 Tokens 中的 // 前缀
+       // 先规范化 Tokens 中的 // 前缀（同时处理 src 和 data-src）
        if bytes.Contains(node.Tokens, []byte("src=\"//")) {
            node.Tokens = bytes.Replace(node.Tokens, []byte("src=\"//"), []byte("src=\"https://"), 1)
        }
@@ -945,9 +965,9 @@ assetsMap[url] 内存字典查询
        node.Tokens = bytes.ReplaceAll(node.Tokens, []byte(oldDest), []byte(dest))
    }
    ```
-10. **Bug 修复 - 音视频 `data-src` 提取与替换**：修改 `getRemoteAssetsLinkDests()` 同时提取 `src` 和 `data-src`，并确保两者都被替换
-11. **Bug 修复 - 音视频 `TextMarkAHref` 同步更新**：在 `setAssetsLinkDest()` 中同步更新 `TextMarkAHref`（如果存在）
-12. **静默失败场景提示**：对音视频 `//` 前缀等静默失败场景增加日志或用户提示
+10. **Bug 修复 - 音视频替换前后一致性校验**：在 `setAssetsLinkDest()` 返回前检查 `Tokens` 中是否仍包含原始 URL，若包含则记录日志或标记失败
+11. **Bug 修复 - 音视频 `data-src` 独立提取与下载**：修改 `getRemoteAssetsLinkDests()` 同时提取 `src` 和 `data-src`（当两者不同时），分别下载并替换
+12. **"显示成功但未替换"场景检测**：在 `netAssets2LocalAssets0` 中对比替换前后的文档树，检测替换失败但计数成功的异常场景并给予用户警告
 
 ---
 
