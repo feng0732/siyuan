@@ -510,20 +510,32 @@ catch (error) {
 
 ### 4.2 data-render 状态机（防重复渲染核心）
 
-`data-render` 属性是整个渲染协作体系的核心状态标记，全代码库共 **91 处**引用（grep 结果），其中：
+`data-render` 属性是整个渲染协作体系的核心状态标记。
 
-| 操作类型 | 次数 | 典型场景 |
+**搜索口径与排除说明**（统计范围：`app/src` 目录）：
+
+| 口径 | 数量 | 说明 |
 |---|---|---|
-| **设置为 true** | 18 处 | 各渲染器 forEach 内首行；AV 渲染完成 |
-| **查询 true / 非 true** | 26 处 | 各渲染器 `:not([data-render="true"])` 过滤 |
-| **移除属性** | 47 处 | 编辑浮层 input；事务更新；回车；粘贴；代码语言切换；撤销重做等 |
+| 宽泛关键词 `data-render` 匹配 | 93 行 / 29 文件 | 含 `data-rendering` 干扰属性 |
+| 精确后缀 `data-render[='"\]]` 匹配 | **89 行 / 26 文件** | 排除 `data-rendering`（4 处 / 3 文件）干扰 |
+| 其中：注释行 | 1 行 | `transaction.ts` L248，已人工排除 |
+| **有效代码行合计** | **88 行 / 26 文件** | 89 − 1 注释 = 88 ✓ |
+
+**按操作分类统计**（按代码行计数，每行归入其主操作）：
+
+| 操作类型 | 代码行数 | 涉及文件数 | 典型场景及证据 |
+|---|---|---|---|
+| **setAttribute 设置** | 15 行 | 15 文件 | 设为 `"true"`: 10 个渲染器 + highlight + av/render + av/gallery + Title（14 处）<br>设为 `"2"`: `removeEmbed.ts` L12（1 处，嵌入块删除过渡态） |
+| **removeAttribute 移除** | 45 行 | 16 文件 | 事务更新 13 处 + gutter 9 处 + toolbar 4 处 + AV 4 处 + 其他 15 处（见索引） |
+| **查询（读操作）** | 28 行 | ~19 文件 | getAttribute 判断（17 处）+ CSS 选择器 `querySelector/All` 过滤（13 处）− 链式调用重叠（2 处） |
+| **校验合计** | **88 行** | **26 文件** | 15 + 45 + 28 = 88 ✓ |
 
 **状态转换表：**
 
 | 状态 | 属性值 | 含义 | 触发操作及证据 |
 |---|---|---|---|
-| 待渲染 | 属性不存在 / 非 "true" | 需要执行渲染 | 编辑浮层：`toolbar/index.ts` L1078 `removeAttribute("data-render")`<br>事务推送：`transaction.ts` L135, L189, L340 等 |
-| 渲染中 / 完成 | "true" | 已渲染 / 正在渲染，跳过 | 各渲染器：`setAttribute("data-render", "true")` 如 mathRender L23 |
+| 待渲染 | 属性不存在 / 非 "true" | 需要执行渲染 | 编辑浮层：`toolbar/index.ts` L1078 `removeAttribute("data-render")`<br>事务推送：`transaction.ts` L135, L189, L340 等（共 45 处移除触发） |
+| 渲染中 / 完成 | "true" | 已渲染 / 正在渲染，跳过 | 各渲染器：`setAttribute("data-render", "true")` 如 `mathRender.ts` L23（共 14 处设为 true） |
 
 **关键设计证据**（`app/src/protyle/render/blockRender.ts` L23-L24）：
 ```typescript
@@ -835,6 +847,10 @@ lute.SetSanitize(options.sanitize);
 | 可渲染语言白名单 | `app/src/constants.ts` | L841-L843 |
 | 图标 / 渲染框架生成 | `app/src/protyle/render/util.ts` | L5-L43 |
 | 编辑浮层（showRender） | `app/src/protyle/toolbar/index.ts` | L1050-L1180 |
+| **data-render 状态标记汇总** | — | 全代码库 88 行有效代码 / 26 文件（15 设置 + 45 移除 + 28 查询） |
+| &nbsp;&nbsp;data-render 设置（设为 true，14 处） | 10 个渲染器 + highlight + av + Title | 各渲染器首行 forEach 内 |
+| &nbsp;&nbsp;data-render 移除（最多，45 处） | 16 个文件 | transaction.ts 13 处 + gutter 9 处 + toolbar 4 处 + AV 4 处 + 其他 15 处 |
+| &nbsp;&nbsp;data-render 查询（28 处） | ~19 个文件 | getAttribute(17) + CSS选择器过滤(13) − 链式重叠(2) |
 | 事务处理（9 处调用，Σ行号=9 ✓） | `app/src/protyle/wysiwyg/transaction.ts` | L115, L235, L315, L375, L429, L888, L1255, L1359, L1494 |
 | 回车分裂（5 处调用，Σ行号=5 ✓） | `app/src/protyle/wysiwyg/enter.ts` | L93, L99, L483, L564, L571 |
 | 编辑器浮层（4 处调用，Σ行号=4 ✓） | `app/src/protyle/toolbar/index.ts` | L1081, L1163, L1176, L1835 |
