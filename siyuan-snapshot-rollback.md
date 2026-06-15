@@ -6,6 +6,8 @@
 > - 数据库版本：DatabaseVer = "20220501" (`kernel/util/runtime.go:90`)
 > - dejavu 仓库库：v0.0.0-20260411080619-1de6197a80f4 (`kernel/go.mod:66`)
 > - 分析代码行覆盖：约 5,200 行
+>
+> **引用说明**：全文代码位置采用「仓库相对路径 + 行号范围」格式，例如 `kernel/model/history.go:54-60` 表示仓库根目录下 `kernel/model/history.go` 文件的第 54 至 60 行。单一行号如 `kernel/model/transaction.go:440` 表示精确行定位。
 
 ---
 
@@ -944,4 +946,6 @@ HistoryTypeDatabase = 4  // 数据库
 > **生成时间**：2026-06-15
 > **分析版本**：SiYuan v3.6.5 (kernel)
 > **分析范围**：9 个核心文件 / ~5,200 行代码 / 33 个 API 端点
-> **代码引用数量**：80+ 处可点击跳转
+> **代码引用格式**：全文采用「仓库相对路径 + 行号范围」格式引用，例如 `kernel/model/history.go:54-60` 表示仓库根目录下 `kernel/model/history.go` 文件的第 54 至 60 行
+> **代码引用数量**：约 70 处代码位置引用（涵盖 12 个核心文件）
+> **代码片段**：15+ 处源码片段（含 Go 代码块）
