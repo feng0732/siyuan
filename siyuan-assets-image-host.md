@@ -209,15 +209,16 @@ MultipartForm 解析（c.Request.MultipartForm）
 
 SiYuan 涉及"云端"的资源处理存在三种**完全不同**的语义，代码证据表明它们的行为、触发方式和对正文的影响均严格区分，不可混淆：
 
-| 维度 | 场景一：云端批量上传 | 场景二：标准 Markdown 导出渲染 | 场景三：发布到链滴社区 |
-|------|---------------------|------------------------------|----------------------|
-| **核心语义** | 把本地资源推到 SiYuan 云端做备份/CDN | 输出 .md 时给链接加云端前缀 | 先上传社区图床再发帖 |
+| 维度 | 场景一：云端批量上传 | 场景二：语雀复制（标准 Markdown 渲染） | 场景三：发布到链滴社区 |
+|------|---------------------|--------------------------------------|----------------------|
+| **核心语义** | 把本地资源推到 SiYuan 云端做备份/CDN | 复制为 Markdown 时给链接加云端前缀（含空格→下划线） | 先上传社区图床再发帖 |
 | **触发函数** | `UploadAssets2Cloud` / `UploadAssets2CloudByAssetsPaths` | `ExportStdMarkdown` | `Export2Liandi` |
 | **内部调用** | `uploadAssets2Cloud(assets, bizTypeUploadAssets, ignorePushMsg)` | `exportMarkdownContent0(tree, cloudAssetsBase, …)` | 先 `uploadAssets2Cloud(assets, bizTypeExport2Liandi, false)`，再 `exportMarkdownContent0(tree, forumAssetsBase, assetsDestSpace2Underscore=true, …)` |
 | **bizType 参数** | `"upload-assets"` | 不参与上传 | `"export-liandi"` |
 | **meta-type** | `5`（SiYuan 内部） | N/A | `4`（社区 Client） |
 | **上传目标** | `{cloudServer}/apis/siyuan/upload` | 不上传 | `{cloudServer}/apis/siyuan/upload`，最终链接前缀 `{forumAssetsServer}/{yyyymm}/siyuan/{userId}/` |
-| **是否回写正文（.sy 文件）** | **完全不回写**，保留本地 `assets/` 链接 | **完全不回写**，仅内存渲染 | **仅回写 `custom-liandi-articleid` 属性**，不修改资源链接 |
+| **内存 tree 修改** | 只读遍历，不改 tree | `exportTree` 直接修改传入 tree（`ret=tree` 无克隆） | 同左，且 `assetsDestSpace2Underscore` 会把 tree 中链接的空格替换为下划线 |
+| **是否回写正文（.sy 文件）** | **完全不回写**，保留本地 `assets/` 链接 | **完全不回写**，tree 是一次性副本 | **仅回写 `custom-liandi-articleid` 属性**，资源链接修改只在内存 |
 | **返回值** | `count`（成功上传个数） | `string`（渲染后的 Markdown 文本） | `error`（社区发帖是否成功） |
 
 ### 场景一：云端批量上传（上传到云端图床菜单）
@@ -275,76 +276,125 @@ func uploadAssets2Cloud(assetPaths []string, bizType string, ignorePushMsg bool)
 
 ---
 
-### 场景二：标准 Markdown 导出的资源前缀渲染
+### 场景二：语雀复制（标准 Markdown 渲染）
 
-**触发入口：**
+**触发入口（唯一 1 个，有代码证据）：**
 
-| 入口 | API | 说明 |
-|------|-----|------|
-| 导出菜单 | 前端通过 `POST /api/export/*` 系列路由 | 后端 API 通过 `kernel/api/router.go` 的标准导出端点调用 |
-| 直接调用 | `ExportStdMarkdown(id, ...)` | 供其他内核逻辑复用 |
+| 入口 | 前端位置 | API | 参数 |
+|------|---------|-----|------|
+| 预览窗右上角「复制为 Markdown → 语雀」 | `app/src/protyle/preview/index.ts#L65-L66` 定义按钮，`L280-L290` 点击调用 | `POST /api/lute/copyStdMarkdown` | `{id: protyle.block.id || protyle.options.blockId || protyle.block.parentID, assetsDestSpace2Underscore: true, fillCSSVar: true, adjustHeadingLevel: true}` |
+
+**关键证据：**
+- 前端：`app/src/protyle/preview/index.ts#L281` → `fetchPost("/api/lute/copyStdMarkdown", {...})`，调用后 `writeText(response.data)` 写入剪贴板 + `showMessage(pasteToYuque)` 提示
+- 路由：`kernel/api/router.go#L176` → `POST /api/lute/copyStdMarkdown`，仅 `CheckAuth` 鉴权（不需要 Admin 角色，只读上下文也可调用）
+- Handler：`kernel/api/lute.go#L67` → 唯一调用 `model.ExportStdMarkdown(id, assetsDestSpace2Underscore, fillCSSVar, adjustHeadingLevel, imgTag=false)` 的地方
+- **⚠️ 代码证明：** 在 `kernel/` 目录全文搜索 `ExportStdMarkdown`，仅 `kernel/api/lute.go:L67` 这一处调用，没有其他内核逻辑复用，也没有"导出菜单"对应的后端端点调用
+
+**完整调用链：**
+
+```
+预览窗点击「复制为语雀」
+  └─ fetchPost("/api/lute/copyStdMarkdown", {id, assetsDestSpace2Underscore:true})
+       └─ CheckAuth 鉴权
+            └─ kernel/api/lute.go: copyStdMarkdown(c)
+                 └─ model.ExportStdMarkdown(id, true, true, true, false)
+                      ├─ prepareExportTree(bt) → filesys.LoadTree → parseJSON2Tree
+                      │    ★ 每次返回新 tree 对象，与缓存/磁盘无引用关联
+                      ├─ IsSubscriber() 判定 → 决定 cloudAssetsBase 是否非空
+                      └─ exportMarkdownContent0(id, tree, cloudAssetsBase, assetsDestSpace2Underscore=true, ...)
 
 **关键代码 `kernel/model/export.go#L1678-L1722`：**
 
 ```go
-func ExportStdMarkdown(id string, ...) string {
+func ExportStdMarkdown(id string, assetsDestSpace2Underscore, fillCSSVar, adjustHeadingLevel, imgTag bool) string {
+    bt := treenode.GetBlockTree(id)
     tree := prepareExportTree(bt)
     cloudAssetsBase := ""
     if IsSubscriber() {
         cloudAssetsBase = util.GetCloudAssetsServer() + Conf.GetUser().UserId + "/"
         // 中国大陆示例："https://assets.b3logfile.com/siyuan/{userId}/"
     }
-    return exportMarkdownContent0(id, tree, cloudAssetsBase, ...)
+    return exportMarkdownContent0(id, tree, cloudAssetsBase, assetsDestSpace2Underscore, ...)
 }
 ```
 
-**前缀注入方式（`kernel/model/export.go#L2300-L2301`）：**
+**前缀注入 + 空格替换的真实影响边界（`kernel/model/export.go#L2300-L2326`）：**
 
 ```go
-luteEngine := NewLute()
+// 步骤 A：LinkBase 前缀（仅影响 lute 渲染输出，不修改 AST）
 if "" != cloudAssetsBase {
     luteEngine.RenderOptions.LinkBase = cloudAssetsBase
 }
+
+// 步骤 B：空格→下划线（直接修改内存 tree 的 Tokens 字段）
+if assetsDestSpace2Underscore {
+    ast.Walk(tree.Root, func(n *ast.Node, entering bool) ast.WalkStatus {
+        if ast.NodeLinkDest == n.Type && util.IsAssetLinkDest(n.Tokens, false) {
+            n.Tokens = bytes.ReplaceAll(n.Tokens, []byte(" "), []byte("_"))
+        } else if n.IsTextMarkType("a") && util.IsAssetLinkDest([]byte(href), false) {
+            n.TextMarkAHref = strings.ReplaceAll(href, " ", "_")
+        } else if (ast.NodeIFrame == n.Type || ast.NodeAudio == n.Type || ast.NodeVideo == n.Type) {
+            setAssetsLinkDest(n, dest, strings.ReplaceAll(dest, " ", "_"))
+        }
+        return ast.WalkContinue
+    })
+}
 ```
 
-这是 Lute 渲染引擎的配置项，**仅在内存中渲染 AST→Markdown 时对所有以 `assets/` 开头的链接附加前缀**。输出的 `.md` 文件中链接会变成绝对云端 URL，但工作空间里的 `.sy` 文件不受任何修改。
+⚠️ **边界区分（有代码证据）：**
+
+| 操作 | 是否修改内存 tree | 是否修改磁盘 .sy | 代码位置 |
+|------|-------------------|------------------|----------|
+| `LinkBase = cloudAssetsBase` | ❌ 不修改 AST，仅渲染时附加前缀 | ❌ | L2300-L2302 |
+| `assetsDestSpace2Underscore` 替换 | ✅ 直接修改 `n.Tokens` / `TextMarkAHref` | ❌ 无任何 writeTree | L2303-L2326 |
+
+**结论：** 该场景所有 tree 修改只在内存中，`ExportStdMarkdown` 返回的 string 是已替换空格并加了前缀的 Markdown 文本，用于前端复制到剪贴板；工作空间 `.sy` 文件完全不受影响。
 
 ---
 
 ### 场景三：发布到链滴社区
 
-**触发入口：**
+**触发入口（唯一 1 个，有代码证据）：**
 
 | 入口 | 前端位置 | API | 参数 |
 |------|---------|-----|------|
 | 面包屑菜单「分享到链滴」 | `app/src/protyle/breadcrumb/index.ts#L375-L387` | `POST /api/export/export2Liandi` | `{id: protyle.block.parentID}`（整个文档，注意这里是 **parentID**，不是 uploadCloud 用的 id） |
 
-**完整调用链（`kernel/model/export.go#L322-L439`）：**
+**完整调用链 + 内存/磁盘边界分析（`kernel/model/export.go#L322-L439`）：**
 
 ```
 export2Liandi(c)
   └─ Export2Liandi(id)
+       │
+       ├─ ★ 内存 tree A 创建：LoadTreeByBlockID(id) → 新对象
+       │    证据：kernel/model/tree.go#L217-L242 → loadTreeByBlockTree
+       │    → filesys.LoadTreeWithFix → cache.GetTreeData → LoadTreeByData
+       │    → parseJSON2Tree → dataparser.ParseJSON（每次新建 *parse.Tree）
+       │
        ├─ IsUserGuide(tree.Box) → 拒绝用户指南文档发布
        │
-       ├─ Step 1: 上传到社区图床
+       ├─ Step 1: 上传到社区图床（只读遍历 tree A）
        │    ├─ getAssetsLinkDests + getQueryEmbedNodesAssetsLinkDests 去重
        │    └─ uploadAssets2Cloud(assets, bizTypeExport2Liandi="export-liandi", ignorePushMsg=false)
-       │         └─ 上传时 meta-type=4（Client 标识），但**仍不回写正文**
+       │         └─ 上传时 meta-type=4（Client 标识），不回写正文
        │
-       ├─ Step 2: 内存构造社区格式 Markdown
-       │    └─ exportMarkdownContent0(
-       │         id, tree,
-       │         // cloudAssetsBase 前缀：
-       │         util.GetCloudForumAssetsServer()
-       │           + time.Now().Format("2006/01") + "/siyuan/"
-       │           + Conf.GetUser().UserId + "/",
-       │         // 中国大陆示例：
-       │         //   "https://b3logfile.com/file/2025/06/siyuan/{userId}/"
-       │         assetsDestSpace2Underscore=true,   // ★ 空格 → 下划线
-       │         ...)
-       │         └─ 内部 AST 遍历（L2303-L2326）：NodeLinkDest、TextMark a、IFrame/Audio/Video
-       │              的 assets 链接中空格替换为 _（因为论坛图床服务端会自动做该转换）
-       │              这一步是在 exportTree 的副本上操作，不写回磁盘
+       ├─ Step 2: 内存构造社区格式 Markdown（★ 修改 tree A）
+       │    └─ exportMarkdownContent0(id, tree, util.GetCloudForumAssetsServer()
+       │                + time.Now().Format("2006/01") + "/siyuan/" + Conf.GetUser().UserId + "/",
+       │         assetsDestSpace2Underscore=true, ...)
+       │         │
+       │         ├─ 子调用 1：exportTree(tree, ...) L2429 → ret = tree（无克隆）
+       │         │    ├─ resolveEmbedR：修改查询嵌入节点的子节点
+       │         │    ├─ blockLink2Ref：修改超链接 TextMark 类型
+       │         │    └─ 多处 ast.Walk 直接修改 n.Type / n.Tokens / n.IAL
+       │         │
+       │         └─ 子调用 2：assetsDestSpace2Underscore=true 空格替换 L2303-L2326
+       │              ├─ ast.Walk(tree.Root, ...) 遍历
+       │              ├─ NodeLinkDest: n.Tokens = bytes.ReplaceAll(..., " ", "_")
+       │              ├─ TextMark a:   n.TextMarkAHref = strings.ReplaceAll(..., " ", "_")
+       │              ├─ IFrame/Audio/Video: setAssetsLinkDest(n, dest, strings.ReplaceAll(...))
+       │              └─ ★ 代码证明：此处直接修改 tree A 的 AST 节点字段，但
+       │                 整个 exportMarkdownContent0 函数体内无任何 writeTree 调用
        │
        ├─ Step 3: 查询是否已发布过（custom-liandi-articleid）
        │    ├─ GET /api/v2/article/update/{id}
@@ -354,15 +404,38 @@ export2Liandi(c)
        │    ├─ POST 或 PUT {accountServer}/api/v2/article
        │    └─ Body: {articleTitle, articleTags, articleContent=渲染的Markdown}
        │
-       └─ Step 5: ★ 唯一的回写操作
-            └─ 首次发布成功 → 给根文档块 IAL 添加 custom-liandi-articleid 属性
-                 这一步通过 writeTreeUpsertQueue(tree) 写回磁盘，但完全不涉及资源链接字段
+       └─ Step 5: ★ 唯一的磁盘写回操作
+            └─ 首次发布成功 → 注释 L430：
+                 "tree, _ = LoadTreeByBlockID(id) // 这里必须重新加载，因为前面导出时已经修改了树结构"
+                 │
+                 ├─ ★ 内存 tree B 创建：第二次 LoadTreeByBlockID(id)
+                 │    从磁盘/缓存重建全新对象，tree A 的所有修改都不影响 tree B
+                 │
+                 ├─ tree.Root.SetIALAttr(liandiArticleIdAttrName, articleId)
+                 │    仅修改 IAL 属性，不涉及任何资源链接字段
+                 │
+                 └─ writeTreeUpsertQueue(tree) → 写回磁盘
+                      证据：kernel/model/tree.go 的 writeTreeUpsertQueue
+                      只把 tree B（包含新 IAL 属性）持久化到 .sy 文件
 ```
+
+⚠️ **内存 tree 修改 vs 磁盘写回边界（逐条有代码证据）：**
+
+| 操作 | 作用对象 | 是否修改内存 | 是否写回磁盘 | 代码位置 |
+|------|---------|-------------|-------------|----------|
+| `getAssetsLinkDests` 提取 | tree A | ❌ 只读 | ❌ | L334 |
+| `uploadAssets2Cloud` 上传 | tree A | ❌ 只读 | ❌ | L338 |
+| `exportTree` AST 转换 | tree A | ✅ 直接修改节点 | ❌ | L2429 |
+| `assetsDestSpace2Underscore` 空格替换 | tree A | ✅ 修改 `Tokens` / `TextMarkAHref` | ❌ | L2303-L2326 |
+| **第二次 `LoadTreeByBlockID`** | 创建 tree B | ✅ 新对象，含磁盘原始内容 | ❌ | L430 |
+| `SetIALAttr("custom-liandi-articleid")` | tree B | ✅ 仅修改 IAL | ❌ | L431 |
+| `writeTreeUpsertQueue(tree)` | tree B | ❌ | ✅ 持久化 .sy 文件 | L432 |
 
 **关键证据：**
 - `assetsDestSpace2Underscore=true` 对应社区图床对含空格文件的自动重命名逻辑
 - `GetCloudForumAssetsServer`（社区）≠ `GetCloudAssetsServer`（订阅者导出）—— 两套独立服务域名
-- 回写只有 `custom-liandi-articleid` 属性这一处
+- **⚠️ 代码证明：** L430 的注释明确说明必须重新加载 tree，因为前面的导出流程已经修改了 tree 结构——这是 `exportMarkdownContent0` 会修改传入 tree 对象的直接证据
+- **回写只有 `custom-liandi-articleid` 属性这一处**，且是在重新加载的新 tree B 上进行的，tree A 中所有资源链接的空格修改完全被丢弃，不会写回磁盘
 
 ---
 
@@ -719,18 +792,27 @@ Step 1: 文件系统层
   ├─ 同步复制 {old}.sya → {new}.sya（PDF 标注）
   └─ OCR 文本：util.SetAssetText(newPath, GetAssetText(oldPath))
 
-Step 2: 所有文档内容遍历 ★（此处确实会回写正文，和 UploadAssets2Cloud 不同）
-  ├─ 分页（32）遍历所有笔记本下的 .sy 文件
-  ├─ bytes.Contains → bytes.Replace(oldName, newName, -1)
-  ├─ filelock.WriteFile → 写回磁盘
+Step 2: 所有文档内容遍历 ★（与前三个场景对比：这是**唯一**会回写正文资源链接的函数）
+  ├─ 证据：kernel/model/assets.go#L952-L972 分页（32）遍历所有笔记本下的 .sy 文件
+  ├─ bytes.Contains 检测旧文件名 → bytes.Replace(oldName, newName, -1) 替换
+  ├─ filelock.WriteFile → 写回磁盘（L968）
   ├─ 重新解析 tree → generateTreeHistory → UpsertBlockTree + UpsertTreeQueue
   └─ cache.RemoveTreeData 失效缓存
 
 Step 3: 数据库（Attribute View）JSON 替换
-  └─ storage/av/*.json 全量 bytes.ReplaceAll(oldPath, newPath)
+  └─ kernel/model/assets.go#L992-L999: storage/av/*.json 全量 bytes.ReplaceAll(oldPath, newPath)
 
 Step 4: IncSync() → 触发云同步
 ```
+
+⚠️ **与其他场景的写回对比（代码证据）：**
+
+| 函数 | 是否回写 .sy 正文资源链接 | 代码位置 |
+|------|--------------------------|----------|
+| `UploadAssets2Cloud` | ❌ 不回写，只上传 | `kernel/model/assets.go#L662-L776` 无 writeTree/WriteFile |
+| `ExportStdMarkdown` | ❌ 不回写，只返回渲染文本 | `kernel/model/export.go#L1678-L1722` 无 writeTree/WriteFile |
+| `Export2Liandi` | ⚠️ 仅回写 IAL 属性 `custom-liandi-articleid`，不修改资源链接 | `kernel/model/export.go#L430-L434` 仅 SetIALAttr |
+| `RenameAsset` | ✅ 全文替换资源链接并写回 .sy | `kernel/model/assets.go#L963-L972` bytes.Replace + WriteFile |
 
 API 端点：`POST /api/asset/renameAsset`（`kernel/api/asset.go#L177-L198`）。
 
@@ -748,14 +830,21 @@ API 端点：`POST /api/asset/renameAsset`（`kernel/api/asset.go#L177-L198`）�
 | 导出格式 | 资源处理方式 | 关键实现 |
 |---------|-------------|---------|
 | **发布到链滴社区** | 见前文场景三：上传社区图床 + 内存前缀渲染（含空格→下划线），POST 到社区 API | `Export2Liandi` L322-L439 |
-| **标准 Markdown** | 订阅者 `IsSubscriber()` 情况下通过 `luteEngine.RenderOptions.LinkBase` 给输出 Markdown 加云端前缀，仅影响内存输出 | `ExportStdMarkdown` L1678-L1722 |
+| **语雀复制（标准 Markdown）** | 预览窗「复制为语雀」触发；订阅者 `IsSubscriber()` 时通过 `LinkBase` 给输出 Markdown 加云端前缀，`assetsDestSpace2Underscore=true` 替换空格，仅影响内存输出 | `ExportStdMarkdown` L1678-L1722，仅被 `kernel/api/lute.go#L67` 调用 |
 | **PDF / DOCX (`removeAssets=false`)** | 复制 assets 目录到临时导出文件夹并嵌入（DOCX: `tmpAssets` 目录；PDF: 内嵌图片流） | `ExportDocx` L832、`ProcessPDF` L1291 |
 | **PDF / DOCX (`removeAssets=true`)** | 保持超链接形式，不复制资源文件到输出物 | `processPDFLinkEmbedAssets` L1488 |
 | **导出压缩包（批量）** | 遍历所有引用 → `copiedAssets` HashSet 去重 → 按相对路径复制到导出目录，AV JSON 同步替换路径 | `export.go` L1957-L2008 |
 
-### 笔记本级资源迁移辅助
+### 笔记本级资源迁移辅助（有代码证据的内部函数）
 
-`copyBoxAssetsToDataAssets` / `copyDocAssetsToDataAssets` 提供从笔记本/文档级 assets 向全局 assets 的批量复制，用于合并工作空间或导出前预处理。
+代码位置：`kernel/model/assets.go#L1722-L1758`
+
+| 函数 | 触发场景 | 行为 |
+|------|---------|------|
+| `copyBoxAssetsToDataAssets(boxID)` | 卸载笔记本时 `model/mount.go#L153` 自动调用 | 递归遍历笔记本下所有 `/assets/` 目录，复制到全局 `data/assets/` |
+| `copyDocAssetsToDataAssets(boxID, parentDocPath)` | 文档被移出笔记本层级时 `model/file.go#L1582` 自动调用 | 把该文档及其子文档的同级 `assets/` 复制到全局 `data/assets/` |
+
+⚠️ 这两个函数只有内核内部调用，**没有公开 API 或 UI 触发点**。
 
 ---
 
@@ -769,6 +858,7 @@ API 端点：`POST /api/asset/renameAsset`（`kernel/api/asset.go#L177-L198`）�
 | `kernel/model/upload.go` | 上传主流程、本地文件插入、三级目录选择、文件名规范化、七牛 ETag 查重 |
 | `kernel/api/asset.go` | HTTP API 层：unused/missing/remove/rename/ocr/上传云端两个端点 |
 | `kernel/api/export.go` | export2Liandi HTTP 封装、导出系列 API 参数解析 |
+| `kernel/api/lute.go` | **copyStdMarkdown Handler**，唯一调用 `ExportStdMarkdown` 的入口（`L67`） |
 | `kernel/api/router.go` | 所有 API 路由注册与中间件挂载（含鉴权链） |
 | `kernel/server/serve.go` | 文件上传端点 `/upload`、静态资源鉴权 Group |
 | `kernel/model/session.go` | CheckAuth（7 种身份识别）/CheckAdminRole/CheckReadonly 权限中间件 |
@@ -790,6 +880,7 @@ API 端点：`POST /api/asset/renameAsset`（`kernel/api/asset.go#L177-L198`）�
 | `app/src/protyle/upload/index.ts` | 前端上传：三阶段校验、XMLHttpRequest 进度、结果智能渲染、事务 undo/redo |
 | `app/src/protyle/util/Options.ts` | Protyle 默认 upload 18 项配置初始化值 |
 | `app/src/protyle/breadcrumb/index.ts` | 面包屑菜单：上传到云端图床 L363、分享到链滴 L375、网络资源本地化 L345 |
+| `app/src/protyle/preview/index.ts` | 预览窗「复制为 Markdown → 语雀」触发 `copyStdMarkdown` API（L65 按钮定义，L280-L290 点击调用） |
 | `app/src/config/image.ts` | 前端资源管理面板：未引用 / 缺失 / AV 清理三个 Tab UI |
 | `app/src/util/fetch.ts` | fetchPost 统一 HTTP 封装、401 自动刷新、processMessage 路由 |
 | `app/src/util/needSubscribe.ts` | 前端订阅者判断（含 iOS 平台差异化提示）+ showMessage 拦截 |
