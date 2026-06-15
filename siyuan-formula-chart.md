@@ -27,10 +27,13 @@ SiYuan 支持以下 8 种「特殊渲染代码块」，语言标识通过 `data-
 
 ### 2.2 统一调度入口
 
-所有渲染任务的调度入口是 `app/src/protyle/util/processCode.ts` 第 48-73 行定义的 `RENDER_MAP` 映射表和 `processRender()` 函数。
+所有渲染任务的调度入口位于 `app/src/protyle/util/processCode.ts`，由两部分组成：
+- **RENDER_MAP 路由表**（L48-L57）：8 种渲染器的语言标识 → 函数映射
+- **processRender 调度函数**（L59-L73）：三路分发逻辑
 
-**证据链代码（processCode.ts:L48-L73）：**
+**证据链代码（processCode.ts:L48-L73，含精确行号标注）：**
 ```typescript
+// L48-L57：RENDER_MAP 路由表
 const RENDER_MAP: Record<string, (previewPanel: Element) => void> = {
     abc: abcRender,
     plantuml: plantumlRender,
@@ -42,18 +45,19 @@ const RENDER_MAP: Record<string, (previewPanel: Element) => void> = {
     math: mathRender,
 };
 
+// L59-L73：processRender 调度函数（export 行 = L59，函数体 = L60-L73）
 export const processRender = (previewPanel: Element) => {
     const language = previewPanel.getAttribute("data-subtype");
     if (RENDER_MAP[language]) {
-        RENDER_MAP[language](previewPanel);  // 单元素精确路由
+        RENDER_MAP[language](previewPanel);  // 精确路由：单元素 data-subtype 直接命中
         return;
     }
     if (previewPanel.getAttribute("data-type") === "NodeHTMLBlock") {
-        htmlRender(previewPanel);
+        htmlRender(previewPanel);          // HTML 块路由
         return;
     }
     for (const render of Object.values(RENDER_MAP)) {
-        render(previewPanel);  // 容器批量扫描
+        render(previewPanel);              // 批量扫描：父容器 → 各渲染器 querySelectorAll 自过滤
     }
     htmlRender(previewPanel);
 };
@@ -111,14 +115,17 @@ public static readonly SIYUAN_RENDER_CODE_LANGUAGES: string[] = [
 
 ### 3.2 阶段二：渲染任务触发（精确统计：**14 个文件，共 32 处真实调用**）
 
-> **统计说明**：在 `app/src` 下 grep `processRender(`（区分 import/定义/调用）精确统计如下：
+> **三种搜索口径的精确对比**（均在 `app/src` 目录下执行）：
 >
-> | grep 结果分类 | 行数 | 说明 |
-> |---|---|---|
-> | import 语句 | 14 行 | 14 个调用文件各 1 条 import（一一对应） |
-> | 函数定义 | 1 行 | `app/src/protyle/util/processCode.ts` L46：`export const processRender = ...` |
-> | **真实调用** | **32 行** | 分布于 **14 个源文件**（下表逐项校验） |
-> | **grep 合计** | **47 行** | 14 + 1 + 32 = 47 ✓ |
+> | grep 模式 | 命中行数 | 涉及文件数 | 含义 |
+> |---|---|---|---|
+> | `processRender`（宽泛关键词） | 47 行 | 15 文件 | 含 import + 定义 + 调用全部命中（processCode.ts 自身仅含定义不含调用） |
+> | `processRender(`（精确调用） | **32 行** | **14 文件** | 仅函数调用（不含 import、不含定义行）——**本章节使用此口径** |
+> | `import.*processRender` | 14 行 | 14 文件 | 仅 import 语句（与 14 个调用文件一一对应） |
+>
+> **三种口径交叉校验**：宽泛 47 = import 14 + 定义 1（processCode.ts L59）+ 调用 32 = 47 ✓
+>
+> **函数定义精确定位**：`app/src/protyle/util/processCode.ts` L59 `export const processRender = ...`（函数体 L59-L73）
 
 #### 3.2.1 调用点全景分类（逐项行号校验）
 
@@ -808,7 +815,9 @@ lute.SetSanitize(options.sanitize);
 
 | 模块 | 仓库相对路径 | 关键行号范围 |
 |---|---|---|
-| 渲染调度中心（定义 + 路由） | `app/src/protyle/util/processCode.ts` | L48-L73 |
+| RENDER_MAP 路由表（8 路分发） | `app/src/protyle/util/processCode.ts` | L48-L57 |
+| processRender 调度函数（三路分发） | `app/src/protyle/util/processCode.ts` | L59-L73 |
+| processRender 调度中心整体 | `app/src/protyle/util/processCode.ts` | L48-L73（RENDER_MAP + 调度函数合计） |
 | 数学公式渲染 | `app/src/protyle/render/mathRender.ts` | L1-L133 |
 | ECharts 图表渲染 | `app/src/protyle/render/chartRender.ts` | L1-L56 |
 | Mermaid 图渲染 | `app/src/protyle/render/mermaidRender.ts` | L1-L116 |
@@ -842,4 +851,9 @@ lute.SetSanitize(options.sanitize);
 
 ---
 
-*文档生成时间：2026-06-15 · 基于 SiYuan 3.6.x 分支代码分析<br>数据说明：在 `app/src` 下 grep `processRender(` 共返回 **47 行**。精确分类：**14 行 import**（14 个调用文件各 1 条，一一对应）+ **1 行函数定义**（processCode.ts:L46）+ **32 行真实调用**（14 个文件，逐文件逐行号校验见上表）。14 + 1 + 32 = 47 ✓*
+*文档生成时间：2026-06-15 · 基于 SiYuan 3.6.x 分支代码分析<br>**数据说明（三种 grep 口径统一）**：在 `app/src` 目录下执行三种不同精度的搜索，结果严格对应：
+> - 宽泛关键词 `processRender` → **47 行 / 15 文件**（含 import、定义、调用全部命中）
+> - 精确调用 `processRender(` → **32 行 / 14 文件**（仅函数调用，processCode.ts 自身无调用）
+> - 仅 import `import.*processRender` → **14 行 / 14 文件**（与 14 个调用文件一一对应）
+> - 调度函数定义：`app/src/protyle/util/processCode.ts` L59 `export const processRender = ...`（函数体 L59-L73）
+> - 交叉校验：宽泛 47 = import 14 + 定义 1 + 调用 32 ✓*
