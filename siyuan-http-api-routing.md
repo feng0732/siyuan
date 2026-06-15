@@ -1031,9 +1031,144 @@ msgCallback case "setLocalStorageVal"
 window.siyuan.storage[key] = val  ── 更新内存存储
 ```
 
-### 7.6 后台任务推送的完整调用链路
+### 7.6 本地存储推送的生效方式：赋值后的实际影响
 
-#### 7.6.1 后端推送链路（5 步）
+本地存储推送通过 WebSocket 更新 `window.siyuan.storage[key] = val` 后，其生效方式取决于该存储键的**具体读取时机**。经代码验证，SiYuan 主应用**不存在**任何响应式驱动、订阅机制或显式刷新路径。
+
+#### 7.6.1 机制验证：不存在的基础设施
+
+| 机制类型 | 是否存在 | 验证方式 |
+|---------|---------|---------|
+| **Vue/React 响应式** (`reactive`, `ref`, `watch`, `Proxy`) | ❌ 不存在 | Grep 主应用 TypeScript 代码 0 匹配，仅 PDF 查看器的 JS 文件中有使用 |
+| **事件总线订阅** (`eventBus.on`/`emit` 绑定 storage) | ❌ 不存在 | Grep 主应用代码 0 匹配，未发现任何 storage 相关的 eventBus 钩子 |
+| **定时轮询/心跳刷新** | ❌ 不存在 | 未发现周期性读取 storage 的定时器 |
+| **getter/setter 属性劫持** (`Object.defineProperty`) | ❌ 不存在 | `window.siyuan.storage` 是普通对象赋值，未被属性劫持 |
+
+> **核心结论**：`window.siyuan.storage` 是一个**纯普通 JavaScript 对象**。主回调赋值后，不存在任何自动触发的副作用。其生效完全依赖于**后续业务代码对该对象的主动读取**。
+
+#### 7.6.2 两种生效模式
+
+| 模式 | 特征 | 赋值后效果 | 典型场景 |
+|------|------|-----------|---------|
+| **A. 内存状态直接生效** | 存储值被**运行中组件的状态变量持有**，或作为 DOM 渲染时的内联数据源使用 | ❌ **赋值后不立即生效**，需重新渲染或下次交互时重新读取才能体现 | 已打开的搜索面板、已渲染的工具栏图标状态 |
+| **B. 下次事件触发生效** | 存储值仅在**特定事件回调**中被读取（点击、打开面板、切换文档等） | ❌ **赋值后不生效**，需触发对应事件后才被读取 | 搜索面板打开、历史记录打开、对话框弹出 |
+
+> **重要修正**：之前分析中"依赖该存储的组件通过响应式机制自动更新"的结论**与实际代码不符**。在无响应式基础设施的前提下，不存在任何"自动更新"。
+
+#### 7.6.3 生效模式总表（按存储键分类）
+
+以下对所有 30 个存储键逐一分类：
+
+**模式 A：内存状态直接更新（无，纯内存持有场景均属模式 B 子类）**
+
+严格意义上，SiYuan 中不存在"赋值后立即影响现有 DOM"的存储键。所有存储键的生效均属模式 B。
+
+**模式 B：下次事件触发生效（全部 30 个存储键）**
+
+| 分类 | 存储键 | 首次读取时机 | 赋值后如何才生效 |
+|------|--------|-------------|-----------------|
+| **简单配置型** | `LOCAL_ZOOM` | 窗口初始化、用户点击缩放按钮 | 其他窗口需**重新初始化或下次点击缩放**时才读取新值 |
+| | `LOCAL_EMOJIS` | 表情面板打开时 | 其他窗口需**下次打开表情面板**才读取 `currentTab` |
+| | `LOCAL_IMAGES` | 速记/卡片等功能打开时 | 其他窗口需**下次打开相关功能**才读取图标映射 |
+| | `LOCAL_BAZAAR` | 集市面板打开时 | 其他窗口需**下次打开集市**才读取分类选择 |
+| | `LOCAL_FLASHCARD` | 闪卡面板打开时 | 其他窗口需**下次打开闪卡**才读取全屏状态 |
+| | `LOCAL_OUTLINE` | 大纲面板渲染时（内联模板） | ❗ 特殊：大纲面板**渲染时作为内联数据源**，赋值后**不重新渲染则不生效**。其他窗口需**重新创建大纲面板**才体现 |
+| | `LOCAL_RECENT_DOCS` | 最近文档打开时 | 其他窗口需**下次打开最近文档**才读取排序类型 |
+| **导出配置型** | `LOCAL_EXPORTPDF` | 导出 PDF 对话框打开时 | 其他窗口需**下次打开导出 PDF 对话框**才读取配置 |
+| | `LOCAL_EXPORTWORD` | 导出 Word 对话框打开时 | 同上 |
+| | `LOCAL_EXPORTIMG` | 导出图片对话框打开时 | 同上 |
+| | `LOCAL_PDFTHEME` | PDF 预览打开时 | 其他窗口需**下次打开 PDF 预览**才读取主题色 |
+| **搜索状态型** | `LOCAL_SEARCHDATA` | 全局搜索打开、搜索配置创建时 | ❗ 特殊：[search/util.ts#L62](file:///d:/fz/0601/solo-dogfeeding/code/303-siyuan/app/src/search/util.ts#L62) 打开搜索时读取，但**已打开的搜索面板内部持有自己的 `config` 变量**，赋值后已打开的面板**不生效**。仅新打开的搜索面板才读取存储 |
+| | `LOCAL_SEARCHKEYS` | 搜索面板创建时 | 其他窗口需**下次创建搜索面板**才读取历史关键词 |
+| | `LOCAL_SEARCHASSET` | 资源搜索打开时 | 同上 |
+| | `LOCAL_SEARCHUNREF` | 未引用块搜索打开时 | 同上 |
+| **面板/布局状态型** | `LOCAL_HISTORY` | 历史面板渲染时（内联宽度） | ❗ 特殊：[history/resizeSide.ts#L37](file:///d:/fz/0601/solo-dogfeeding/code/303-siyuan/app/src/history/resizeSide.ts#L37) 拖拽时写入，[history/history.ts](file:///d:/fz/0601/solo-dogfeeding/code/303-siyuan/app/src/history/history.ts) 内联模板读取宽度。赋值后**需重新打开历史面板**才体现新宽度 |
+| | `LOCAL_FILEPOSITION` | 文档打开（恢复滚动）、前进后退导航时 | ❗ 特殊：[saveScroll.ts](file:///d:/fz/0601/solo-dogfeeding/code/303-siyuan/app/src/protyle/scroll/saveScroll.ts) 写入；[backForward.ts#L56](file:///d:/fz/0601/solo-dogfeeding/code/303-siyuan/app/src/util/backForward.ts#L56) 等场景读取。已打开的文档**不会**因赋值改变滚动位置（滚动状态在 DOM scrollTop 中持，不在 storage 中） |
+| | `LOCAL_FILESPATHS` | 文件树状态打开时 | 其他窗口需**下次恢复文件路径**才读取 |
+| | `LOCAL_DIALOGPOSITION` | 对话框创建定位时 | 其他窗口需**下次打开对话框**才读取位置 |
+| | `LOCAL_LAYOUTS` | 布局保存/加载对话框打开时 | 其他窗口需**下次打开布局对话框**才读取列表 |
+| | `LOCAL_CLOSED_TABS` | 关闭标签页恢复功能触发时 | 其他窗口需**下次触发恢复标签**才读取 |
+| **引用/插件型** | `LOCAL_AI` | AI 提示词面板打开时 | 其他窗口需**下次打开 AI 面板**才读取配置 |
+| | `LOCAL_PLUGINTOPUNPIN` | 插件顶栏渲染时（内联模板） | ❗ 特殊：[plugin/loader.ts](file:///d:/fz/0601/solo-dogfeeding/code/303-siyuan/app/src/plugin/loader.ts) 渲染插件顶栏时内联读取。赋值后**需重新加载插件或刷新页面**才体现 |
+| | `LOCAL_PLUGIN_DOCKS` | 插件停靠栏创建时 | 其他窗口需**下次创建插件停靠**才读取 |
+| **其他型** | `LOCAL_DOCINFO`（仅移动端） | 移动端文档打开时 | 需移动端**下次打开文档**才读取 |
+| | `LOCAL_CODELANG` | 代码块语言切换时 | 需**下次操作代码块**才读取 |
+| | `LOCAL_FONTSTYLES` | 字体样式应用时 | 需**下次应用字体**才读取 |
+| | `LOCAL_DAILYNOTEID` | 日记创建/跳转时 | 需**下次创建日记**才读取 |
+| | `LOCAL_SESSION_FIRSTLOAD` | 会话加载判断时 | 需**下次会话初始化**才读取 |
+| | `LOCAL_MOVE_PATH` | 移动路径功能打开时 | 需**下次触发移动**才读取 |
+
+#### 7.6.4 典型场景：LOCAL_ZOOM 的跨窗口生效路径
+
+以缩放比例（`LOCAL_ZOOM`）为例，完整跨窗口生效路径如下：
+
+**场景**：用户在窗口 A 点击放大按钮，缩放比例从 1 → 1.25。
+
+**窗口 A（主动方）**：
+
+```
+[topBar.ts#L270-L311] setZoom("zoomIn")
+    │
+    ├─ 1. webFrame.setZoomFactor(1.25)     ← 立即影响 Electron webFrame（原生 API）
+    ├─ 2. ipcRenderer.send(setTrafficLightPosition)  ← 立即影响窗口控件位置
+    ├─ 3. window.siyuan.storage[LOCAL_ZOOM] = 1.25  ← 更新内存
+    ├─ 4. setStorageVal(LOCAL_ZOOM, 1.25)  ← 写入磁盘 + 推送 WebSocket
+    └─ 5. 手动更新 #barZoom DOM 显隐与图标 ← 立即影响当前窗口 UI
+```
+
+**窗口 B（接收方）**：
+
+```
+[index.ts#L139-L141] case "setLocalStorageVal":
+    │
+    └─ window.siyuan.storage[LOCAL_ZOOM] = 1.25  ← 更新内存
+        │
+        ├─ ❌ webFrame.setZoomFactor 未调用
+        ├─ ❌ ipcRenderer.send 未调用
+        ├─ ❌ #barZoom DOM 未更新
+        │
+        └─ 生效条件：窗口 B 下次点击缩放按钮时
+            │
+            └─ [topBar.ts#L275] if (item.zoom === storage[LOCAL_ZOOM]) ...
+                   └─ ← 此时才读取到 1.25，以此为基准计算下一级缩放
+```
+
+> **结论**：`LOCAL_ZOOM` 跨窗口推送赋值后，**仅影响后续计算的基准值**，不立即改变实际缩放状态。窗口 B 的实际缩放比例仍为 1，直到用户主动触发缩放操作。
+
+#### 7.6.5 典型场景：LOCAL_SEARCHDATA 的跨窗口生效路径
+
+**场景**：用户在窗口 A 打开搜索面板，勾选"包含子文档"选项，改变了搜索配置。
+
+**窗口 A（主动方）**：
+
+```
+[search/util.ts#L751-L752]
+    ├─ 1. 更新搜索面板内部 config 变量（局部闭包持有）← 立即影响当前搜索面板
+    ├─ 2. window.siyuan.storage[LOCAL_SEARCHDATA] = clone(config) ← 更新内存
+    └─ 3. setStorageVal(LOCAL_SEARCHDATA, ...) ← 写入磁盘 + 推送 WebSocket
+```
+
+**窗口 B（接收方）**：
+
+```
+[index.ts#L139-L141] case "setLocalStorageVal":
+    │
+    └─ window.siyuan.storage[LOCAL_SEARCHDATA] = newConfig ← 更新内存
+        │
+        ├─ ❌ 窗口 B 已打开的搜索面板内部 config 未变（闭包变量独立）
+        ├─ ❌ 窗口 B 已打开的搜索面板 DOM 未更新
+        │
+        └─ 生效条件：窗口 B 下次打开新搜索面板时
+            │
+            └─ [search/util.ts#L62] const localData = storage[LOCAL_SEARCHDATA]
+                   └─ ← 此时才读取新配置，用于初始化新搜索面板
+```
+
+> **结论**：`LOCAL_SEARCHDATA` 跨窗口推送后，**已打开的搜索面板完全不受影响**，仅新创建的搜索面板才会读取新配置。
+
+### 7.7 后台任务推送的完整调用链路
+
+#### 7.7.1 后端推送链路（5 步）
 
 **步骤 1：定时任务触发 StatusJob**  
 `StatusJob()` 由定时器定期调用，收集任务队列状态。
@@ -1082,7 +1217,7 @@ func BroadcastByType(typ, cmd string, code int, msg string, data any) {
 }
 ```
 
-#### 7.6.2 前端接收链路（4 步）
+#### 7.7.2 前端接收链路（4 步）
 
 **步骤 1：WebSocket 接收**  
 与本地存储推送相同，经过 `Model.ts#L57-L64`。
@@ -1112,7 +1247,7 @@ export const progressBackgroundTask = (tasks: { action: string }[]) => {
 };
 ```
 
-#### 7.6.3 调用链全景图
+#### 7.7.3 调用链全景图
 
 ```
 后端定时器 → StatusJob()
@@ -1169,6 +1304,10 @@ progressBackgroundTask(tasks)
 3. **同步调用链路清晰**：从后端 API 到前端 UI 更新的每一步都有明确的代码位置，没有隐式的事件总线或全局钩子，便于调试追踪。
 
 4. **向后兼容保障**：`processMessage` 返回 `false` 阻止后续处理的设计，确保新增通用消息类型时不会意外触发业务分支。
+
+5. **纯对象存储的极简设计**：`window.siyuan.storage` 不引入响应式库，采用"下次事件触发时读取"的惰性模式。避免了 Proxy 劫持的性能开销和 watch 机制的调试复杂度，代价是跨窗口同步不会实时刷新已打开的组件状态。
+
+6. **写侧主动推送，读侧惰性消费**：存储变更的推送仅在写操作发生时触发（通过 `setStorageVal`），读操作不触发任何网络请求或通知。写侧承担同步责任，读侧保持无副作用，降低了消息风暴的风险。
 
 ---
 
