@@ -302,6 +302,7 @@ func uploadAssets2Cloud(assetPaths []string, bizType string, ignorePushMsg bool)
                       │    ★ 每次返回新 tree 对象，与缓存/磁盘无引用关联
                       ├─ IsSubscriber() 判定 → 决定 cloudAssetsBase 是否非空
                       └─ exportMarkdownContent0(id, tree, cloudAssetsBase, assetsDestSpace2Underscore=true, ...)
+```
 
 **关键代码 `kernel/model/export.go#L1678-L1722`：**
 
