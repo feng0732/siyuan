@@ -22,7 +22,7 @@ SiYuan 采用**双入口 + 编译条件分支 + 运行时特性检测**的三层
 │  │   ├── index.ts          # 移动端入口 App 类                     │
 │  │   ├── editor.ts         # 移动端编辑器打开逻辑                   │
 │  │   ├── dock/             # 移动端侧栏面板 (Files/Outline/Tags)  │
-│  │   ├── menu/             # 移动端右侧菜单/搜索/设置面板          │
+│  │   ├── menu/             # 移动端主菜单面板                      │
 │  │   ├── settings/         # 移动端设置项组件                      │
 │  │   └── util/             # 移动端工具集                          │
 │  │       ├── touch.ts            # 核心手势处理                    │
@@ -36,7 +36,8 @@ SiYuan 采用**双入口 + 编译条件分支 + 运行时特性检测**的三层
 │  └── assets/scss/          # 样式                                  │
 │      ├── base.scss         # 桌面端入口样式                        │
 │      ├── mobile.scss       # 移动端入口样式                        │
-│      └── main/_mobile.scss # 移动端特定样式覆盖                    │
+│      ├── main/_mobile.scss # 移动端特定样式覆盖                    │
+│      └── component/_menu.scss  # 菜单组件样式（含 fullscreen 模式） │
 └───────────────────────────────────────────────────────────────────┘
                               ↓
 ┌───────────────────────────────────────────────────────────────────┐
@@ -54,19 +55,21 @@ SiYuan 采用**双入口 + 编译条件分支 + 运行时特性检测**的三层
 
 | 模块 | 文件路径 | 核心职责 |
 |------|----------|----------|
-| 移动端入口 | [index.ts](file:///d:/fz/0601/solo-dogfeeding/code/302-siyuan/app/src/mobile/index.ts) | 移动端 App 类，事件绑定、启动流程 |
-| 手势核心 | [touch.ts (mobile)](file:///d:/fz/0601/solo-dogfeeding/code/302-siyuan/app/src/mobile/util/touch.ts) | 滑动手势、侧栏切换、方向判定 |
-| 手势共用 | [touch.ts (boot)](file:///d:/fz/0601/solo-dogfeeding/code/302-siyuan/app/src/boot/globalEvent/touch.ts) | 背景图调整、iOS 长按菜单 |
-| 输入法管理 | [keyboardToolbar.ts](file:///d:/fz/0601/solo-dogfeeding/code/302-siyuan/app/src/mobile/util/keyboardToolbar.ts) | 键盘工具栏、输入法高度检测、光标滚动 |
-| 原生桥接 | [mobileAppUtil.ts](file:///d:/fz/0601/solo-dogfeeding/code/302-siyuan/app/src/mobile/util/mobileAppUtil.ts) | JSAndroid/JSHarmony/webkit 调用封装 |
-| 框架初始化 | [initFramework.ts](file:///d:/fz/0601/solo-dogfeeding/code/302-siyuan/app/src/mobile/util/initFramework.ts) | 侧栏/菜单/工具栏绑定，文档打开逻辑 |
-| 编辑器 | [editor.ts](file:///d:/fz/0601/solo-dogfeeding/code/302-siyuan/app/src/mobile/editor.ts) | openMobileFileById、文档切换 |
-| 设备识别 | [compatibility.ts](file:///d:/fz/0601/solo-dogfeeding/code/302-siyuan/app/src/protyle/util/compatibility.ts) | 所有 isXxx 系列判断函数 |
-| 运行时检测 | [functions.ts](file:///d:/fz/0601/solo-dogfeeding/code/302-siyuan/app/src/util/functions.ts) | isMobile()、getFrontend() |
-| 菜单面板 | [menu/index.ts](file:///d:/fz/0601/solo-dogfeeding/code/302-siyuan/app/src/mobile/menu/index.ts) | 右侧菜单内容与事件绑定 |
-| Protyle 核心 | [protyle/index.ts](file:///d:/fz/0601/solo-dogfeeding/code/302-siyuan/app/src/protyle/index.ts) | 编辑器核心类（双端共用） |
-| 构建配置 | [webpack.mobile.js](file:///d:/fz/0601/solo-dogfeeding/code/302-siyuan/app/webpack.mobile.js) | 移动端打包配置、宏 MOBILE=true |
-| 移动端样式 | [_mobile.scss](file:///d:/fz/0601/solo-dogfeeding/code/302-siyuan/app/src/assets/scss/main/_mobile.scss) | 移动端布局样式覆盖 |
+| 移动端入口 | `app/src/mobile/index.ts` | 移动端 App 类，事件绑定、启动流程 |
+| 手势核心 | `app/src/mobile/util/touch.ts` | 滑动手势、侧栏切换、方向判定 |
+| 手势共用 | `app/src/boot/globalEvent/touch.ts` | 背景图调整、iOS 长按菜单 |
+| 输入法管理 | `app/src/mobile/util/keyboardToolbar.ts` | 键盘工具栏、输入法高度检测、光标滚动 |
+| 原生桥接 | `app/src/mobile/util/mobileAppUtil.ts` | JSAndroid/JSHarmony/webkit 调用封装 |
+| 框架初始化 | `app/src/mobile/util/initFramework.ts` | 侧栏/菜单/工具栏绑定，文档打开逻辑 |
+| 编辑器 | `app/src/mobile/editor.ts` | openMobileFileById、文档切换 |
+| 设备识别 | `app/src/protyle/util/compatibility.ts` | 所有 isXxx 系列判断函数 |
+| 运行时检测 | `app/src/util/functions.ts` | isMobile()、getFrontend() |
+| 菜单面板 | `app/src/mobile/menu/index.ts` | 主菜单内容与事件绑定 |
+| Protyle 核心 | `app/src/protyle/index.ts` | 编辑器核心类（双端共用） |
+| 构建配置 | `app/webpack.mobile.js` | 移动端打包配置、宏 MOBILE=true |
+| 移动端样式 | `app/src/assets/scss/main/_mobile.scss` | 移动端布局样式覆盖 |
+| 菜单组件样式 | `app/src/assets/scss/component/_menu.scss` | b3-menu--fullscreen 全屏菜单样式 |
+| HTML 模板 | `app/src/assets/template/mobile/index.tpl` | 移动端 DOM 结构定义 |
 
 ---
 
@@ -78,15 +81,14 @@ SiYuan 的设备识别分为 **构建时** 和 **运行时** 两个维度，配�
 
 #### 2.1.1 构建时分支（ifdef-loader 宏）
 
-在 [webpack.mobile.js](file:///d:/fz/0601/solo-dogfeeding/code/302-siyuan/app/webpack.mobile.js#L62-L68) 中定义编译宏：
+在 `app/webpack.mobile.js` 中定义编译宏：
 
 ```javascript
-// 移动端编译时注入
 {
     loader: "ifdef-loader",
     options: {
         BROWSER: true,
-        MOBILE: true,    // 移动端特有宏
+        MOBILE: true,
     },
 }
 ```
@@ -104,7 +106,7 @@ import {Tab} from "../../layout/Tab";
 
 #### 2.1.2 运行时 DOM 特征检测
 
-在 [functions.ts](file:///d:/fz/0601/solo-dogfeeding/code/302-siyuan/app/src/util/functions.ts#L7-L9) 中：
+在 `app/src/util/functions.ts` 中：
 
 ```typescript
 export const isMobile = () => {
@@ -114,19 +116,19 @@ export const isMobile = () => {
 
 **设计意图：** 通过 DOM 中是否存在 `#sidebar` 元素判定当前加载的是移动端 HTML 模板还是桌面端模板。此方法在共用模块（如 Protyle 核心、菜单系统）中广泛使用，无需传入编译宏。
 
-在 [constants.ts](file:///d:/fz/0601/solo-dogfeeding/code/302-siyuan/app/src/constants.ts#L76) 和 [constants.ts](file:///d:/fz/0601/solo-dogfeeding/code/302-siyuan/app/src/constants.ts#L844-L877) 中被用于确定工具栏/UI 尺寸：
+在 `app/src/constants.ts` 中被用于确定工具栏/UI 尺寸：
 
 ```typescript
 public static readonly SIZE_TOOLBAR_HEIGHT: number = isMobile() ? 0 : 32;
 public static readonly PROTYLE_TOOLBAR: string[] = isMobile() ? [
     "block-ref", "a", "|", "text", "strong", "em", "u", "clear", "|",
-    "code", "tag", "inline-math", "inline-memo",   // 移动端：删除 s/mark/sup/sub/kbd
+    "code", "tag", "inline-math", "inline-memo",
 ] : [ /* 桌面端完整列表 */ ];
 ```
 
 #### 2.1.3 容器/浏览器检测
 
-在 [compatibility.ts](file:///d:/fz/0601/solo-dogfeeding/code/302-siyuan/app/src/protyle/util/compatibility.ts#L307-L374) 中：
+在 `app/src/protyle/util/compatibility.ts` 中：
 
 | 函数 | 判定逻辑 | 用途 |
 |------|----------|------|
@@ -149,16 +151,27 @@ SiYuan 的移动端与桌面端之间采用的是**编译入口硬切换**，而
 **边界判定特征：**
 
 1. **无 CSS 断点**：`_mobile.scss` 中不使用 `@media` 查询做端间切换，仅使用 `100vw`、`100vh` 做屏幕自适应
-2. **固定 UI 结构**：移动端 HTML 模板只包含三个固定面板：
-   - `#menu`：左滑出的主菜单（`transform: translateX(0/-100vw)`）
-   - `#sidebar`：右滑出的侧栏（文件树/大纲/标签等）
+2. **固定 UI 结构**：移动端 HTML 模板（`app/src/assets/template/mobile/index.tpl`）包含四个核心面板：
+   - `#sidebar`（`.side-panel`）：**左侧**侧栏，CSS 默认 `translateX(-100vw)` 隐藏于屏幕左侧
+   - `#menu`（`.b3-menu.b3-menu--fullscreen`）：**右侧**主菜单，CSS 默认 `translateX(100vw)` 隐藏于屏幕右侧
    - `#editor`：中央编辑区
-   - `#model`：设置等模态弹窗（从底部滑入）
+   - `#model`（`.side-panel.side-panel--all`）：设置等模态弹窗，CSS 默认 `translateY(-200vh)` 隐藏于屏幕上方
 3. **横竖屏检测**：使用 `window.matchMedia("(orientation: portrait/landscape)")` 仅用于更新卡片尺寸和键盘高度缓存，不触发布局重排
 
+**面板 CSS 默认值对照（已从模板与样式文件交叉验证）：**
+
+| 面板 | HTML class | CSS 默认 transform | 展开时 transform | 隐藏方向 |
+|------|-----------|-------------------|-----------------|---------|
+| `#sidebar` | `side-panel fn__flex-column` | `translateX(-100vw)` | `translateX(0px)` | 隐藏于左侧 |
+| `#menu` | `b3-menu b3-menu--fullscreen` | `translateX(100vw)` | `translateX(0px)` | 隐藏于右侧 |
+| `#model` | `side-panel side-panel--all fn__flex-column` | `translateY(-200vh)` | `translateY(0px)` | 隐藏于上方 |
+
+> **注意**：`#menu` 与 `#sidebar`/`#model` 使用不同的 CSS 类。`#sidebar` 和 `#model` 共用 `side-panel` 基类（`position:fixed; transform:translateX(-100vw)`），而 `#menu` 使用 `b3-menu--fullscreen`（`position:fixed; left:0; right:0; width:100%`），其 `translateX(100vw)` 由 `#menu` 专属 CSS 规则在 `_mobile.scss` 中单独定义。
+
 **相关代码：**
-- 横竖屏监听在 [index.ts#L134-L138](file:///d:/fz/0601/solo-dogfeeding/code/302-siyuan/app/src/mobile/index.ts#L134-L138)
-- 面板样式在 [_mobile.scss#L155-L179](file:///d:/fz/0601/solo-dogfeeding/code/302-siyuan/app/src/assets/scss/main/_mobile.scss#L155-L179)
+- 侧栏/模型面板样式在 `app/src/assets/scss/main/_mobile.scss` 的 `.side-panel` 规则
+- 菜单全屏样式在 `app/src/assets/scss/component/_menu.scss` 的 `.b3-menu--fullscreen` 规则
+- `#menu` 专属偏移在 `app/src/assets/scss/main/_mobile.scss` 的 `#menu { transform: translateX(100vw); top: 0; }` 规则
 
 ---
 
@@ -169,37 +182,41 @@ SiYuan 的移动端与桌面端之间采用的是**编译入口硬切换**，而
 三种核心面板通过 CSS `transform` 实现位移切换，配合手势拖拽实现物理跟随效果。
 
 ```
-                    ┌──────────────────────┐
-                    │    初始/默认状态     │
-                    │  #menu: translateX(  │
-                    │   -100vw) 隐藏       │
-                    │  #sidebar: translateX│
-                    │   (-100vw) 隐藏      │
-                    │  #model: translateY  │
-                    │   (-200vh) 隐藏      │
-                    └─────────┬────────────┘
-                              │
-        ┌─────────────────────┼──────────────────────┐
-        ↓                     ↓                      ↓
-  右滑手势 /            左滑手势 /            设置面板被调用
-  toolbarFile 点击     toolbarMore 点击       openModel()
-        │                     │                      │
-        ↓                     ↓                      ↓
-┌───────────────┐   ┌───────────────┐      ┌──────────────────┐
-│  #sidebar 展开 │   │   #menu 展开  │      │   #model 展开     │
-│ translateX(0) │   │ translateX(0) │      │ translateY(0)     │
-│ 显示文件树等   │   │ 显示主菜单项  │      │ 模态遮罩 + 内容   │
-└───────┬───────┘   └───────┬───────┘      └────────┬─────────┘
-        │                   │                         │
-        │ 左滑 / 遮罩点击    │ 右滑 / 遮罩点击         │ 关闭按钮点击
-        │                   │                         │ / 左滑
-        └───────────────────┼─────────────────────────┘
-                            ↓
+                    ┌──────────────────────────────────┐
+                    │         初始/默认状态              │
+                    │  #sidebar: translateX(-100vw)     │
+                    │            隐藏于屏幕左侧         │
+                    │  #menu:    translateX(100vw)      │
+                    │            隐藏于屏幕右侧         │
+                    │  #model:   translateY(-200vh)     │
+                    │            隐藏于屏幕上方         │
+                    └─────────────┬────────────────────┘
+                                  │
+        ┌─────────────────────────┼──────────────────────┐
+        ↓                         ↓                      ↓
+  右滑手势 /                左滑手势 /              设置面板被调用
+  toolbarFile 点击         toolbarMore 点击         openModel()
+  (iconMenu)               (iconSettings)
+        │                         │                      │
+        ↓                         ↓                      ↓
+┌───────────────┐       ┌───────────────┐      ┌──────────────────┐
+│ #sidebar 展开  │       │  #menu 展开   │      │  #model 展开      │
+│ translateX(0) │       │ translateX(0) │      │ translateY(0)     │
+│ 左侧显示      │       │ 右侧显示      │      │ 从顶部滑入        │
+│ 文件树/大纲等  │       │ 主菜单项      │      │ 模态遮罩 + 内容   │
+└───────┬───────┘       └───────┬───────┘      └────────┬─────────┘
+        │                       │                         │
+        │ 左滑 / 遮罩点击       │ 右滑 / 遮罩点击         │ 关闭按钮点击
+        │ (推向左侧关闭)        │ (推向右侧关闭)          │ / #model右滑
+        └───────────────────────┼─────────────────────────┘
+                                ↓
                     ┌──────────────────┐
                     │  closePanel()    │
-                    │  统一重置所有    │
-                    │  transform +     │
-                    │  隐藏遮罩        │
+                    │  统一将 inline   │
+                    │  transform 重置  │
+                    │  为空字符串      │
+                    │  (还原CSS默认)   │
+                    │  + 隐藏遮罩     │
                     └──────────────────┘
 ```
 
@@ -207,10 +224,12 @@ SiYuan 的移动端与桌面端之间采用的是**编译入口硬切换**，而
 
 | 函数 | 位置 | 职责 |
 |------|------|------|
-| `closePanel()` | [closePanel.ts#L4-L14](file:///d:/fz/0601/solo-dogfeeding/code/302-siyuan/app/src/mobile/util/closePanel.ts#L4-L14) | 重置 `#menu`/`#sidebar`/`#model` 的 transform，延时隐藏遮罩 `.side-mask` |
-| `closeModel()` | [closePanel.ts#L16-L19](file:///d:/fz/0601/solo-dogfeeding/code/302-siyuan/app/src/mobile/util/closePanel.ts#L16-L19) | 先调用 `activeBlur()` 收起键盘，再关闭 #model |
-| `popMenu()` | [menu/index.ts#L34-L37](file:///d:/fz/0601/solo-dogfeeding/code/302-siyuan/app/src/mobile/menu/index.ts#L34-L37) | 先 `activeBlur()` 再将 #menu 设为 `translateX(0)` |
-| `popSide()` | [touch.ts#L27-L34](file:///d:/fz/0601/solo-dogfeeding/code/302-siyuan/app/src/mobile/util/touch.ts#L27-L34) | 侧栏显示/重置辅助函数 |
+| `closePanel()` | `app/src/mobile/util/closePanel.ts` | 将 `#menu`/`#sidebar`/`#model` 的 inline transform 重置为空（还原 CSS 默认值），延时隐藏遮罩 `.side-mask` |
+| `closeModel()` | `app/src/mobile/util/closePanel.ts` | 先调用 `activeBlur()` 收起键盘，再关闭 #model |
+| `popMenu()` | `app/src/mobile/menu/index.ts` | 先 `activeBlur()` 再将 #menu 设为 `translateX(0px)` |
+| `popSide(render?)` | `app/src/mobile/util/touch.ts` | `render=true` 时模拟 `toolbarFile` 点击；`render=false` 时直接设 `sidebar.style.transform = "translateX(0px)"` |
+
+**`closePanel()` 的还原机制：** 调用 `element.style.transform = ""` 移除 inline 样式，元素回归 CSS 默认值——sidebar 回到 `translateX(-100vw)`（左侧），menu 回到 `translateX(100vw)`（右侧），model 回到 `translateY(-200vh)`（上方）。
 
 ### 3.2 桌面端功能复用策略
 
@@ -228,23 +247,23 @@ SiYuan 通过以下方式实现桌面端核心功能在移动端的复用：
 
 **移动端差异化通过以下机制实现：**
 
-1. **构造参数差异** — [editor.ts#L61-L77](file:///d:/fz/0601/solo-dogfeeding/code/302-siyuan/app/src/mobile/editor.ts#L61-L77) 传入移动端特有 ProtyleOptions：
+1. **构造参数差异** — `app/src/mobile/editor.ts` 传入移动端特有 ProtyleOptions：
 
 ```typescript
 const protyleOptions: IProtyleOptions = {
     render: {
         scroll: true,
         title: true,
-        titleShowTop: true,      // 移动端标题显示在顶部工具栏
+        titleShowTop: true,
         background: true,
-        gutter: true,            // 启用块操作手柄（移动端通过长按显示）
+        gutter: true,
     },
-    typewriterMode: true,        // 强制打字机模式（优化光标可见性）
+    typewriterMode: true,
 };
 ```
 
 2. **`isMobile()` 运行时分支** — Protyle 内部大量调用 `isMobile()` 做行为微调：
-   - [constants.ts#L844-L877](file:///d:/fz/0601/solo-dogfeeding/code/302-siyuan/app/src/constants.ts#L844-L877) 调整工具栏按钮（移动端精简）
+   - `app/src/constants.ts` 调整工具栏按钮（移动端精简）
    - Gutter 菜单的弹出方式（移动端走 `fullscreen("bottom")`）
    - 滚动加载阈值、动画速度的微调整
 
@@ -253,7 +272,7 @@ const protyleOptions: IProtyleOptions = {
 ```typescript
 // protyle/index.ts 中典型模式
 /// #if !MOBILE
-import {updatePanelByEditor} from "../editor/util";   // 桌面端侧栏联动
+import {updatePanelByEditor} from "../editor/util";
 import {setPanelFocus} from "../layout/util";
 /// #endif
 ```
@@ -264,8 +283,8 @@ import {setPanelFocus} from "../layout/util";
 
 | 桌面端 | 移动端适配 | 所在文件 |
 |--------|------------|----------|
-| 鼠标坐标 popup 菜单 | `menu.fullscreen("bottom")` 从底部铺满弹出 | [touch.ts (boot)](file:///d:/fz/0601/solo-dogfeeding/code/302-siyuan/app/src/boot/globalEvent/touch.ts#L72-L91) |
-| 系统级 Dialog 窗口 | 统一使用 `#model` 面板承载（设置面板） | [menu/index.ts](file:///d:/fz/0601/solo-dogfeeding/code/302-siyuan/app/src/mobile/menu/index.ts#L261-L285) |
+| 鼠标坐标 popup 菜单 | `menu.fullscreen("bottom")` 从底部铺满弹出 | `app/src/boot/globalEvent/touch.ts` |
+| 系统级 Dialog 窗口 | 统一使用 `#model` 面板承载（设置面板） | `app/src/mobile/menu/index.ts` |
 | Dock 面板体系（可拖拽/多窗口） | `app/src/mobile/dock/` 下封装 MobileXxx 适配层，内部复用核心逻辑 | `MobileOutline`、`MobileFiles` 等 |
 
 #### 3.2.3 设置系统的 MobileXxx 包装
@@ -282,7 +301,7 @@ import {setPanelFocus} from "../layout/util";
 
 ### 4.1 全局触控事件管线
 
-移动端在 [index.ts#L175-L179](file:///d:/fz/0601/solo-dogfeeding/code/302-siyuan/app/src/mobile/index.ts#L175-L179) 绑定了文档级触控监听：
+移动端在 `app/src/mobile/index.ts` 绑定了文档级触控监听：
 
 ```typescript
 document.addEventListener("touchstart", handleTouchStart, false);
@@ -292,7 +311,18 @@ document.addEventListener("touchend", (event) => {
 }, false);
 ```
 
-处理流程是 **串联式管道**，每个阶段都有提前退出（return）的条件判定：
+处理流程是 **串联式管道**，每个阶段都有提前退出（return）的条件判定。
+
+**xDiff 方向约定**（关键，贯穿所有手势判定）：
+
+```
+xDiff = Math.floor(clientX - currentX)   // 起点 X - 当前 X
+
+xDiff > 0  →  当前位置 < 起点  →  手指向左移动  →  "toLeft"
+xDiff < 0  →  当前位置 > 起点  →  手指向右移动  →  "toRight"
+```
+
+### 4.1.1 touchstart 处理流程
 
 ```
 touchstart → handleTouchStart
@@ -300,51 +330,122 @@ touchstart → handleTouchStart
   │     ├─ 命中：背景图拖拽模式启动，返回 true，阻止后续
   │     └─ 未命中：返回 false，继续
   ├─ 记录触摸起点 (clientX, clientY, time)
-  ├─ iOS 边缘屏蔽 (clientX < 8 || clientX > width - 8)
-  └─ 重置状态变量（方向、差值等）
+  ├─ iOS 边缘屏蔽（非 iPhone 且 x < 8 或 x > width-8 → clientX = null）
+  └─ 重置状态变量（firstDirection/firstXY/lastClientX/scrollBlock）
+```
 
+### 4.1.2 touchmove 处理流程
+
+```
 touchmove → handleTouchMove
-  ├─ 检查白名单/黑名单（编辑中/对话框/选中文字/PDF 查看器等 → return）
-  ├─ 计算 xDiff / yDiff，锁定 firstXY（区分横向/纵向滚动）
-  ├─ firstXY === "y"：交给系统垂直滚动，return
-  ├─ firstXY === "x"：进入横向手势处理
-  │     ├─ 检测内部可横向滚动元素（表格/代码块/数据库/面包屑等）
-  │     │    └─ scrollBlock = true，让位给元素内部滚动
-  │     ├─ 遮罩层 z-index 提升
-  │     └─ 根据滑动起点所在容器，实时 transform 面板跟随
-  └─ activeBlur()，禁用编辑器 overflow
+  ├─ 提前退出检查：
+  │   ├─ clientX/clientY 未设置（边缘屏蔽后）→ return
+  │   ├─ 目标是 AUDIO/对话框/键盘工具栏/PDF查看器/子菜单 → return
+  │   ├─ firstXY === "y"（已锁定纵向）→ return
+  │   ├─ 键盘工具栏正在显示 → return（编辑中禁止手势）
+  │   └─ 编辑器内有选中文本 → return（选中扩选禁止）
+  │
+  ├─ 计算 xDiff / yDiff
+  ├─ 确定首次方向 firstDirection（xDiff > 0 → toLeft, 否则 toRight）
+  ├─ 确定首次主导轴 firstXY：
+  │   ├─ |xDiff| > |yDiff| → firstXY = "x"（横向为主）
+  │   └─ |xDiff| ≤ |yDiff| → firstXY = "y"（纵向为主，后续 move 直接 return）
+  │
+  ├─ 面板内"同向保持"降级修正：
+  │   ├─ 在 #menu 中且 firstDirection === "toLeft" → firstXY = "y"
+  │   │  （在菜单上左滑是"保持打开"方向，应让位给内容纵向滚动）
+  │   └─ 在 #sidebar 中且 firstDirection === "toRight" → firstXY = "y"
+  │      （在侧栏上右滑是"保持打开"方向，应让位给内容纵向滚动）
+  │
+  ├─ 反向位移检测（lastClientX）：
+  │   ├─ toRight 过程中检测到反向（previousClientX > currentX）→ 记录 lastClientX
+  │   └─ toLeft 过程中检测到反向（previousClientX < currentX）→ 记录 lastClientX
+  │
+  ├─ 横向移动处理（|xDiff| > |yDiff|）：
+  │   ├─ #model 内 → return（不处理）
+  │   ├─ 内部横滚元素白名单检测 → scrollBlock = true → return
+  │   ├─ z-index 提升（首次移动时）
+  │   ├─ 根据触摸目标容器实时 transform：
+  │   │   ├─ 在 #menu 上：
+  │   │   │   ├─ xDiff < 0（右滑 = 关闭方向）→ menu.transform = translateX(−xDiff)
+  │   │   │   │   −xDiff 为正，menu 从 translateX(0) 向正方向推（向右关闭）
+  │   │   │   └─ xDiff ≥ 0（左滑 = 保持方向）→ menu.transform = translateX(0px)
+  │   │   ├─ 在 #sidebar 上：
+  │   │   │   ├─ xDiff > 0（左滑 = 关闭方向）→ sidebar.transform = translateX(−xDiff)
+  │   │   │   │   −xDiff 为负，sidebar 从 translateX(0) 向负方向推（向左关闭）
+  │   │   │   └─ xDiff ≤ 0（右滑 = 保持方向）→ sidebar.transform = translateX(0px)
+  │   │   └─ 在编辑区/其他：
+  │   │       ├─ firstDirection === "toRight" → sidebar 从左侧跟手拉出：
+  │   │       │   sidebar.transform = translateX(min(−xDiff − windowWidth, 0))
+  │   │       │   （xDiff < 0 → −xDiff 为正，从 −windowWidth 趋向 0）
+  │   │       └─ firstDirection === "toLeft" → menu 从右侧跟手拉出：
+  │   │           menu.transform = translateX(max(windowWidth − xDiff, 0))
+  │   │           （xDiff > 0，从 windowWidth 趋向 0）
+  │   └─ activeBlur() + 编辑器 overflow = "hidden"
+  └─ 遮罩透明度更新 transformMask(...)
+```
 
+### 4.1.3 touchend 处理流程
+
+```
 touchend → handleTouchEnd
   ├─→ globalTouchEnd() ← iOS 长按菜单判定（900ms 长按）
-  ├─ 条件判定提前退出（输入框/对话框/键盘显示中/PDF 中）
-  ├─ scrollBlock 为真 → closePanel()，return
-  ├─ 判定手势有效性：
-  │     时间 < 1000ms  OR  |xDiff| > window.innerWidth / 3
-  ├─ 根据起点容器（#model/#menu/#sidebar/编辑器）和方向判定目标状态
-  ├─ 反向位移检测（lastClientX）：中途反向则取消手势
-  └─ 最终：popMenu() / popSide() / closePanel() / closeModel()
+  ├─ 提前退出检查（AUDIO/对话框/子菜单/PDF/键盘工具栏）→ return
+  ├─ 还原编辑器 overflow = ""
+  ├─ scrollBlock === true → closePanel(), return
+  ├─ 有效性检查：(time < 1000ms) OR (|xDiff| > innerWidth/3)
+  │     └─ 无效 → closePanel()，面板回弹
+  │
+  ├─ isXScroll = |xDiff| > |yDiff|
+  │
+  ├─ 触摸目标在 #model 内：
+  │   └─ isXScroll && toRight && 无反向 → closeModel()
+  │
+  ├─ 触摸目标在 #menu 内：
+  │   ├─ isXScroll && toRight（右滑 = 关闭方向）：
+  │   │   ├─ 有反向 lastClientX → popMenu()（取消关闭，保持打开）
+  │   │   └─ 无反向 → closePanel()（确认关闭，menu 滑回右侧 +100vw）
+  │   ├─ isXScroll && toLeft（左滑 = 保持方向）：
+  │   │   ├─ 有反向 lastClientX → closePanel()（取消保持，执行关闭）
+  │   │   └─ 无反向 → popMenu()（确认保持打开）
+  │   └─ 非横向 → popMenu()（保持打开）
+  │
+  ├─ 触摸目标在 #sidebar 内：
+  │   ├─ isXScroll && toLeft（左滑 = 关闭方向）：
+  │   │   ├─ 有反向 lastClientX → popSide(false)（取消关闭，保持打开）
+  │   │   └─ 无反向 → closePanel()（确认关闭，sidebar 滑回左侧 -100vw）
+  │   ├─ isXScroll && toRight（右滑 = 保持方向）：
+  │   │   ├─ 有反向 lastClientX → closePanel()（取消保持，执行关闭）
+  │   │   └─ 无反向 → popSide(false)（确认保持打开）
+  │   └─ 非横向 → popSide(false)（保持打开）
+  │
+  └─ 触摸目标在编辑区/其他：
+      ├─ xDiff > 0（左滑）→ popMenu()（从右侧打开菜单）
+      ├─ xDiff < 0（右滑）→ popSide()（从左侧打开侧栏）
+      └─ 有反向 lastClientX 时一律 closePanel()
 ```
 
 ### 4.2 核心手势状态变量
 
-在 [touch.ts (mobile)](file:///d:/fz/0601/solo-dogfeeding/code/302-siyuan/app/src/mobile/util/touch.ts#L16-L25) 中定义：
+在 `app/src/mobile/util/touch.ts` 中定义：
 
 | 变量 | 类型 | 作用 |
 |------|------|------|
 | `clientX/Y` | number | 触摸起点坐标（边缘区域置 null 以禁用手势） |
-| `xDiff/yDiff` | number | 位移差值（起点 - 当前点） |
-| `time` | number | 起点时间戳，用于判定快滑 |
-| `firstDirection` | toLeft/toRight | 首次横向位移方向，用于后续一致性检测 |
-| `firstXY` | "x"/"y" | 首次主导方向，纵向滚动则锁定禁用横向手势 |
-| `lastClientX` | number | 反向位移检测用，记录方向反转时的 X 坐标 |
+| `xDiff/yDiff` | number | 位移差值（起点 - 当前点），xDiff > 0 为左滑，< 0 为右滑 |
+| `time` | number | 起点时间戳，用于判定快滑（< 1000ms 有效） |
+| `firstDirection` | "toLeft"/"toRight" | 首次横向位移方向，用于后续一致性检测 |
+| `firstXY` | "x"/"y" | 首次主导方向轴，"y" 锁定后后续 move 直接 return |
+| `lastClientX` | number | 反向位移检测：与 firstDirection 不一致时记录最后一次 clientX |
 | `scrollBlock` | boolean | 内部可横滚元素命中标记，让位给原生滚动 |
 | `isFirstMove` | boolean | 首次横向有效移动标记（用于提升 z-index） |
+| `previousClientX` | number | 上一帧 clientX，用于逐帧检测方向反转 |
 
 ### 4.3 手势判定的冲突解决策略
 
-**横向手势 vs 纵向滚动（优先级：原生滚动）**
+#### 4.3.1 横向手势 vs 纵向滚动（优先级：原生滚动）
 
-在 [touch.ts#L231-L245](file:///d:/fz/0601/solo-dogfeeding/code/302-siyuan/app/src/mobile/util/touch.ts#L231-L245) 中：
+在 `app/src/mobile/util/touch.ts` 的 handleTouchMove 中：
 
 ```typescript
 if (!firstXY) {
@@ -353,38 +454,56 @@ if (!firstXY) {
     } else {
         firstXY = "y";  // 纵向为主 → 交给系统，后续 move 直接 return
     }
-    // 特殊修正：面板内的"反向"滑动视为面板内滚动而非关闭
+    // 面板内"同向保持"降级：在已打开的面板上向打开方向滑动视为面板内纵向滚动
     if (firstXY === "x") {
-        if ((在 #menu 中且向左滑) || (在 #sidebar 中且向右滑)) {
-            firstXY = "y";  // 降级为纵向，允许垂直滚动浏览菜单项
+        if ((hasClosestByAttribute(target, "id", "menu") && firstDirection === "toLeft") ||
+            (hasClosestByAttribute(target, "id", "sidebar") && firstDirection === "toRight")) {
+            firstXY = "y";  // 降级为纵向，允许滚动浏览面板内容
         }
     }
 }
 ```
 
-**面板手势 vs 内部元素水平滚动（优先级：元素内部）**
+**设计意图**：当用户在已打开的 `#menu` 上左滑（toLeft，即"保持打开"方向），或已打开的 `#sidebar` 上右滑（toRight，即"保持打开"方向），这更可能是想**纵向滚动面板内容**而非执行面板手势，因此降级为纵向处理。只有"关闭方向"的滑动（menu 上右滑、sidebar 上左滑）才保留为横向面板手势。
 
-在 [touch.ts#L266-L304](file:///d:/fz/0601/solo-dogfeeding/code/302-siyuan/app/src/mobile/util/touch.ts#L266-L304) 中：遍历父链查找以下元素，如果存在且仍有可滚动余量，设置 `scrollBlock = true` 让出手势：
+#### 4.3.2 面板手势 vs 内部元素水平滚动（优先级：元素内部）
 
-| 元素类型 | 检测方式 |
-|----------|----------|
-| 代码块 | `data-type="NodeCodeBlock"` + `.code-block` 类 |
-| 数据库 | `data-type="NodeAttributeView"` → tab-bar / av__scroll / av__kanban |
-| 数学公式块 | `data-type="NodeMathBlock"` → 递归查找有 scrollWidth 溢出的子元素 |
-| 表格 | `data-type="NodeTable"` → 第一个子元素滚动容器 |
-| 列表 | `.list` 类（处理缩进层级过多导致的宽度溢出） |
-| 面包屑 | `.protyle-breadcrumb__bar--nowrap` 类 |
+在 `app/src/mobile/util/touch.ts` 的 handleTouchMove 中：遍历父链查找以下元素，如果存在且仍有可滚动余量，设置 `scrollBlock = true` 让出手势：
 
-**iOS 边缘手势屏蔽：**
+| 元素类型 | 检测方式 | 滚动容器定位 |
+|----------|----------|-------------|
+| 代码块 | `data-type="NodeCodeBlock"` | `.code-block` → 第二个子元素（代码区域） |
+| 数据库 | `data-type="NodeAttributeView"` | `.layout-tab-bar` / `.av__scroll` / `.av__kanban` |
+| 数学公式块 | `data-type="NodeMathBlock"` | 递归查找第一个 `scrollWidth > clientWidth` 的子元素 |
+| 表格 | `data-type="NodeTable"` | `.table` → 第一个子元素 |
+| 列表 | `.list` 类 | 直接使用（缩进层级溢出） |
+| 面包屑 | `.protyle-breadcrumb__bar--nowrap` | 直接使用 |
+
+滚动余量判定：
+```typescript
+// 向右滑（xDiff < 0）：检查是否还能向左滚
+xDiff < 0 && scrollElement.scrollLeft > 0
+// 向左滑（xDiff > 0）：检查是否还能向右滚
+xDiff > 0 && Math.ceil(scrollElement.clientWidth + scrollElement.scrollLeft) < scrollElement.scrollWidth
+```
+
+#### 4.3.3 iOS 边缘手势屏蔽
 
 ```typescript
-// 起点距离屏幕边缘 < 8px 视为系统边缘返回手势 → 不记录起点
-if (isIPhone() || (event.touches[0].clientX > 8 && event.touches[0].clientX < window.innerWidth - 8))
+if (isIPhone() ||
+    (event.touches[0].clientX > 8 && event.touches[0].clientX < window.innerWidth - 8)) {
+    clientX = event.touches[0].clientX;
+    clientY = event.touches[0].clientY;
+} else {
+    clientX = null;  // 非 iPhone 且在 8px 边缘内 → 禁用手势
+}
 ```
+
+> **注意**：此逻辑在 iPhone 上**始终记录起点**（因为 `isIPhone()` 为 true 时短路 OR），只在非 iPhone 设备且起点在 8px 边缘内时才屏蔽手势。
 
 ### 4.4 iOS 长按菜单（globalTouchEnd）
 
-在 [touch.ts (boot)](file:///d:/fz/0601/solo-dogfeeding/code/302-siyuan/app/src/boot/globalEvent/touch.ts#L62-L146) 中，条件：`yDiff === undefined`（未产生移动）且 `duration > 900ms`：
+在 `app/src/boot/globalEvent/touch.ts` 中，条件：`yDiff === undefined`（未产生移动）且 `duration > 900ms`：
 
 - 文档树节点 → `initNavigationMenu()` / `initFileMenu()`（复用桌面端菜单生成逻辑）
 - 行级元素（ref/tag/a/math/memo 等）→ 对应 `xxxMenu(protyle, target)`（全部复用桌面端）
@@ -392,7 +511,7 @@ if (isIPhone() || (event.touches[0].clientX > 8 && event.touches[0].clientX < wi
 
 ### 4.5 背景图拖拽手势（globalTouchStart）
 
-在 [touch.ts (boot)](file:///d:/fz/0601/solo-dogfeeding/code/302-siyuan/app/src/boot/globalEvent/touch.ts#L20-L60) 中：如果 touchstart 命中文档题头图 `.protyle-background img`，则：
+在 `app/src/boot/globalEvent/touch.ts` 中：如果 touchstart 命中文档题头图 `.protyle-background img`，则：
 
 1. 临时设置 `contentElement.style.overflow = "hidden"` 阻止页面滚动
 2. 绑定 `document.ontouchmove` 实时调整 `objectPosition` 百分比
@@ -414,36 +533,33 @@ if (isIPhone() || (event.touches[0].clientX > 8 && event.touches[0].clientX < wi
 用户点击编辑区
   │
   ├─→ click 事件（优先使用 click 而非 touchstart，避免键盘不收起问题）
-  │     ├─ [index.ts#L97-L103](file:///d:/fz/0601/solo-dogfeeding/code/302-siyuan/app/src/mobile/index.ts#L97-L103)
-  │     │    滚动输入/textarea 到视口中心
-  │     └─ [index.ts#L104-L108](file:///d:/fz/0601/solo-dogfeeding/code/302-siyuan/app/src/mobile/index.ts#L104-L108)
-  │          canInput(element) → true → callMobileAppShowKeyboard()
+  │     ├─ 滚动输入/textarea 到视口中心
+  │     └─ canInput(element) → true → callMobileAppShowKeyboard()
   │
   └─→ 焦点拦截（HTMLElement.prototype.focus 覆写）
-        [index.ts#L113-L127](file:///d:/fz/0601/solo-dogfeeding/code/302-siyuan/app/src/mobile/index.ts#L113-L127)
         所有 focus() 调用 → canInput() 检测 → callMobileAppShowKeyboard()
 ```
 
-`canInput()` 判定逻辑在 [mobileAppUtil.ts#L18-L33](file:///d:/fz/0601/solo-dogfeeding/code/302-siyuan/app/src/mobile/util/mobileAppUtil.ts#L18-L33)：
+`canInput()` 判定逻辑在 `app/src/mobile/util/mobileAppUtil.ts`：
 - INPUT/TEXTAREA 且非 readonly
 - contenteditable="true" 且所在 `.protyle-wysiwyg[data-readonly="false"]`
 
 #### 5.1.2 键盘锁定机制（防闪烁）
 
-在 [mobileAppUtil.ts#L3-L15](file:///d:/fz/0601/solo-dogfeeding/code/302-siyuan/app/src/mobile/util/mobileAppUtil.ts#L3-L15) 中引入了**主动唤起后的 500ms 锁定窗口**：
+在 `app/src/mobile/util/mobileAppUtil.ts` 中引入了**主动唤起后的 500ms 锁定窗口**：
 
 ```typescript
 export let keyboardLockUntil = 0;
 
 export const callMobileAppShowKeyboard = () => {
-    keyboardLockUntil = Date.now() + 500;  // 锁定 500ms
+    keyboardLockUntil = Date.now() + 500;
     window.JSAndroid?.showKeyboard();      // 或 JSHarmony / iOS
 };
 
 export const activeBlur = () => {
-    if (Date.now() < keyboardLockUntil) {  // 锁定期禁止 blur
+    if (Date.now() < keyboardLockUntil) {
         console.warn(`activeBlur blocked by lock ...`);
-        return;  // ← 防止某些机型（如鸿蒙 Pura X）"弹起键盘后立即触发 blur → 键盘又被关闭"的死循环
+        return;  // ← 防止某些机型（如鸿蒙 Pura X）键盘弹起后立即 blur 的死循环
     }
     window.JSAndroid?.hideKeyboard();
     hideKeyboardToolbar();
@@ -453,7 +569,7 @@ export const activeBlur = () => {
 
 ### 5.2 键盘高度检测与布局调整
 
-由于移动端浏览器没有直接获取键盘高度的 DOM API，SiYuan 采用了 **`resize` 事件监听 + 高度差缓存** 的方案，见 [keyboardToolbar.ts#L528-L568](file:///d:/fz/0601/solo-dogfeeding/code/302-siyuan/app/src/mobile/util/keyboardToolbar.ts#L528-L568)：
+由于移动端浏览器没有直接获取键盘高度的 DOM API，SiYuan 采用了 **`resize` 事件监听 + 高度差缓存** 的方案，见 `app/src/mobile/util/keyboardToolbar.ts`：
 
 ```
 初始化/横竖屏切换：
@@ -497,8 +613,8 @@ document.selectionchange（防抖 620ms）
        ├─ showUtil === false → hideKeyboardToolbarUtil()（收起扩展区）
        ├─ showKeyboardToolbar() → 显示紧凑模式
        │     ├─ #keyboardToolbar.fn__none → 移除
-       │     ├─ protyle.parent.paddingBottom = 48px ← 预留底部空间，避免被遮挡
-       │     ├─ 若光标位置 < 顶部 或 > (innerHeight - 42) → smooth scroll 调整滚动位置
+       │     ├─ protyle.parent.paddingBottom = 48px ← 预留底部空间
+       │     ├─ 若光标位置 < 顶部 或 > (innerHeight - 42) → smooth scroll
        │     └─ 插件事件：emit("mobile-keyboard-show")
        │
        └─ 动态按钮检测：
@@ -511,11 +627,10 @@ document.selectionchange（防抖 620ms）
 调用 `showKeyboardToolbarUtil(oldScrollTop)` 时：
 
 ```typescript
-// [keyboardToolbar.ts#L288-L314](file:///d:/fz/0601/solo-dogfeeding/code/302-siyuan/app/src/mobile/util/keyboardToolbar.ts#L288-L314)
-keyboardHeight = height1 - height2 + toolHeight;   // 推算总可用高度
+keyboardHeight = height1 - height2 + toolHeight;
 editor.protyle.element.parent.paddingBottom = keyboardHeight + "px";
 editor.protyle.contentElement.scrollTop = oldScrollTop;  // 还原滚动位置
-setTimeout(() => {  // 等待过渡动画结束后再设高度，防抖动
+setTimeout(() => {
     toolbarElement.style.height = keyboardHeight + "px";
 }, 300);
 ```
@@ -528,24 +643,27 @@ setTimeout(() => {  // 等待过渡动画结束后再设高度，防抖动
 
 ### 5.4 编辑状态与手势/滚动的互斥
 
-为避免编辑中误触发侧栏滑动，在 `handleTouchMove` 中设置了多重互斥条件，见 [touch.ts#L202-L224](file:///d:/fz/0601/solo-dogfeeding/code/302-siyuan/app/src/mobile/util/touch.ts#L202-L224)：
+为避免编辑中误触发侧栏滑动，在 `handleTouchMove` 中设置了多重互斥条件：
 
 ```
 handleTouchMove 提前退出条件（OR）：
   ├─ #keyboardToolbar 正在显示（.fn__none 不包含） → 编辑中禁止
   ├─ 用户有选中文本（range.toString() !== ""）且选区在编辑器内 → 选中扩选禁止
-  ├─ 目标在对话框 / PDF 查看器 / 子菜单面板中 → 禁止
+  ├─ 目标在对话框 / PDF 查看器 / 子菜单面板 / AUDIO 中 → 禁止
   └─ firstXY === "y"（纵向滚动主导）→ 禁止横滑手势
 ```
 
 **编辑中滚动保护：** 当首次判定为横向手势后，立即设置编辑器 `overflow = "hidden"` 防止页面产生垂直位移抖动：
 
 ```typescript
-// touch.ts handleTouchMove#L345-L347
+// handleTouchMove 中
 if (window.siyuan.mobile.editor) {
     window.siyuan.mobile.editor.protyle.contentElement.style.overflow = "hidden";
 }
-// touchend 时还原：contentElement.style.overflow = ""
+// handleTouchEnd 中还原
+if (window.siyuan.mobile.editor) {
+    window.siyuan.mobile.editor.protyle.contentElement.style.overflow = "";
+}
 ```
 
 ### 5.5 光标位置与选区管理
@@ -553,18 +671,16 @@ if (window.siyuan.mobile.editor) {
 移动端 `touchstart` 时额外保存 `touchRange`，用于后续修正被键盘顶出视口的光标：
 
 ```typescript
-// touch.ts handleTouchStart#L170-L176
+// handleTouchStart 中
 if (选区存在 && 点击在编辑器下半屏 && 工具栏隐藏) {
-    window.siyuan.mobile.touchRange = getRangeByPoint(x, y);
+    window.siyuan.mobile.touchRange = getRangeByPoint(event.touches[0].clientX, event.touches[0].clientY);
 }
 ```
 
 `showKeyboardToolbar()` 中如果发现光标已跳出视口（`cursorTop < 0`），则使用 `touchRange` 进行修正：
 
 ```typescript
-// keyboardToolbar.ts#L444-L454
 if (cursorTop < 0 && window.siyuan.mobile.touchRange) {
-    // 用 touchstart 时保存的 range 来重新聚焦
     focusBlock(rangeBlockElement) 或 focusByRange(touchRange);
     cursorTop = 重新计算后的位置;
 }
@@ -577,7 +693,7 @@ if (cursorTop < 0 && window.siyuan.mobile.touchRange) {
 
 ### 6.1 文档打开流程（openMobileFileById）
 
-涉及模块：`editor.ts` + `Protyle` 核心 + `setEmpty.ts`
+涉及模块：`app/src/mobile/editor.ts` + `Protyle` 核心 + `closePanel.ts`
 
 ```
 用户点击文档（文档树/最近文档/搜索结果）
@@ -608,44 +724,64 @@ if (cursorTop < 0 && window.siyuan.mobile.touchRange) {
 
 ### 6.2 横滑手势完整流程（从触摸到面板切换）
 
+以下以"从编辑区右滑打开侧栏"为例，追踪完整时序：
+
 ```
-touchstart 触发
+touchstart 触发（起点在编辑区中央）
   │
-  ├─ globalTouchStart → 背景图检测 → 命中 return
-  ├─ 记录 clientX/Y/time
-  ├─ iPhone 边缘 8px 过滤
-  └─ 重置 firstDirection/firstXY/lastClientX
+  ├─ globalTouchStart → 非背景图 → 继续
+  ├─ clientX = 300, clientY = 400, time = T0
+  └─ 重置 firstDirection/firstXY/lastClientX/scrollBlock
 
-touchmove 首次触发
+touchmove 第1帧（手指向右移动到 x=350）
   │
-  ├─ 编辑/选中/对话框/PDF → return
-  ├─ 计算 xDiff(23px) / yDiff(5px)
-  ├─ firstDirection = xDiff > 0 ? toLeft : toRight
-  ├─ firstXY = |xDiff| > |yDiff| ? "x" : "y"   → 此处判定为 "x"
-  ├─ 扫描内部横滚元素 → 未命中 scrollBlock = false
-  ├─ isFirstMove：提升侧栏/菜单/遮罩 z-index
-  ├─ 计算面板实时 transform（起点在编辑区 → 目标面板跟手移动）
-  └─ 遮罩透明度 = transformMask(...)
+  ├─ 键盘未显示 / 无选中文本 / 非对话框 → 继续
+  ├─ xDiff = 300 - 350 = -50, yDiff = 0
+  ├─ firstDirection = xDiff < 0 ? "toRight"
+  ├─ firstXY = |−50| > |0| → "x"（横向为主）
+  ├─ 不在 #menu / #sidebar 上 → 无需降级
+  ├─ 无内部横滚元素命中 → scrollBlock = false
+  ├─ isFirstMove → 提升 sidebar/menu/mask 的 z-index
+  ├─ firstDirection === "toRight" → sidebar 跟手：
+  │   sidebar.transform = translateX(min(−(−50) − 400, 0)) = translateX(−350)
+  │   （sidebar 从 -100vw 位置向 0 方向移动了 50px）
+  └─ mask.opacity = min(1 − (400 + (−50))/400, 0.68) = 0.125
 
-touchmove 后续触发（持续更新 transform/opacity）
-  ↓
+touchmove 第N帧（手指继续右移到 x=500）
+  │
+  ├─ xDiff = 300 − 500 = −200
+  ├─ sidebar.transform = translateX(min(200 − 400, 0)) = translateX(−200)
+  │   （sidebar 已拉出 200px）
+  └─ mask.opacity = min(1 − 200/400, 0.68) = 0.5
+
 touchend 触发
   │
-  ├─ scrollBlock === true → closePanel return
-  ├─ 有效性检查：(now - time < 1000ms) || (|xDiff| > width/3)
-  │     ├─ 无效：closePanel()，面板回弹到关闭位
-  │     └─ 有效：根据 firstDirection 和 lastClientX 判定
-  │
-  ├─ lastClientX 检测（中途反向滑动过）：
-  │     toRight 过程中有过反向 → lastClientX != undefined
-  │       → 用户犹豫 → 执行 closePanel()（取消）
-  │
-  └─ 最终动作：
-       toRight + 起点在编辑区 → popMenu()（打开主菜单）
-       toLeft  + 起点在编辑区 → popSide() （打开侧栏）
-       toLeft  + 起点在 #menu → closePanel()（关闭主菜单）
-       toRight + 起点在 #sidebar → closePanel()（关闭侧栏）
+  ├─ scrollBlock === false → 继续
+  ├─ time 检查：< 1000ms → scrollEnable = true
+  ├─ isXScroll = |−200| > |0| → true
+  ├─ 不在 #model / #menu / #sidebar 内 → 进入编辑区逻辑
+  ├─ xDiff = −200 < 0 → 右滑
+  │   ├─ 无反向 lastClientX → popSide()
+  │   └─ sidebar.transform = "translateX(0px)" → 完全展开
+  └─ 遮罩显示，侧栏内容可浏览
 ```
+
+### 6.3 方向-面板-动作对照表
+
+**从编辑区滑动的方向与打开面板对应关系：**
+
+| xDiff | 方向 | 打开面板 | 面板来源方向 | CSS 默认 → 目标 |
+|-------|------|----------|-------------|----------------|
+| xDiff < 0 | 右滑 (toRight) | `#sidebar` (popSide) | 从左侧滑入 | `translateX(-100vw)` → `translateX(0px)` |
+| xDiff > 0 | 左滑 (toLeft) | `#menu` (popMenu) | 从右侧滑入 | `translateX(100vw)` → `translateX(0px)` |
+
+**在面板上滑动的方向与关闭/保持对应关系：**
+
+| 当前面板 | 关闭方向 | 关闭 transform 变化 | 保持方向 | 保持状态 |
+|----------|---------|--------------------|---------|---------| 
+| `#sidebar` | 左滑 (toLeft, xDiff > 0) | `0px` → `translateX(−xDiff)` 推向左侧 | 右滑 (toRight, xDiff < 0) | `translateX(0px)` |
+| `#menu` | 右滑 (toRight, xDiff < 0) | `0px` → `translateX(−xDiff)` 推向右侧 | 左滑 (toLeft, xDiff ≥ 0) | `translateX(0px)` |
+| `#model` | 右滑 (toRight) | closeModel() | — | — |
 
 ---
 
@@ -666,7 +802,7 @@ touchend 触发
                        │
 ┌──────────────────────┼──────────────────────────────────────────────┐
 │  移动端 App 入口     │         核心模块协作                          │
-│  [mobile/index.ts]   │                                               │
+│  mobile/index.ts     │                                               │
 │                      │                                               │
 │  ┌────────────────┐  │   ┌───────────────────┐   ┌────────────────┐ │
 │  │ 全局事件绑定    │──┼──▶│ touch.ts (mobile) │◀──│ click/keydown  │ │
@@ -695,7 +831,7 @@ touchend 触发
 │                      │             ▼                                │
 │                      │   ┌───────────────────┐   ┌────────────────┐ │
 │                      │   │ menu/index.ts     │◀──│ onMessage.ts   │ │
-│                      │   │ 右侧菜单/设置面板 │   │ WebSocket 消息 │ │
+│                      │   │ 主菜单/设置面板   │   │ WebSocket 消息 │ │
 │                      │   │ + 面板打开辅助    │   │ 远端事件驱动   │ │
 │                      │   └───────────────────┘   └────────────────┘ │
 └──────────────────────────────────────────────────────────────────────┘
@@ -709,31 +845,31 @@ touchend 触发
 
 | 风险 | 场景 | 影响 | 相关代码 |
 |------|------|------|----------|
-| **UA 伪装导致误判** | 第三方浏览器/工具伪装 iPhone UA 或者 iPadOS 13+ 上报 Macintosh UA | `isIPad()` 失效 → 菜单弹出位置错误；交互行为与实际不匹配 | [compatibility.ts#L307-L318](file:///d:/fz/0601/solo-dogfeeding/code/302-siyuan/app/src/protyle/util/compatibility.ts#L307-L318) |
-| **容器检测依赖全局对象** | `window.JSAndroid` / `JSHarmony` / `webkit` 注入时机晚于初始化脚本 | `isInMobileApp()` 返回 false → 原生功能不可用；剪贴板/键盘异常 | [compatibility.ts#L350-L367](file:///d:/fz/0601/solo-dogfeeding/code/302-siyuan/app/src/protyle/util/compatibility.ts#L350-L367) |
-| **`isMobile()` 依赖 DOM 就绪时机** | 在 DOM 未构建完时调用（constants.ts 模块加载阶段）→ `#sidebar` 不存在 | 常量计算错误，如 `SIZE_TOOLBAR_HEIGHT = 32`（应为 0） | [functions.ts#L7-L9](file:///d:/fz/0601/solo-dogfeeding/code/302-siyuan/app/src/util/functions.ts#L7-L9) |
-| **Edge 浏览器不做 resize 键盘检测** | `!isInEdge()` 时跳过 resize 监听 → Edge 中键盘高度无法感知 | 工具栏被键盘遮挡 / 光标不可见 | [keyboardToolbar.ts#L527-L569](file:///d:/fz/0601/solo-dogfeeding/code/302-siyuan/app/src/mobile/util/keyboardToolbar.ts#L527-L569) |
+| **UA 伪装导致误判** | 第三方浏览器/工具伪装 iPhone UA 或者 iPadOS 13+ 上报 Macintosh UA | `isIPad()` 失效 → 菜单弹出位置错误；交互行为与实际不匹配 | `app/src/protyle/util/compatibility.ts` |
+| **容器检测依赖全局对象** | `window.JSAndroid` / `JSHarmony` / `webkit` 注入时机晚于初始化脚本 | `isInMobileApp()` 返回 false → 原生功能不可用；剪贴板/键盘异常 | `app/src/protyle/util/compatibility.ts` |
+| **`isMobile()` 依赖 DOM 就绪时机** | 在 DOM 未构建完时调用（constants.ts 模块加载阶段）→ `#sidebar` 不存在 | 常量计算错误，如 `SIZE_TOOLBAR_HEIGHT = 32`（应为 0） | `app/src/util/functions.ts` |
+| **Edge 浏览器不做 resize 键盘检测** | `!isInEdge()` 时跳过 resize 监听 → Edge 中键盘高度无法感知 | 工具栏被键盘遮挡 / 光标不可见 | `app/src/mobile/util/keyboardToolbar.ts` |
 
 ### 8.2 手势与触控
 
 | 风险 | 场景 | 影响 | 相关代码 |
 |------|------|------|----------|
-| **手势状态变量为模块级全局** | 多指触控 / 同时操作两个触点时，状态被覆盖 | 手势中途状态错乱，面板卡在半开位置 | [touch.ts#L16-L25](file:///d:/fz/0601/solo-dogfeeding/code/302-siyuan/app/src/mobile/util/touch.ts#L16-L25) |
-| **内部横滚元素检测不完整** | 新增可横滚组件（如 Timeline / Graph 迷你图）未列入白名单 | 触发面板手势而不是内部滚动，用户体验割裂 | [touch.ts#L266-L304](file:///d:/fz/0601/solo-dogfeeding/code/302-siyuan/app/src/mobile/util/touch.ts#L266-L304) |
-| **纵向/横向首次判定后无法切换** | 用户开始纵向，之后转为大幅度横向滑动 | firstXY="y" 锁定 → 横向手势永远不会生效 | [touch.ts#L231-L245](file:///d:/fz/0601/solo-dogfeeding/code/302-siyuan/app/src/mobile/util/touch.ts#L231-L245) |
-| **8px 边缘屏蔽的一刀切** | iPhone 全面屏的 Home Indicator 区域 / Android 全面屏手势区 | 左侧菜单"滑入打开"不灵敏，需重复尝试 | [touch.ts#L183-L193](file:///d:/fz/0601/solo-dogfeeding/code/302-siyuan/app/src/mobile/util/touch.ts#L183-L193) |
-| **编辑器 overflow 恢复丢失** | touchmove 中设 `overflow:hidden`，但 touchend 中因某个 return 条件提前退出 | 编辑器永久无法滚动，需刷新页面 | [touch.ts#L345-L347](file:///d:/fz/0601/solo-dogfeeding/code/302-siyuan/app/src/mobile/util/touch.ts#L345-L347) 对比 [touch.ts#L69-L71](file:///d:/fz/0601/solo-dogfeeding/code/302-siyuan/app/src/mobile/util/touch.ts#L69-L71) |
+| **手势状态变量为模块级全局** | 多指触控 / 同时操作两个触点时，状态被覆盖 | 手势中途状态错乱，面板卡在半开位置 | `app/src/mobile/util/touch.ts` |
+| **内部横滚元素检测不完整** | 新增可横滚组件（如 Timeline / Graph 迷你图）未列入白名单 | 触发面板手势而不是内部滚动，用户体验割裂 | `app/src/mobile/util/touch.ts` |
+| **纵向/横向首次判定后无法切换** | 用户开始纵向，之后转为大幅度横向滑动 | firstXY="y" 锁定 → 横向手势永远不会生效 | `app/src/mobile/util/touch.ts` |
+| **8px 边缘屏蔽逻辑对非 iPhone 设备** | 非 iPhone 设备在 8px 边缘内触摸 → clientX=null → 手势完全禁用 | Android 全面屏手势区附近无法触发面板滑动 | `app/src/mobile/util/touch.ts` |
+| **编辑器 overflow 恢复丢失** | touchmove 中设 `overflow:hidden`，但 touchend 中因某个 return 条件提前退出 | 编辑器永久无法滚动，需刷新页面 | `app/src/mobile/util/touch.ts`（move 设 hidden / end 设 ""） |
 
 ### 8.3 输入法与编辑状态
 
 | 风险 | 场景 | 影响 | 相关代码 |
 |------|------|------|----------|
-| **键盘锁定 500ms 硬编码** | 低端机型键盘动画 > 500ms；或者切换输入法/选词期间触发 blur | 锁定失效，键盘被意外收起；或锁定时间过长无法手动关闭 | [mobileAppUtil.ts#L3-L15](file:///d:/fz/0601/solo-dogfeeding/code/302-siyuan/app/src/mobile/util/mobileAppUtil.ts#L3-L15) |
-| **`selectionchange` 620ms 防抖** | 快速光标移动 → 工具栏显示滞后；用户连续输入中途工具栏才刷新 | 工具栏与光标位置不同步；点击工具栏按钮作用到错误选区 | [keyboardToolbar.ts#L328-L415](file:///d:/fz/0601/solo-dogfeeding/code/302-siyuan/app/src/mobile/util/keyboardToolbar.ts#L328-L415) |
-| **resize 差值 -100px 阈值** | 折叠屏展开时视口变化可能 > 100px 但非键盘事件；横屏键盘较矮 | 误判为键盘弹起 → 布局错乱 / 键盘高度被低估 | [keyboardToolbar.ts#L538-L541](file:///d:/fz/0601/solo-dogfeeding/code/302-siyuan/app/src/mobile/util/keyboardToolbar.ts#L538-L541) |
-| **`touchRange` 单实例覆盖** | A 区域 touchstart → B 区域 touchstart（多指/快速连点） | 键盘修正时使用了过期的 range，光标跳到错误位置 | [touch.ts#L170-L176](file:///d:/fz/0601/solo-dogfeeding/code/302-siyuan/app/src/mobile/util/touch.ts#L170-L176) |
-| **paddingBottom 未在销毁时清理** | 从输入态跳转到其他页面（PDF/搜索）未调用 hideKeyboardToolbar | 后续页面底部永久留白 48px | [keyboardToolbar.ts#L469-L490](file:///d:/fz/0601/solo-dogfeeding/code/302-siyuan/app/src/mobile/util/keyboardToolbar.ts#L469-L490) |
-| **`HTMLElement.prototype.focus` 全局覆写** | 第三方插件/代码依赖原生 focus 行为（如带 options 参数） | 兼容性问题；focus 参数丢失 | [index.ts#L113-L127](file:///d:/fz/0601/solo-dogfeeding/code/302-siyuan/app/src/mobile/index.ts#L113-L127) |
+| **键盘锁定 500ms 硬编码** | 低端机型键盘动画 > 500ms；或者切换输入法/选词期间触发 blur | 锁定失效，键盘被意外收起；或锁定时间过长无法手动关闭 | `app/src/mobile/util/mobileAppUtil.ts` |
+| **`selectionchange` 620ms 防抖** | 快速光标移动 → 工具栏显示滞后；用户连续输入中途工具栏才刷新 | 工具栏与光标位置不同步；点击工具栏按钮作用到错误选区 | `app/src/mobile/util/keyboardToolbar.ts` |
+| **resize 差值 -100px 阈值** | 折叠屏展开时视口变化可能 > 100px 但非键盘事件；横屏键盘较矮 | 误判为键盘弹起 → 布局错乱 / 键盘高度被低估 | `app/src/mobile/util/keyboardToolbar.ts` |
+| **`touchRange` 单实例覆盖** | A 区域 touchstart → B 区域 touchstart（多指/快速连点） | 键盘修正时使用了过期的 range，光标跳到错误位置 | `app/src/mobile/util/touch.ts` |
+| **paddingBottom 未在销毁时清理** | 从输入态跳转到其他页面（PDF/搜索）未调用 hideKeyboardToolbar | 后续页面底部永久留白 48px | `app/src/mobile/util/keyboardToolbar.ts` |
+| **`HTMLElement.prototype.focus` 全局覆写** | 第三方插件/代码依赖原生 focus 行为（如带 options 参数） | 兼容性问题；focus 参数丢失 | `app/src/mobile/index.ts` |
 
 ### 8.4 性能压力
 
@@ -790,9 +926,9 @@ touchend 触发
    - 测试：属性视图的看板布局、画廊视图、数据库的 tab 横向滚动、ECharts 图
    - 关注：能否正常内部滚动、不会误触发面板手势
 
-8. **iPhone 边缘 8px 屏蔽的左右手体验？**
-   - 测试：左手持机、右手持机、左右手联合操作
-   - 关注：左滑菜单、右滑侧栏的成功率和灵敏度
+8. **非 iPhone 设备 8px 边缘屏蔽的影响？**
+   - 测试：Android 全面屏设备左右边缘触摸
+   - 关注：左滑打开菜单、右滑打开侧栏的可达性
 
 9. **selectionchange 防抖 620ms 的合理性？**
    - 测试：使用系统输入法快速选词、切词、删词
@@ -834,5 +970,6 @@ SiYuan 移动端的设计在**工程可维护性**和**双端复用率**之间�
 - **重适配：** UI 布局、手势交互、键盘处理、面板承载完全独立实现，以 `mobile/` 目录为适配层，通过条件编译和运行时检测与桌面端切割
 - **强耦合：** 手势、键盘、编辑器滚动、面板切换通过全局 `window.siyuan.mobile` 共享状态紧密协作，效率高但可测试性/可调试性较弱
 - **硬边界：** 双端入口级分离而非 CSS 响应式断点，避免了"一套布局适配所有设备"的复杂度，但也损失了折叠屏/平板形态下的中间态可能性
+- **非对称面板布局：** `#sidebar`（左侧，`side-panel`）与 `#menu`（右侧，`b3-menu--fullscreen`）使用不同的 CSS 类和隐藏方向（`-100vw` vs `+100vw`），手势处理代码需要针对两个面板分别计算 transform
 
-对于后续迭代，**最值得投入的改进方向**是：将 `touch.ts` 中的模块级全局变量封装为 TouchState 类、引入 `requestAnimationFrame` 节流、并建立"折叠屏/平板中间布局模式"以覆盖越来越多的混合形态设备。
+对于后续迭代，**最值得投入的改进方向**是：将 `touch.ts` 中的模块级全局变量封装为 TouchState 类、引入 `requestAnimationFrame` 节流、统一 `#sidebar` 与 `#menu` 的 CSS 基类以减少手势代码中的分支、并建立"折叠屏/平板中间布局模式"以覆盖越来越多的混合形态设备。
