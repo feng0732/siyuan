@@ -222,7 +222,7 @@ func (conf *AppConf) Save() {
 | 4 | **L761** | **`sql.FlushQueue()`** | **先将 SQLite 的写队列全部 flush 到磁盘** |
 | 5 | L780 | `Conf.Close()` → `Conf.Save()` | **再落盘 conf.json**（确保已包含 Sync.Synced 等同步后更新的字段） |
 | 6 | L781 | `sql.CloseDatabase()` | 关闭所有 SQLite 连接 |
-| 7 | L782 | `util.SaveAssetsTexts()` | 将 OCR 文本等资源内容刷盘 |
+| 7 | L782 | `util.SaveAssetsTexts()` | 将内存中 OCR 文本写入 `ocr-texts.json`（纯文件操作，不依赖数据库，在 CloseDatabase 之后安全） |
 | 8 | L783 | `clearWorkspaceTemp()` | 清理 temp/ 下的临时文件 |
 | 9 | L784 | `clearCorruptedNotebooks()` | 删除检测到的损坏笔记本 |
 | 10 | L785 | `clearPortJSON()` | 清除端口映射 |
@@ -558,7 +558,6 @@ mergeResult.Removes     // 需要删除的文件列表
 | **iOS 沙箱路径误判** | 硬编码 `strings.Contains(d, "/Documents/")`，若工作空间目录名恰好为 `Documents` 可能误切 | [util/working.go#L324-L361](kernel/util/working.go#L324-L361) |
 | **Docker 强制 bypass 环境变量** | `SIYUAN_ACCESS_AUTH_CODE_BYPASS=true` 可跳过访问授权码检查，部署时需警惕 | 路由层 `checkAuth` 中间件 |
 | **BroadcastChannel 引用计数清理延迟** | `Destroy(false)` 无订阅者时不立即清理，高频创建/销毁场景可能有短时 goroutine 堆积 | [api/broadcast.go:Destroy](kernel/api/broadcast.go) |
-| **SaveAssetsTexts 在 sql.CloseDatabase 之后** | `SaveAssetsTexts()`（L782）执行于 `sql.CloseDatabase()`（L781）**之后**，若 OCR 文本仍有 DB 写入则会失败 | [model/conf.go#L780-L783](kernel/model/conf.go#L780-L783) |
 
 ### 9.3 低风险项
 
@@ -613,10 +612,9 @@ mergeResult.Removes     // 需要删除的文件列表
 
 ### 10.3 退出顺序与数据完整性
 
-7. **Q7：SaveAssetsTexts 位于 sql.CloseDatabase 之后是否安全？**
+7. **Q7（已核实）：SaveAssetsTexts 位于 sql.CloseDatabase 之后是否安全？**
    - L781 `sql.CloseDatabase()` → L782 `util.SaveAssetsTexts()`
-   - 若 `SaveAssetsTexts()` 内部有数据库写入（如更新资产内容表），此时连接已关闭
-   - **建议验证**：搜索 `SaveAssetsTexts` 的实现，确认是否有数据库操作
+   - **核实结论：不构成风险**。`SaveAssetsTexts()` 实现（[util/ocr.go#L105-L135](kernel/util/ocr.go#L105-L135)）仅操作内存中的 `assetsTexts` map + `filelock.WriteFile` 写入 `ocr-texts.json`，**不涉及任何数据库操作**，因此 CloseDatabase 在其之前执行不影响正确性
 
 8. **Q8：ExitSyncSucc 非零直接 return 是否跳过了 Conf.Save()？**
    - L750-L753：`if 0 != ExitSyncSucc { exitCode = 1; return }`
@@ -645,14 +643,14 @@ mergeResult.Removes     // 需要删除的文件列表
 
 ### 10.5 性能与资源
 
-12. **Q12：saveLayout 的递增重试是否有上限？**
-    - `saveLayout()` 中 `for (Constants.TIMEOUT_LOAD * saveCount) > time...`
-    - `saveCount` 若持续递增（例如 setUILayout API 持续超时）会导致等待指数级变长
-    - 是否有最大重试次数与 reset 机制
+12. **Q12（已核实）：saveLayout 的递增重试是否有上限？**
+    - **核实结论：有上限，不构成溢出风险**。`saveLayout()` 中（[app/src/layout/util.ts#L150-L156](app/src/layout/util.ts#L150-L156)）条件为 `saveCount < 10`，超过 10 次后走 else 分支直接保存，`saveCount` 重置为 0
+    - 最大延迟为 `Constants.TIMEOUT_LOAD * 10`（约 3~5 秒），不会无限增长
 
-13. **Q13：syncSameCount 的指数退避是否溢出？**
-    - `delay := time.Minute * 2^syncSameCount`，当 syncSameCount > 63 时整型溢出
-    - 虽有 `syncSameCount.Store(5)` 的上限截断，但只在 `> 10` 时触发（此时 2^10 = 1024 分钟 = ~17 小时，已远超 fixSyncInterval = 5 分钟的兜底）
+13. **Q13（已核实）：syncSameCount 的指数退避是否溢出？**
+    - 代码（[model/repository.go#L1684-L1693](kernel/model/repository.go#L1684-L1693)）：`syncSameCount.Add(1)` → 若 `> 10` 则 `Store(5)` → `delay = time.Minute * 2^syncSameCount` → 若 `delay < fixSyncInterval(5min)` 则 `delay = 8min`
+    - **核实结论：不会溢出**。`syncSameCount` 为 `atomic.Int32`，上限被截断为 10，`2^10 = 1024` 分钟（约 17 小时），远低于 int32 溢出范围
+    - 但需注意：**当连续 10 次以上同步无数据变更时，下次同步延迟会从 2^5=32 分钟重新开始爬升**（Store(5) 重置），形成了「32→64→128→256→512→1024→32」的锯齿形退避模式，并非严格的指数退避
 
 ---
 
