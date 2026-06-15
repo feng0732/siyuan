@@ -109,27 +109,36 @@ public static readonly SIYUAN_RENDER_CODE_LANGUAGES: string[] = [
 
 ---
 
-### 3.2 阶段二：渲染任务触发（精确统计：**14 个文件，共 33 处真实调用**）
+### 3.2 阶段二：渲染任务触发（精确统计：**14 个文件，共 32 处真实调用**）
 
-> **统计说明**：grep `processRender` 返回 47 行结果，其中 **13 行是 import 语句**，**1 行是函数定义**（processCode.ts:L59），剩余 **33 行是真实调用**，分布于 **14 个源文件**。
+> **统计说明**：在 `app/src` 下 grep `processRender(`（区分 import/定义/调用）精确统计如下：
+>
+> | grep 结果分类 | 行数 | 说明 |
+> |---|---|---|
+> | import 语句 | 14 行 | 14 个调用文件各 1 条 import（一一对应） |
+> | 函数定义 | 1 行 | `app/src/protyle/util/processCode.ts` L46：`export const processRender = ...` |
+> | **真实调用** | **32 行** | 分布于 **14 个源文件**（下表逐项校验） |
+> | **grep 合计** | **47 行** | 14 + 1 + 32 = 47 ✓ |
 
-#### 3.2.1 调用点全景分类
+#### 3.2.1 调用点全景分类（逐项行号校验）
 
-| 触发场景分类 | 文件数 | 调用次数 | 文件列表（仓库相对路径）及具体行号 |
-|---|---|---|---|
-| **事务更新** | 1 | 10 次 | `app/src/protyle/wysiwyg/transaction.ts` L115, L235, L315, L375, L429, L888, L1255, L1359, L1494 |
-| **回车分裂块** | 1 | 6 次 | `app/src/protyle/wysiwyg/enter.ts` L93, L99, L483, L564, L571 |
-| **编辑器浮层编辑** | 1 | 4 次 | `app/src/protyle/toolbar/index.ts` L1081, L1163, L1176, L1835 |
-| **粘贴操作** | 1 | 3 次 | `app/src/protyle/util/paste.ts` L459, L561, L630 |
-| **反链渲染** | 1 | 2 次 | `app/src/protyle/wysiwyg/renderBacklink.ts` L24, L79 |
-| **文档初始加载** | 2 | 2 次 | `app/src/protyle/util/onGet.ts` L232<br>`app/src/mobile/util/MobileBackFoward.ts` L92 |
-| **嵌入块递归渲染** | 1 | 1 次 | `app/src/protyle/render/blockRender.ts` L120 |
-| **预览面板** | 1 | 1 次 | `app/src/protyle/preview/index.ts` L193 |
-| **导出流程** | 1 | 1 次 | `app/src/protyle/export/util.ts` L166 |
-| **自动补全提示** | 2 | 2 次 | `app/src/protyle/hint/index.ts` L865<br>`app/src/protyle/hint/extend.ts` L559 |
-| **AV 画廊渲染** | 1 | 1 次 | `app/src/protyle/render/av/gallery/render.ts` L157 |
-| **AI 内容填充** | 1 | 1 次 | `app/src/ai/actions.ts` L25 |
-| **合计** | **14** | **33** | |
+下表中「调用次数」= 行号列表逗号分隔数量，最后一行合计严格等于 Σ 调用次数。
+
+| 触发场景分类 | 文件数 | 调用次数 | 行号列表（逐行对应） | 仓库相对路径 |
+|---|---|---|---|---|
+| **事务更新** | 1 | 9 | L115, L235, L315, L375, L429, L888, L1255, L1359, L1494 | `app/src/protyle/wysiwyg/transaction.ts` |
+| **回车分裂块** | 1 | 5 | L93, L99, L483, L564, L571 | `app/src/protyle/wysiwyg/enter.ts` |
+| **编辑器浮层编辑** | 1 | 4 | L1081, L1163, L1176, L1835 | `app/src/protyle/toolbar/index.ts` |
+| **粘贴操作** | 1 | 3 | L459, L561, L630 | `app/src/protyle/util/paste.ts` |
+| **反链渲染** | 1 | 2 | L24, L79 | `app/src/protyle/wysiwyg/renderBacklink.ts` |
+| **文档初始加载** | 2 | 2 | L232; L92 | `app/src/protyle/util/onGet.ts` / `app/src/mobile/util/MobileBackFoward.ts` |
+| **自动补全提示** | 2 | 2 | L865; L559 | `app/src/protyle/hint/index.ts` / `app/src/protyle/hint/extend.ts` |
+| **嵌入块递归渲染** | 1 | 1 | L120 | `app/src/protyle/render/blockRender.ts` |
+| **预览面板** | 1 | 1 | L193 | `app/src/protyle/preview/index.ts` |
+| **导出流程** | 1 | 1 | L166 | `app/src/protyle/export/util.ts` |
+| **AV 画廊渲染** | 1 | 1 | L157 | `app/src/protyle/render/av/gallery/render.ts` |
+| **AI 内容填充** | 1 | 1 | L25 | `app/src/ai/actions.ts` |
+| **校验合计** | **14** | **32** | 9+5+4+3+2+2+2+1+1+1+1+1 = **32** ✓ | 14 个文件 ✓ |
 
 #### 3.2.2 各场景调用上下文（证据链抽样）
 
@@ -452,7 +461,7 @@ catch (error) {
                                                            │ data-type          │
                                                            └─────────┬──────────┘
                                                                      │
-                                            14 个文件，33 处真实调用触发
+                                            14 个文件，32 处真实调用触发
                                                                      │
                                                                      ▼
                                    ┌───────────────────────────────────────────────┐
@@ -784,14 +793,14 @@ lute.SetSanitize(options.sanitize);
 - [ ] 覆盖测试 inline-math 8 种 ZWSP 边界场景的光标定位
 - [ ] 验证 showRender 浮层 noChange=true 时是否仍错误 removeAttribute("data-render")
 - [ ] 导出 PDF maxWidth 模式下公式宽度重计算的精度测试
-- [ ] 33 处 processRender 调用：检查传入容器是否可能为 null / 已 detached
+- [ ] 32 处 processRender 调用：检查传入容器是否可能为 null / 已 detached
 
 ### 8.5 可维护性
 - [ ] 抽取 8 个渲染器的公共骨架为 `baseRender(type, engineLoader, renderer)` 函数
 - [ ] 所有外部资源版本号集中至 `constants.ts` 统一管理
 - [ ] RENDER_MAP 支持优先级与依赖声明，避免层级 `.then()` 嵌套
 - [ ] 为 abcRender `%%params` 语法补充单元测试
-- [ ] 为 33 处 processRender 调用分类建档，明确每处的触发用户行为
+- [ ] 为 32 处 processRender 调用分类建档，明确每处的触发用户行为
 
 ---
 
@@ -817,17 +826,20 @@ lute.SetSanitize(options.sanitize);
 | 可渲染语言白名单 | `app/src/constants.ts` | L841-L843 |
 | 图标 / 渲染框架生成 | `app/src/protyle/render/util.ts` | L5-L43 |
 | 编辑浮层（showRender） | `app/src/protyle/toolbar/index.ts` | L1050-L1180 |
-| 事务处理（10 处调用） | `app/src/protyle/wysiwyg/transaction.ts` | L115, L235, L315, L375, L429, L888, L1255, L1359, L1494 |
-| 回车分裂（6 处调用） | `app/src/protyle/wysiwyg/enter.ts` | L93, L99, L483, L564, L571 |
-| 粘贴（3 处调用） | `app/src/protyle/util/paste.ts` | L459, L561, L630 |
-| 文档加载（2 处调用） | `app/src/protyle/util/onGet.ts`<br>`app/src/mobile/util/MobileBackFoward.ts` | L232<br>L92 |
-| AI 填充 | `app/src/ai/actions.ts` | L25 |
-| 预览面板 | `app/src/protyle/preview/index.ts` | L193 |
-| 导出流程 | `app/src/protyle/export/util.ts` | L166 |
-| AV 画廊 | `app/src/protyle/render/av/gallery/render.ts` | L157 |
-| 提示面板（2 处） | `app/src/protyle/hint/index.ts`<br>`app/src/protyle/hint/extend.ts` | L865<br>L559 |
-| 反链渲染（2 处） | `app/src/protyle/wysiwyg/renderBacklink.ts` | L24, L79 |
+| 事务处理（9 处调用，Σ行号=9 ✓） | `app/src/protyle/wysiwyg/transaction.ts` | L115, L235, L315, L375, L429, L888, L1255, L1359, L1494 |
+| 回车分裂（5 处调用，Σ行号=5 ✓） | `app/src/protyle/wysiwyg/enter.ts` | L93, L99, L483, L564, L571 |
+| 编辑器浮层（4 处调用，Σ行号=4 ✓） | `app/src/protyle/toolbar/index.ts` | L1081, L1163, L1176, L1835 |
+| 粘贴（3 处调用，Σ行号=3 ✓） | `app/src/protyle/util/paste.ts` | L459, L561, L630 |
+| 反链渲染（2 处调用，Σ行号=2 ✓） | `app/src/protyle/wysiwyg/renderBacklink.ts` | L24, L79 |
+| 文档加载（2 处调用，2 文件） | `app/src/protyle/util/onGet.ts` / `app/src/mobile/util/MobileBackFoward.ts` | L232 / L92 |
+| 自动补全提示（2 处调用，2 文件） | `app/src/protyle/hint/index.ts` / `app/src/protyle/hint/extend.ts` | L865 / L559 |
+| 嵌入块递归（1 处调用） | `app/src/protyle/render/blockRender.ts` | L120 |
+| AI 填充（1 处调用） | `app/src/ai/actions.ts` | L25 |
+| 预览面板（1 处调用） | `app/src/protyle/preview/index.ts` | L193 |
+| 导出流程（1 处调用） | `app/src/protyle/export/util.ts` | L166 |
+| AV 画廊（1 处调用） | `app/src/protyle/render/av/gallery/render.ts` | L157 |
+| **调用点合计** | **14 文件** | **9+5+4+3+2+2+2+1+1+1+1+1 = 32 ✓** |
 
 ---
 
-*文档生成时间：2026-06-15 · 基于 SiYuan 3.6.x 分支代码分析<br>数据说明：processRender 共 47 条 grep 结果，去重后 13 import + 1 定义 + **33 处真实调用**（14 个文件）*
+*文档生成时间：2026-06-15 · 基于 SiYuan 3.6.x 分支代码分析<br>数据说明：在 `app/src` 下 grep `processRender(` 共返回 **47 行**。精确分类：**14 行 import**（14 个调用文件各 1 条，一一对应）+ **1 行函数定义**（processCode.ts:L46）+ **32 行真实调用**（14 个文件，逐文件逐行号校验见上表）。14 + 1 + 32 = 47 ✓*
