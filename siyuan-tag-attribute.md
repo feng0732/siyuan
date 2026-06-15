@@ -558,6 +558,7 @@ setBlockAttrs API
    tags := sql.QueryTagSpansByLabel(oldLabel)  // 从 spans 表查所有标签位置
    treeBlocks := map[string][]string{}         // 按 root_id 分组：文档ID → [块ID列表]
    ```
+   > 注意：`QueryTagSpansByLabel` 使用 `content LIKE '%label%'` **子串匹配**，会返回标签名仅包含 `oldLabel` 子串的块（如 `oldLabel="a/b"` 时也会返回含 `xa/b` 标签的块）。但后续替换守卫会正确过滤，仅多余加载文档树产生性能开销。
 
 3. **逐文档处理**（遍历 treeBlocks）：
    - `LoadTreeByBlockIDWithReindex(treeID)` 加载文档树
@@ -574,7 +575,7 @@ setBlockAttrs API
    - `ReloadProtyle(id)` 刷新所有受影响编辑器
    - `updateAttributeViewBlockText(updateNodes)` 同步属性视图中的块文本
 
-5. **前缀匹配替换规则**：`strings.HasPrefix(content, oldLabel+"/") || content == oldLabel`，确保 `a/b` 重命名为 `c/d` 时，`a/b/e` 也会被同步替换为 `c/d/e`
+5. **前缀匹配替换规则**：文档标签和行内标签均使用双重守卫 `strings.HasPrefix(content, oldLabel+"/") || content == oldLabel`，确保仅替换精确匹配或路径前缀匹配的标签。`strings.Replace(content, oldLabel, newLabel, 1)` 在守卫保护下安全执行——守卫保证 `oldLabel` 始终在 `content` 的位置 0 出现，Replace 只替换首次出现，因此不会产生误替换。例如 `oldLabel="a/b"` 时：`a/b` → 替换、`a/b/c` → 替换（路径前缀）、`xa/b` → 不替换（非前缀）
 
 ### 7.2 标签批量删除（RemoveTag）
 
@@ -659,12 +660,16 @@ SQL 索引队列（`kernel/sql/queue.go`）中，**同一 tree.ID 的同类操�
 
 | 阶段 | 处理逻辑 | 位置 |
 |------|---------|------|
-| **写入验证** | 验证 `custom-` 前缀后首字符为小写字母，整体长度 > 7 | `isValidAttrName` |
+| **写入验证（属性名）** | 验证 `custom-` 前缀后首字符为小写字母，整体长度 > 7，后续仅允许小写字母/数字/连字符 | `isValidAttrName` |
+| **写入验证（属性值）** | 仅做字符串清理：`RemoveInvalidRetainCtrl`（移除非法控制字符）+ `TrimSpace`（去首尾空白）+ `EscapeAttrVal`（HTML 转义）。**无类型、格式、长度校验** | `setNodeAttrs0` |
+| **业务语义校验** | 各业务函数自行处理，如 `SetBlockReminder` 对 `custom-reminder-wechat` 做日期格式校验。直接调用通用 API 可绕过这些校验 | `SetBlockReminder` 等业务函数 |
 | **存储格式** | IAL 中转义字符串 + 逐行 attributes 表记录 | `setNodeAttrs0` + `buildAttributeFromNode` |
 | **索引判断** | `isAttr(name)` 返回 true → 写入 attributes 表 | `strings.HasPrefix(name, "custom-")` |
 | **类型标记** | attributes.type: `"b"`（块级）/ `"s"`（行级 span 级） | `buildAttributeFromNode` |
 | **缓存同步** | 属性修改后同步写入 `blockIALCache` | `cache.PutBlockIAL` |
 | **搜索索引** | 随 blocks.ial / blocks_fts 全文可搜 | `upsertTree`（blocks 增量 + attributes 全量） |
+
+> **架构设计**：属性值的校验采用「通用层放行 + 业务层约束」的两层架构。通用层 `setNodeAttrs0` 只做最基本的字符串安全清理，不关心属性值的业务含义；业务层函数在调用通用层之前自行校验自己的领域约束。这种设计使得通用 API 灵活但需要调用方自行保证值的有效性。
 
 ### 9.2 扩展字段在属性视图（Attribute View）中的深度集成
 
@@ -775,9 +780,9 @@ SQL 索引队列（`kernel/sql/queue.go`）中，**同一 tree.ID 的同类操�
 
 | 风险点 | 严重程度 | 说明 |
 |--------|---------|------|
-| **标签前缀误替换** | 中 | RenameTag 使用 `strings.Replace(docTag, oldLabel, newLabel, 1)`，若标签名是另一个标签名的子串（如 `a/b` 与 `aa/b`）且未用 `/` 边界严格校验，可能误替换（虽然有 `HasPrefix(oldLabel+"/")` 判断，但 `Replace` 本身不保证位置） |
+| **QueryTagSpansByLabel 子串匹配过度召回** | 低 | `QueryTagSpansByLabel` 使用 `content LIKE '%label%'` 子串匹配而非精确匹配，会返回标签名仅包含 `oldLabel` 子串的块（如 `oldLabel="a/b"` 时也会返回含 `xa/b` 标签的块）。虽然替换守卫 `HasPrefix(content, oldLabel+"/") \|\| content == oldLabel` 能正确过滤不相关标签，但多加载这些块的文档树会产生不必要的性能开销（历史快照、文件写入） |
 | **属性大小写敏感丢失** | 中 | 强制属性名小写可能破坏用户对大小写区分的预期，尤其是通过 API 导入的外部数据 |
-| **custom 属性未验证值类型** | 低 | 属性值统一为 string，由调用方自行负责 JSON/数字/日期的序列化与解析 |
+| **custom 属性值缺少业务语义校验** | 低 | 通用属性层 `setNodeAttrs0` 对属性值仅做字符串清理（`RemoveInvalidRetainCtrl` + `TrimSpace` + `EscapeAttrVal`），无类型、格式、长度校验。业务语义校验（如 `custom-reminder-wechat` 的日期格式）由各业务函数（如 `SetBlockReminder`）自行处理，直接调用通用 API 可绕过这些校验写入任意字符串 |
 | **子表重建丢失增量** | 低 | 子表全量重建意味着每次保存都要删插所有 attribute/span 记录，理论上存在事务失败导致索引残缺的风险，但 SQLite 事务原子性保证了要么全成要么全败 |
 
 ### 11.4 安全风险
@@ -795,7 +800,7 @@ SQL 索引队列（`kernel/sql/queue.go`）中，**同一 tree.ID 的同类操�
 
 | 编号 | 验证项 | 验证步骤 | 预期结果 |
 |------|--------|---------|---------|
-| V-01 | 标签重命名前缀准确性 | 创建标签 `test` 和 `test1`，各绑定若干块，重命名 `test` → `demo` | `test1` 不应被修改，`test` 及其子标签正确替换 |
+| V-01 | 标签重命名前缀准确性 | 创建标签 `test` 和 `test1`，各绑定若干块，重命名 `test` → `demo` | `test1` 不应被修改（守卫 `HasPrefix("test1", "test/")` 为 false），`test` 及其子标签 `test/x` 正确替换为 `demo/x` |
 | V-02 | 文档 tags IAL 去重 | 通过 API 设 `tags="a,b,a,c,b"` | 实际存储为 `tags="a,b,c"` |
 | V-03 | 属性大小写归一化 | 设 `Custom-Name` 和 `custom-name` 两个属性 | 最终只保留一个小写版本，值为最后一次设置 |
 | V-04 | 批量属性设置事务性 | 100 个跨文档 blockAttrs，其中第 50 个 blockID 不存在 | 前 49 个应成功还是全部回滚？需确认设计语义 |
@@ -872,3 +877,4 @@ SQL 索引队列（`kernel/sql/queue.go`）中，**同一 tree.ID 的同类操�
 - v2 - 修正 upsertTree 增量更新理解：仅 blocks 表做 Hash 增量，spans/assets/attributes/refs 均为整文档全量重建
 - v3 - 修正 update_refs 理解：仅重建 refs+file_annotation_refs，不涉及其他表；补充索引忽略配置对 upsert 的副作用分析（先删后忽略=数据丢失）、update_refs 与 upsert 的竞态分析
 - v4 - 新增索引忽略三种生命周期路径对比：全量重建、后加忽略+upsert、仅触发引用刷新；明确标签两级索引不一致、属性两层索引不一致、refs 与主索引脱节等具体一致性风险
+- v5 - 修正两处风险判断：1) RenameTag 替换守卫 `HasPrefix(content, oldLabel+"/") || content == oldLabel` 保证 `strings.Replace` 安全，不存在「前缀误替换」风险，实际风险为 `QueryTagSpansByLabel` 使用 LIKE 子串匹配过度召回；2) custom 属性值校验分两层架构：通用层仅做字符串清理（控制字符+trim+HTML转义），业务层各自校验领域约束，应区分「类型校验缺失」与「业务语义校验缺失」
