@@ -175,16 +175,65 @@ blocktrees 表记录每个块的位置信息
    - 更新节点的 updated 时间戳
    - 级联更新所有父节点
 
-### 4.3 树加载流程
+### 4.3 树加载的两种入口
 
-`LoadTreeByBlockID()`（`kernel/model/tree.go`）：
+SiYuan 有两种树加载入口，行为不同：
+
+**1. 普通加载** — `LoadTreeByBlockID()`（`kernel/model/tree.go`）：
 
 ```
-1. 查 BlockTree 索引 -> 2. 加载文件 -> 3. 解析 JSON -> 4. 缓存 -> 5. 修复数据 -> 6. 构建 AST
-     │                                                                              │
-     └─> 索引不存在 -> indexTreeInFilesystem() 搜索文件系统
-     └─> 加载失败 -> 返回 ErrTreeNotFound
+1. 校验 ID 格式
+2. 查 BlockTree 索引
+3. 索引不存在 -> 返回 ErrTreeNotFound（不搜索文件系统）
+4. 索引存在 -> loadTreeByBlockTree
+     ├─> LoadTreeWithFix 加载文件
+     │    ├─> 有缓存直接用缓存
+     │    └─> 读文件 -> fixTreeJSONData 数据修复 -> needFix?
+     └─> needFix 为 true 时更新 BlockTree 和 SQL 索引
 ```
+
+> **注意**：普通加载不会因为索引与文件不一致而自动修正。只有数据修复（XSS、Unicode、ID 不一致）触发 `needFix` 时，才会更新索引。
+
+**2. 带重建的加载** — `LoadTreeByBlockIDWithReindex()`（`kernel/model/tree.go` L188-L215）：
+
+```
+1. 查 BlockTree 索引
+2. 索引不存在 -> indexTreeInFilesystem() 全量搜索文件系统
+     ├─> 限频保护（3秒1次）
+     ├─> findUnindexedTreePathInAllBoxes 遍历所有笔记本
+     └─> 找到后加载树并建立索引
+3. 索引存在 -> 正常加载
+```
+
+> **使用场景**：仅在特定场景下调用，如打开文档时找不到索引的容错处理。并非每次加载都会触发。
+
+### 4.4 索引修复链路（checkIndex）
+
+除了上述加载时的局部修复，还有一套完整的索引校验修复机制，仅在**数据同步完成后执行一次**（`sync.Once` 保护）：
+
+**执行顺序**（`kernel/model/index_fix.go` checkIndex）：
+
+```
+1. removeDuplicateDatabaseIndex  — 删除数据库索引重复项
+2. resetDuplicateBlocksOnFileSys — 重置文件系统上重复的块 ID
+3. fixBlockTreeByFileSys         — 以文件系统为准订正 BlockTree
+4. fixDatabaseIndexByBlockTree   — 以 BlockTree 为准订正 SQL 搜索索引
+5. removeDuplicateDatabaseRefs   — 删除数据库引用重复项
+```
+
+**fixBlockTreeByFileSys 核心逻辑**：
+
+```
+遍历文件系统所有 .sy 文件 -> 得到 paths 列表
+   ├─> ClearRedundantBlockTrees — 删除索引中有、文件中没有的（冗余）
+   └─> GetNotExistPaths         — 找出文件中有、索引中没有的（缺失）
+        └─> 逐个 reindexTreeByPath 重建索引
+```
+
+> **关键纠正**：BlockTree 索引与文件系统不一致时，**不会自动按文件修正**。只有在以下三种场景才会修正：
+> 1. 加载时检测到数据需要修复（needFix）
+> 2. 显式调用带重建的加载接口
+> 3. 同步完成后的一次性索引校验（checkIndex）
 
 ## 5. 节点移动机制
 
@@ -741,6 +790,22 @@ removeDoc()
 
 > **注意**：移动文档时清空了**全部** docIAL 缓存（`ClearDocsIAL()`），而不是只清除受影响的文档。这是因为移动会导致大量文档的 HPath 变化，逐个清除效率更低。
 
+### 10.6 索引恢复链路四场景对比
+
+| 场景 | 触发时机 | 索引行为 | 修正方式 | 代码位置 |
+|------|----------|----------|----------|----------|
+| **普通加载** | 每次读文档 | 索引不存在直接返回错误 | 不修正，返回 ErrTreeNotFound | `LoadTreeByBlockID()` |
+| **缺索引重建** | 特定加载路径（如打开文档） | 索引不存在则搜索文件系统 | 找到后建立索引（限频 3 秒 1 次） | `LoadTreeByBlockIDWithReindex()` + `indexTreeInFilesystem()` |
+| **路径过期/全量修复** | 同步完成后执行一次（sync.Once） | 以文件系统为准全量订正 | 删冗余 + 补缺失，双向修正 | `checkIndex()` → `fixBlockTreeByFileSys()` |
+| **事务提交失败** | commit 阶段写文件出错 | 操作阶段已写入索引，可能与文件不一致 | 不自动修正，错误码决定是否退出 | `commit()` → `writeTreeUpsertQueue()` |
+
+**关键结论**：
+
+1. **不存在自动按文件修正机制**：普通加载路径下，索引缺失就是缺失，不会去文件系统找
+2. **缺索引重建有严格限频**：3 秒内最多触发一次，防止性能问题
+3. **全量修正是被动触发的**：仅在数据同步完成后执行一次，平时不运行
+4. **事务失败可能留下不一致**：操作阶段写了索引但 commit 失败，索引会比文件"新"，需等下次修改或全量校验修正
+
 ## 11. 异常恢复机制
 
 ### 11.1 Panic 恢复与事务回滚
@@ -799,7 +864,12 @@ defer func() {
               └─> 根据错误码决定是否 Fatal 退出
 ```
 
-> **重要误判排除**：commit 阶段失败时，**部分文件可能已经写入成功**，不会回滚。这意味着如果 commit 中途失败，可能出现部分文档已更新、部分未更新的情况。但由于 BlockTree 索引在操作阶段已更新，索引与文件系统可能暂时不一致，下一次加载时会以文件系统为准。
+> **重要误判排除**：commit 阶段失败时，**部分文件可能已经写入成功**，不会回滚。这意味着如果 commit 中途失败，可能出现部分文档已更新、部分未更新的情况。由于 BlockTree 索引在操作阶段已更新，索引与文件系统可能暂时不一致。
+>
+> **索引不会自动修正**：下一次加载**不会**自动以文件系统为准修正索引。不一致状态会持续到：
+> - 文档内容修改触发索引更新
+> - 触发 `LoadTreeByBlockIDWithReindex` 重建
+> - 同步完成后执行 `checkIndex` 全量校验
 
 ### 11.3 BlockTree 数据库损坏恢复
 
@@ -953,8 +1023,8 @@ for i := range parts {
 2. **BlockTree 索引与文件系统不一致窗口**
    - 风险：事务操作阶段先更新 BlockTree 索引，commit 阶段才写文件
    - 场景：操作阶段成功但 commit 阶段前进程崩溃
-   - 影响：BlockTree 索引中有记录但文件系统中没有
-   - 恢复：下次加载时会以文件系统为准，索引会逐步修正
+   - 影响：BlockTree 索引中有记录但文件系统中没有（或反之）
+   - 恢复：不会自动修正，需依赖 checkIndex 全量校验或手动重建索引
 
 3. **锁粒度粗**
    - 风险：`flushLock` 是全局锁，所有事务串行执行
@@ -1016,6 +1086,8 @@ for i := range parts {
 |---------|--------------|------------|----------|
 | .sy 文件损坏（Properties 丢失） | 是（自动移走） | 有（文件损坏） | 从 corrupted 目录手动恢复 |
 | BlockTree 索引损坏 | 否（需重启） | 无（索引可重建） | 删除 db 文件后重启 |
+| BlockTree 索引与文件不一致 | 否（不自动修正） | 无 | 手动重建索引或等同步后 checkIndex |
+| 索引缺失（文件存在、索引无） | 特定场景可（带重建加载） | 无 | LoadTreeByBlockIDWithReindex 或全量重建 |
 | 事务执行中 panic | 是（自动回滚） | 低（只回滚内存状态） | 自动恢复 |
 | commit 中途失败 | 否 | 中（部分写入） | 手动检查一致性 |
 | 磁盘空间不足写入失败 | 否 | 低 | 释放空间后重试 |
@@ -1037,6 +1109,10 @@ for i := range parts {
 | `rebuilt parent tree` | 自动补全了缺失的父文档 | 提示 |
 | `transaction failed` | 事务执行失败 | 警告 |
 | `reinitialized database` | 数据库已重新初始化 | 提示 |
+| `searching tree on filesystem` | 正在文件系统中搜索丢失的索引 | 提示 |
+| `reindexed tree by filesystem` | 已通过文件系统重建索引 | 提示 |
+| `tree not found on filesystem` | 文件系统中也找不到树 | 警告 |
+| `exist more than one tree duplicated` | 检测到重复的树 ID | 警告 |
 
 **日志位置：**
 
@@ -1134,7 +1210,42 @@ for i := range parts {
 > - 是前端缓存还是后端缓存？
 > - 移动文档会清空全部 docIAL 缓存，列表刷新慢是正常的
 
-#### 问题 5：大量 "Untitled" 文档突然出现
+#### 问题 5：BlockTree 索引与文件系统不一致
+
+**症状：**
+
+- 通过 ID 能搜到块，但打开文档报错"找不到"
+- 或文档存在但文件树列表不显示
+- 搜索结果指向错误的路径
+
+**排查步骤：**
+
+1. **确认是索引问题**：
+   - 用文件管理器确认 `.sy` 文件是否存在于预期路径
+   - 用 SQL 查询 BlockTree 索引：`SELECT * FROM blocktrees WHERE root_id = '文档ID'`
+
+2. **判断不一致方向**：
+   - 文件有、索引无 → 索引缺失
+   - 文件无、索引有 → 索引冗余
+   - 两边都有但路径/标题对不上 → 路径过期
+
+3. **修复方式**：
+   - 单文档：打开文档触发 `LoadTreeByBlockIDWithReindex`（如果支持）
+   - 全量：设置 → 搜索 → 重建索引
+   - 或调用 API：`POST /api/filetree/reindex`
+
+4. **日志关键词**：
+   - `searching tree on filesystem` — 正在文件系统中搜索丢失的树
+   - `reindexed tree by filesystem` — 已通过文件系统重建索引
+   - `tree not found on filesystem` — 文件系统中也找不到
+
+> **常见误判排除**：
+> - 文档在已关闭的笔记本中（索引会被清除）
+> - 文档被移到了其他笔记本
+> - 是权限问题还是索引问题（发布模式下可能隐藏）
+> - 普通加载不会自动修复索引，别等"自动好"
+
+#### 问题 6：大量 "Untitled" 文档突然出现
 
 **可能原因：**
 
@@ -1147,7 +1258,7 @@ for i := range parts {
 2. 搜索日志中的 `rebuilt parent tree` 记录
 3. 确认是否有同步操作正在进行
 
-#### 问题 6：事务执行缓慢
+#### 问题 7：事务执行缓慢
 
 **症状：**
 
@@ -1228,6 +1339,8 @@ SiYuan 文档树管理采用了**三层持久化 + 两级缓存**的架构设计
 | 孤儿文档补全 | 加载子文档时自动补全缺失的父文档 | `kernel/filesys/tree.go` LoadTreeByData |
 | 事务回滚 | 仅清空内存引用，不回滚索引 | `kernel/model/transaction.go` tx.rollback |
 | 文档移动 | 非事务操作，移动前清空事务队列 | `kernel/model/file.go` MoveDocs |
+| 缺索引重建 | 索引缺失时搜索文件系统重建（限频） | `kernel/model/tree.go` indexTreeInFilesystem |
+| 全量索引修复 | 同步后 checkIndex 校验，以文件为准订正 | `kernel/model/index_fix.go` fixBlockTreeByFileSys |
 
 ### 设计亮点
 
@@ -1239,8 +1352,9 @@ SiYuan 文档树管理采用了**三层持久化 + 两级缓存**的架构设计
 
 ### 权衡与取舍
 
-- **一致性 vs 性能**：选择最终一致性，优先保证写入性能
+- **一致性 vs 性能**：选择最终一致性，优先保证写入性能。索引先更新、文件后写入，存在短暂不一致窗口
 - **粗粒度锁 vs 细粒度锁**：选择全局串行事务，简化实现，牺牲并发性能
 - **全量缓存失效 vs 精确失效**：移动文档时选择全量清空 docIAL 缓存，简化实现
+- **被动索引修复 vs 主动修正**：选择被动修复（同步后 checkIndex + 特定场景重建），避免频繁扫描文件系统
 
 这是一个经过生产验证的、以**本地优先和数据安全**为核心设计原则的文档树管理实现。
