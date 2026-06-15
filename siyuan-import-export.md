@@ -670,32 +670,104 @@ msgId = showMessage("导出中", -1)  // 永不自动关闭
 
 ##### 源码中的死代码
 
-代码中显式编写的错误分支永远不会被执行：
+代码中显式编写的错误分支永远不会被执行（L53-L56 在浏览器导出分支）：
 
 ```typescript
-// [index.ts:L34-L61] saveExport 浏览器环境
-fetchPost("/api/export/exportBrowserHTML", {...}, zipResponse => {
-    hideMessage(msgId);                  // ← code<0 时不会走到这里
-    // ── 以下是死代码，永远不会执行 ──
-    if (zipResponse.code === -1) {
-        showMessage(
-            window.siyuan.languages._kernel[14].replace("%s", zipResponse.msg),
-            0, "error"
-        );
-        return;
-    }
-    window.open(zipResponse.data.zip);   // ← 也不会走到这里（失败时）
-    showMessage(window.siyuan.languages.exported);
-});
+// [index.ts:L33-L62] saveExport 浏览器环境（#if BROWSER 编译宏）
+/// #if BROWSER
+if (["html", "htmlmd"].includes(option.type)) {
+    const msgId = showMessage(window.siyuan.languages.exporting, -1);  // L36
+    const url = option.type === "htmlmd" ? "/api/export/exportMdHTML"   // L38
+                                         : "/api/export/exportHTML";
+    // 第 1 次 fetchPost
+    fetchPost(url, {id, pdf:false, removeAssets:false, merge:true, savePath:""},
+      async exportResponse => {
+        const html = await onExport(exportResponse, undefined, "", option);
+        // 第 2 次 fetchPost
+        fetchPost("/api/export/exportBrowserHTML", {
+            folder: exportResponse.data.folder,
+            html: html,
+            name: exportResponse.data.name
+        }, zipResponse => {
+            // L52 hideMessage：code<0 时永远不会执行
+            hideMessage(msgId);
+            // ── L53-L56 以下显式 if 判断为死代码 ──
+            if (zipResponse.code === -1) {
+                showMessage(window.siyuan.languages._kernel[14].replace("%s", zipResponse.msg), 0, "error");
+                return;
+            }
+            // L57-L58 在失败时同样无法到达
+            window.open(zipResponse.data.zip);
+            showMessage(window.siyuan.languages.exported);
+        });
+    });
+    return;
+}
+/// #else
 ```
+
+##### 按代码执行顺序的拦截验证
+
+以第 2 次请求（`/api/export/exportBrowserHTML`）失败为例，逐行追踪：
+
+1. **L47**：调用 `fetchPost(url, data, zipResponse => {...})` 发起请求
+2. **`fetch.ts:L41`**：`fetch(url, init)` 发送 HTTP 请求
+3. **`fetch.ts:L65-L67`**：检测到 `content-type: application/json` → 调用 `response.json()` 解析
+4. **`fetch.ts:L88`**：命中条件 `typeof response.msg==="string"` 且 `typeof response.code==="number"`
+5. **`fetch.ts:L89`**：调用 `processMessage(response)`
+6. **`processMessage.ts:L71`**：命中 `if (response.code < 0)`（code === -1）
+7. **`processMessage.ts:L72`**：自动弹出红色错误 Toast（错误信息来自后端返回）
+8. **`processMessage.ts:L73`**：`return false`
+9. **`fetch.ts:L89`**：`if (false && cb)` → 短路，**不执行 `zipResponse` 回调**
+10. **结果**：`zipResponse` 回调函数体（L52-L58 共 7 行）全部被跳过
+
+对于第 1 次请求失败也是同样的链路，区别在于失败时 L46 `onExport()` 不会被调用，流程停在更早的位置。
 
 ##### 潜在 UX Bug
 
 当两次请求中任意一次失败时，用户界面会出现**两个 Toast 同时存在**：
-1. **错误 Toast**（红色）：由 `processMessage` 自动弹出，描述具体错误原因（`timeout=0`，需手动关闭）
-2. **"导出中"Toast**：由于回调未执行，`hideMessage(msgId)` 从未被调用，**永久显示**
+1. **错误 Toast**（红色）：由 `processMessage.ts:L72` 自动弹出，描述具体错误原因（`timeout=0`，需手动关闭）
+2. **"导出中"Toast**：由于回调被跳过，`hideMessage(msgId)`（L52）从未被调用，**永久显示**
 
 用户必须手动关闭错误 Toast 后，才能看到卡住的"导出中"Toast，且无法自动消除。
+
+##### 修复方案分析
+
+**错误的修复思路**：在请求发出前先 `hideMessage(msgId)`
+- ❌ 问题：如果请求成功，等待提示会过早消失，用户失去状态反馈
+- ❌ 问题：无法区分第 1 次请求和第 2 次请求的状态
+
+**正确的修复方案**（按优先级排列）：
+
+1. **方案 A：使用 `fetchSyncPost` + `try/finally`（最简洁）**
+   - 利用 `fetchSyncPost` 在 [fetch.ts:L131-L133] 中只调用 `processMessage` 但**不检查返回值**、**总是返回 response** 的特性
+   - `finally` 块保证 `hideMessage(msgId)` 无论成功失败都会执行
+
+   ```typescript
+   const msgId = showMessage(window.siyuan.languages.exporting, -1);
+   try {
+       const exportResponse = await fetchSyncPost(url, {...});
+       // 检查第 1 次请求是否出错（code<0 时 fetchSyncPost 仍返回对象）
+       if (exportResponse.code < 0) return;
+       const html = await onExport(exportResponse, undefined, "", option);
+       const zipResponse = await fetchSyncPost("/api/export/exportBrowserHTML", {...});
+       if (zipResponse.code < 0) return;
+       window.open(zipResponse.data.zip);
+       showMessage(window.siyuan.languages.exported);
+   } finally {
+       hideMessage(msgId);  // 永远执行
+   }
+   ```
+
+2. **方案 B：移除死代码 + 为 fetchPost 增加通用 cleanup 钩子**
+   - 删除 L53-L56 的冗余 `if (zipResponse.code === -1)` 分支
+   - 为 `fetchPost` 增加第 6 个 `finallyCallback` 参数，在 `.then` 末端和 `.catch` 末端统一调用
+   - 优点：所有使用 `fetchPost` 的场景都能受益
+
+3. **方案 C：局部 watchdog 超时兜底（临时补丁）**
+   - 调用 `fetchPost` 后注册 setTimeout，60 秒后检测 msgId 对应的 DOM 是否还存在
+   - 若存在则强制 `hideMessage`
+   - 缺点：治标不治本，只解决 Toast 残留，不解决死代码
 
 ##### 失败场景
 
@@ -1083,14 +1155,18 @@ treenode.IndexBlockTree(tree)         // 块树缓存更新
    - 需验证 `Improve focus export` 逻辑在聚焦导出场景下的覆盖率
 
 4. **浏览器 HTML 导出死代码**
-   - [index.ts:L639-L646](app/src/protyle/export/index.ts#L639-L646) 中 `if (zipResponse.code === -1)` 分支为死代码
-   - 由于 `fetchPost` + `processMessage` 全局拦截 `code < 0`，回调永远执行不到该分支
-   - 需移除冗余代码，或重构为在调用 `fetchPost` 前 `hideMessage(msgId)`
+   - [index.ts:L53-L56](app/src/protyle/export/index.ts#L53-L56) 中 `if (zipResponse.code === -1)` 分支为死代码（`#if BROWSER` 编译宏内）
+   - 精确位置：`saveExport` 第 2 次 `fetchPost` 的回调内部（L47-L59）
+   - 由于 `fetch.ts:L89` + `processMessage.ts:L70-L74` 全局拦截 `code < 0`，回调永远执行不到该分支
+   - 需移除 L53-L56 冗余代码；**不能**在请求发出前就 `hideMessage(msgId)`，否则成功时用户会丢失等待状态
 
 5. **浏览器 HTML 导出 UX Bug**
-   - 第 1/2 次请求失败时，`hideMessage(msgId)` 不会被调用，导致"导出中"Toast 永久残留
+   - 第 1/2 次请求失败时，回调被跳过 → `hideMessage(msgId)`（L52）不会被调用 → "导出中"Toast 永久残留
    - 用户会同时看到红色错误 Toast + 卡住的"导出中"Toast，体验不佳
-   - 修复方案：在调用 `fetchPost` 前注册 `finally` 逻辑，或使用 `failCallback` 参数兜底
+   - 修复方案推荐：
+     - 方案 A（最简洁）：改用 `fetchSyncPost` + `try/finally` 包裹（`fetchSyncPost` 不拦截 code<0 响应，`finally` 保证 hideMessage 总执行）
+     - 方案 B（通用）：为 `fetchPost` 增加第 6 个 `finallyCallback` 参数，在 `.then/.catch` 末端统一执行 cleanup
+     - **注意**：不能在请求发出前就关闭等待提示，也不能依赖当前仅对 `/api/file/getFile` 生效的 `failCallback` 参数
 
 ### 11.4 兼容性验证
 
